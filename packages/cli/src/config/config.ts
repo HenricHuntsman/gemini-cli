@@ -12,6 +12,10 @@ import { mcpCommand } from '../commands/mcp.js';
 import { extensionsCommand } from '../commands/extensions.js';
 import { skillsCommand } from '../commands/skills.js';
 import { hooksCommand } from '../commands/hooks.js';
+import { repoCommand } from '../commands/repo.js';
+import { gitCommand } from '../commands/git.js';
+import { contextCommand } from '../commands/context.js';
+import { projectCommand } from '../commands/project.js';
 import {
   setGeminiMdFilename as setServerGeminiMdFilename,
   getCurrentGeminiMdFilename,
@@ -115,6 +119,11 @@ const coerceCommaSeparated = (values: string[]): string[] => {
 };
 
 export async function parseArguments(
+      .option('stream', {
+        type: 'boolean',
+        description: 'Stream model output as it is generated (if supported by provider).',
+        default: false,
+      })
   settings: MergedSettings,
 ): Promise<CliArgs> {
   const rawArgv = hideBin(process.argv);
@@ -125,6 +134,19 @@ export async function parseArguments(
     .usage(
       'Usage: gemini [options] [command]\n\nGemini CLI - Defaults to interactive mode. Use -p/--prompt for non-interactive (headless) mode.',
     )
+    .option('provider', {
+      alias: 'P',
+      type: 'string',
+      nargs: 1,
+      description: 'LLM provider to use (e.g., gemini, ollama).',
+      default: 'gemini',
+    })
+    .option('ollama-url', {
+      type: 'string',
+      nargs: 1,
+      description: 'Base URL for Ollama server (default: http://localhost:11434).',
+      default: 'http://localhost:11434',
+    })
     .option('debug', {
       alias: 'd',
       type: 'boolean',
@@ -347,6 +369,12 @@ export async function parseArguments(
   if (settings.hooksConfig.enabled) {
     yargsInstance.command(hooksCommand);
   }
+
+  // Register ripdown core commands
+  yargsInstance.command(repoCommand);
+  yargsInstance.command(gitCommand);
+  yargsInstance.command(contextCommand);
+  yargsInstance.command(projectCommand);
 
   yargsInstance
     .version(await getVersion()) // This will enable the --version flag based on package.json

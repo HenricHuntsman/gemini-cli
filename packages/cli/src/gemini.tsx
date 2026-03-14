@@ -34,6 +34,7 @@ import {
 } from '@google/gemini-cli-core';
 
 import { loadCliConfig, parseArguments } from './config/config.js';
+import { getProvider } from './providers/providerFactory.js';
 import * as cliConfig from './config/config.js';
 import { readStdin } from './utils/readStdin.js';
 import { createHash } from 'node:crypto';
@@ -232,6 +233,23 @@ export async function main() {
   const parseArgsHandle = startupProfiler.start('parse_arguments');
   const argv = await parseArguments(settings.merged);
   parseArgsHandle?.end();
+
+  // Provider selection (Layer 1)
+  // Priority: CLI flag > env > config > default
+  const providerName = argv.provider || process.env.RIPDOWN_PROVIDER || settings.merged.provider || 'gemini';
+  const modelName = argv.model || process.env.RIPDOWN_MODEL || settings.merged.model;
+  const ollamaUrl = argv.ollamaUrl || process.env.RIPDOWN_OLLAMA_URL || settings.merged.ollamaUrl;
+  const provider = getProvider(providerName, { ollamaUrl });
+
+  // Ollama health check (Layer 1)
+  if (providerName.toLowerCase() === 'ollama' && provider.healthCheck) {
+    const healthy = await provider.healthCheck();
+    if (!healthy) {
+      writeToStderr(`Error: Ollama server not reachable at ${ollamaUrl}. Please start Ollama and try again.\n`);
+      await runExitCleanup();
+      process.exit(ExitCodes.FATAL_INPUT_ERROR);
+    }
+  }
 
   if (
     (argv.allowedTools && argv.allowedTools.length > 0) ||
@@ -678,6 +696,8 @@ export async function main() {
       input,
       prompt_id,
       resumedSessionData,
+      provider,
+      model: modelName,
     });
     // Call cleanup before process.exit, which causes cleanup to not run
     await runExitCleanup();

@@ -47,12 +47,16 @@ import {
 } from './utils/errors.js';
 import { TextOutput } from './ui/utils/textOutput.js';
 
+import type { ModelProvider } from './providers/modelProvider.js';
+
 interface RunNonInteractiveParams {
   config: Config;
   settings: LoadedSettings;
   input: string;
   prompt_id: string;
   resumedSessionData?: ResumedSessionData;
+  provider: ModelProvider;
+  model?: string;
 }
 
 export async function runNonInteractive({
@@ -61,6 +65,8 @@ export async function runNonInteractive({
   input,
   prompt_id,
   resumedSessionData,
+  provider,
+  model,
 }: RunNonInteractiveParams): Promise<void> {
   return promptIdContext.run(prompt_id, async () => {
     const consolePatcher = new ConsolePatcher({
@@ -94,244 +100,23 @@ export async function runNonInteractive({
     };
 
     const startTime = Date.now();
-    const streamFormatter =
-      config.getOutputFormat() === OutputFormat.STREAM_JSON
-        ? new StreamJsonFormatter()
-        : null;
-
-    const abortController = new AbortController();
-
-    // Track cancellation state
-    let isAborting = false;
-    let cancelMessageTimer: NodeJS.Timeout | null = null;
-
-    // Setup stdin listener for Ctrl+C detection
-    let stdinWasRaw = false;
-    let rl: readline.Interface | null = null;
-
-    const setupStdinCancellation = () => {
-      // Only setup if stdin is a TTY (user can interact)
-      if (!process.stdin.isTTY) {
-        return;
-      }
-
-      // Save original raw mode state
-      stdinWasRaw = process.stdin.isRaw || false;
-
-      // Enable raw mode to capture individual keypresses
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-
-      // Setup readline to emit keypress events
-      rl = readline.createInterface({
-        input: process.stdin,
-        escapeCodeTimeout: 0,
-      });
-      readline.emitKeypressEvents(process.stdin, rl);
-
-      // Listen for Ctrl+C
-      const keypressHandler = (
-        str: string,
-        key: { name?: string; ctrl?: boolean },
-      ) => {
-        // Detect Ctrl+C: either ctrl+c key combo or raw character code 3
-        if ((key && key.ctrl && key.name === 'c') || str === '\u0003') {
-          // Only handle once
-          if (isAborting) {
-            return;
+      // Provider-driven generation path
+      // For now, only single-turn, non-tool, non-streaming for Ollama; GeminiProvider can wrap old logic
+      try {
+        if (config.stream && provider.generateStream) {
+          for await (const token of provider.generateStream(input, { model })) {
+            textOutput.write(token);
           }
-
-          isAborting = true;
-
-          // Only show message if cancellation takes longer than 200ms
-          // This reduces verbosity for fast cancellations
-          cancelMessageTimer = setTimeout(() => {
-            process.stderr.write('\nCancelling...\n');
-          }, 200);
-
-          abortController.abort();
-          // Note: Don't exit here - let the abort flow through the system
-          // and trigger handleCancellationError() which will exit with proper code
-        }
-      };
-
-      process.stdin.on('keypress', keypressHandler);
-    };
-
-    const cleanupStdinCancellation = () => {
-      // Clear any pending cancel message timer
-      if (cancelMessageTimer) {
-        clearTimeout(cancelMessageTimer);
-        cancelMessageTimer = null;
-      }
-
-      // Cleanup readline and stdin listeners
-      if (rl) {
-        rl.close();
-        rl = null;
-      }
-
-      // Remove keypress listener
-      process.stdin.removeAllListeners('keypress');
-
-      // Restore stdin to original state
-      if (process.stdin.isTTY) {
-        process.stdin.setRawMode(stdinWasRaw);
-        process.stdin.pause();
-      }
-    };
-
-    let errorToHandle: unknown | undefined;
-    try {
-      consolePatcher.patch();
-
-      if (
-        config.getRawOutput() &&
-        !config.getAcceptRawOutputRisk() &&
-        config.getOutputFormat() === OutputFormat.TEXT
-      ) {
-        process.stderr.write(
-          '[WARNING] --raw-output is enabled. Model output is not sanitized and may contain harmful ANSI sequences (e.g. for phishing or command injection). Use --accept-raw-output-risk to suppress this warning.\n',
-        );
-      }
-
-      // Setup stdin cancellation listener
-      setupStdinCancellation();
-
-      coreEvents.on(CoreEvent.UserFeedback, handleUserFeedback);
-      coreEvents.drainBacklogs();
-
-      // Handle EPIPE errors when the output is piped to a command that closes early.
-      process.stdout.on('error', (err: NodeJS.ErrnoException) => {
-        if (err.code === 'EPIPE') {
-          // Exit gracefully if the pipe is closed.
-          process.exit(0);
-        }
-      });
-
-      const geminiClient = config.getGeminiClient();
-      const scheduler = new Scheduler({
-        context: config,
-        messageBus: config.getMessageBus(),
-        getPreferredEditor: () => undefined,
-        schedulerId: ROOT_SCHEDULER_ID,
-      });
-
-      // Initialize chat.  Resume if resume data is passed.
-      if (resumedSessionData) {
-        await geminiClient.resumeChat(
-          convertSessionToClientHistory(
-            resumedSessionData.conversation.messages,
-          ),
-          resumedSessionData,
-        );
-      }
-
-      // Emit init event for streaming JSON
-      if (streamFormatter) {
-        streamFormatter.emitEvent({
-          type: JsonStreamEventType.INIT,
-          timestamp: new Date().toISOString(),
-          session_id: config.getSessionId(),
-          model: config.getModel(),
-        });
-      }
-
-      let query: Part[] | undefined;
-
-      if (isSlashCommand(input)) {
-        const slashCommandResult = await handleSlashCommand(
-          input,
-          abortController,
-          config,
-          settings,
-        );
-        // If a slash command is found and returns a prompt, use it.
-        // Otherwise, slashCommandResult falls through to the default prompt
-        // handling.
-        if (slashCommandResult) {
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-          query = slashCommandResult as Part[];
-        }
-      }
-
-      if (!query) {
-        const { processedQuery, error } = await handleAtCommand({
-          query: input,
-          config,
-          addItem: (_item, _timestamp) => 0,
-          onDebugMessage: () => {},
-          messageId: Date.now(),
-          signal: abortController.signal,
-          escapePastedAtSymbols: false,
-        });
-        if (error || !processedQuery) {
-          // An error occurred during @include processing (e.g., file not found).
-          // The error message is already logged by handleAtCommand.
-          throw new FatalInputError(
-            error || 'Exiting due to an error processing the @ command.',
-          );
-        }
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        query = processedQuery as Part[];
-      }
-
-      // Emit user message event for streaming JSON
-      if (streamFormatter) {
-        streamFormatter.emitEvent({
-          type: JsonStreamEventType.MESSAGE,
-          timestamp: new Date().toISOString(),
-          role: 'user',
-          content: input,
-        });
-      }
-
-      let currentMessages: Content[] = [{ role: 'user', parts: query }];
-
-      let turnCount = 0;
-      while (true) {
-        turnCount++;
-        if (
-          config.getMaxSessionTurns() >= 0 &&
-          turnCount > config.getMaxSessionTurns()
-        ) {
-          handleMaxTurnsExceededError(config);
-        }
-        const toolCallRequests: ToolCallRequestInfo[] = [];
-
-        const responseStream = geminiClient.sendMessageStream(
-          currentMessages[0]?.parts || [],
-          abortController.signal,
-          prompt_id,
-          undefined,
-          false,
-          turnCount === 1 ? input : undefined,
-        );
-
-        let responseText = '';
-        for await (const event of responseStream) {
-          if (abortController.signal.aborted) {
-            handleCancellationError(config);
+          textOutput.ensureTrailingNewline();
+        } else {
+          const output = await provider.generate(input, { model });
+          if (output) {
+            textOutput.write(output);
           }
-
-          if (event.type === GeminiEventType.Content) {
-            const isRaw =
-              config.getRawOutput() || config.getAcceptRawOutputRisk();
-            const output = isRaw ? event.value : stripAnsi(event.value);
-            if (streamFormatter) {
-              streamFormatter.emitEvent({
-                type: JsonStreamEventType.MESSAGE,
-                timestamp: new Date().toISOString(),
-                role: 'assistant',
-                content: output,
-                delta: true,
-              });
-            } else if (config.getOutputFormat() === OutputFormat.JSON) {
-              responseText += output;
-            } else {
-              if (event.value) {
-                textOutput.write(output);
-              }
+        }
+      } catch (err) {
+        handleError(err, config);
+      }
             }
           } else if (event.type === GeminiEventType.ToolCallRequest) {
             if (streamFormatter) {
