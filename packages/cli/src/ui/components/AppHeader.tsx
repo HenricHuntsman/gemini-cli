@@ -18,6 +18,8 @@ import { ThemedGradient } from './ThemedGradient.js';
 import { CliSpinner } from './CliSpinner.js';
 
 import { isAppleTerminal } from '@google/gemini-cli-core';
+import { compactLogoIcon, longAsciiLogoCompactText } from './AsciiArt.js';
+import { getAsciiArtWidth } from '../utils/textUtils.js';
 
 interface AppHeaderProps {
   version: string;
@@ -49,26 +51,54 @@ export const AppHeader = ({ version, showDetails = true }: AppHeaderProps) => {
   const { bannerText } = useBanner(bannerData);
   const { showTips } = useTips();
 
+  const authType = config.getContentGeneratorConfig()?.authType;
+  const loggedOut = !authType;
+
   const showHeader = !(
     settings.merged.ui.hideBanner || config.getScreenReader()
   );
 
   const ICON = isAppleTerminal() ? MAC_TERMINAL_ICON : DEFAULT_ICON;
 
+  let iconArt = ICON;
+  let textArt = '';
+  if (loggedOut) {
+    const widthOfLongLogo = getAsciiArtWidth(longAsciiLogoCompactText) + 10;
+
+    if (terminalWidth >= widthOfLongLogo) {
+      iconArt = compactLogoIcon;
+      textArt = longAsciiLogoCompactText;
+    } else {
+      iconArt = ICON;
+      textArt = '';
+    }
+  }
+
+  const showFullLogo = loggedOut && textArt !== '';
+
   if (!showDetails) {
     return (
       <Box flexDirection="column">
         {showHeader && (
           <Box
-            flexDirection="row"
+            flexDirection={showFullLogo ? 'column' : 'row'}
             marginTop={1}
             marginBottom={1}
             paddingLeft={2}
           >
-            <Box flexShrink={0}>
-              <ThemedGradient>{ICON}</ThemedGradient>
+            <Box flexDirection="row" flexShrink={0}>
+              <ThemedGradient>{iconArt.trim()}</ThemedGradient>
+              {showFullLogo && (
+                <Box marginLeft={2}>
+                  <Text color={theme.text.primary}>{textArt.trim()}</Text>
+                </Box>
+              )}
             </Box>
-            <Box marginLeft={2} flexDirection="column">
+            <Box
+              marginLeft={showFullLogo ? 0 : 2}
+              marginTop={showFullLogo ? 1 : 0}
+              flexDirection="column"
+            >
               <Box>
                 <Text bold color={theme.text.primary}>
                   Gemini CLI
@@ -85,11 +115,25 @@ export const AppHeader = ({ version, showDetails = true }: AppHeaderProps) => {
   return (
     <Box flexDirection="column">
       {showHeader && (
-        <Box flexDirection="row" marginTop={1} marginBottom={1} paddingLeft={2}>
-          <Box flexShrink={0}>
-            <ThemedGradient>{ICON}</ThemedGradient>
+        <Box
+          flexDirection={showFullLogo ? 'column' : 'row'}
+          marginTop={1}
+          marginBottom={1}
+          paddingLeft={2}
+        >
+          <Box flexDirection="row" flexShrink={0}>
+            <ThemedGradient>{iconArt.trim()}</ThemedGradient>
+            {showFullLogo && (
+              <Box marginLeft={2}>
+                <Text color={theme.text.primary}>{textArt.trim()}</Text>
+              </Box>
+            )}
           </Box>
-          <Box marginLeft={2} flexDirection="column">
+          <Box
+            marginLeft={showFullLogo ? 0 : 2}
+            marginTop={showFullLogo ? 1 : 0}
+            flexDirection="column"
+          >
             {/* Line 1: Gemini CLI vVersion [Updating] */}
             <Box>
               <Text bold color={theme.text.primary}>
