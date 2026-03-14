@@ -62,19 +62,17 @@ export const AppHeader = ({ version, showDetails = true }: AppHeaderProps) => {
 
   let iconArt = ICON;
   let textArt = '';
-  if (loggedOut) {
+  let showFullLogo = false;
+
+  if (loggedOut && terminalWidth > 0) {
     const widthOfLongLogo = getAsciiArtWidth(longAsciiLogoCompactText) + 10;
 
     if (terminalWidth >= widthOfLongLogo) {
-      iconArt = compactLogoIcon;
-      textArt = longAsciiLogoCompactText;
-    } else {
-      iconArt = ICON;
-      textArt = '';
+      iconArt = compactLogoIcon.trim();
+      textArt = longAsciiLogoCompactText.trim();
+      showFullLogo = true;
     }
   }
-
-  const showFullLogo = loggedOut && textArt !== '';
 
   if (!showDetails) {
     return (
@@ -86,14 +84,18 @@ export const AppHeader = ({ version, showDetails = true }: AppHeaderProps) => {
             marginBottom={1}
             paddingLeft={2}
           >
-            <Box flexDirection="row" flexShrink={0}>
-              <ThemedGradient>{iconArt.trim()}</ThemedGradient>
-              {showFullLogo && (
+            {showFullLogo ? (
+              <Box flexDirection="row" flexShrink={0}>
+                <ThemedGradient>{iconArt}</ThemedGradient>
                 <Box marginLeft={2}>
-                  <Text color={theme.text.primary}>{textArt.trim()}</Text>
+                  <Text color={theme.text.primary}>{textArt}</Text>
                 </Box>
-              )}
-            </Box>
+              </Box>
+            ) : (
+              <Box flexShrink={0}>
+                <ThemedGradient>{iconArt}</ThemedGradient>
+              </Box>
+            )}
             <Box
               marginLeft={showFullLogo ? 0 : 2}
               marginTop={showFullLogo ? 1 : 0}
@@ -121,14 +123,18 @@ export const AppHeader = ({ version, showDetails = true }: AppHeaderProps) => {
           marginBottom={1}
           paddingLeft={2}
         >
-          <Box flexDirection="row" flexShrink={0}>
-            <ThemedGradient>{iconArt.trim()}</ThemedGradient>
-            {showFullLogo && (
+          {showFullLogo ? (
+            <Box flexDirection="row" flexShrink={0}>
+              <ThemedGradient>{iconArt}</ThemedGradient>
               <Box marginLeft={2}>
-                <Text color={theme.text.primary}>{textArt.trim()}</Text>
+                <Text color={theme.text.primary}>{textArt}</Text>
               </Box>
-            )}
-          </Box>
+            </Box>
+          ) : (
+            <Box flexShrink={0}>
+              <ThemedGradient>{iconArt}</ThemedGradient>
+            </Box>
+          )}
           <Box
             marginLeft={showFullLogo ? 0 : 2}
             marginTop={showFullLogo ? 1 : 0}
@@ -149,10 +155,7 @@ export const AppHeader = ({ version, showDetails = true }: AppHeaderProps) => {
               )}
             </Box>
 
-            {/* Line 2: Blank */}
-            <Box height={1} />
-
-            {/* Lines 3 & 4: User Identity info (Email /auth and Plan /upgrade) */}
+            {/* Line 2: User Identity info (Email /auth and Plan /upgrade) */}
             {settings.merged.ui.showUserIdentity !== false && (
               <UserIdentity config={config} />
             )}
