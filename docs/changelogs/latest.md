@@ -1,6 +1,6 @@
-# Latest stable release: v0.33.1
+# Latest stable release: v0.1.0
 
-Released: March 12, 2026
+Released: April 4, 2026
 
 For most users, our latest stable release is the recommended release. Install
 the latest stable version with:
@@ -10,6 +10,9 @@ npm install -g @google/gemini-cli
 ```
 
 ## Highlights
+
+This is the first stable release of this fork. It includes all features from
+the upstream project up to the point of this fork.
 
 - **Agent Architecture Enhancements:** Introduced HTTP authentication support
   for A2A remote agents, authenticated A2A agent card discovery, and directly
