@@ -13,6 +13,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
 } from 'react';
 
@@ -21,6 +22,7 @@ import { parseMouseEvent } from '../utils/mouse.js';
 import { FOCUS_IN, FOCUS_OUT } from '../hooks/useFocus.js';
 import { appEvents, AppEvent } from '../../utils/events.js';
 import { terminalCapabilityManager } from '../utils/terminalCapabilityManager.js';
+import { useSettingsStore } from './SettingsContext.js';
 
 export const BACKSLASH_ENTER_TIMEOUT = 5;
 export const ESC_TIMEOUT = 50;
@@ -39,6 +41,7 @@ const KEY_INFO_MAP: Record<
   string,
   { name: string; shift?: boolean; ctrl?: boolean }
 > = {
+  OM: { name: 'enter' },
   '[200~': { name: 'paste-start' },
   '[201~': { name: 'paste-end' },
   '[[A': { name: 'f1' },
@@ -448,7 +451,7 @@ function* emitKeys(
               insertable: true,
               sequence: decoded,
             });
-          } catch (_e) {
+          } catch {
             debugLogger.log('Failed to decode OSC 52 clipboard data');
           }
         }
@@ -535,11 +538,24 @@ function* emitKeys(
         } else if (ch === '<') {
           // SGR mouse mode
           ch = yield;
-          sequence += ch;
           // Don't skip on empty string here to avoid timeouts on slow events.
           while (ch === '' || ch === ';' || (ch >= '0' && ch <= '9')) {
-            ch = yield;
             sequence += ch;
+            ch = yield;
+          }
+          if (ch === 'm' || ch === 'M') {
+            sequence += ch;
+          } else if (ch === '\x03') {
+            keypressHandler({
+              name: 'c',
+              ctrl: true,
+              shift: false,
+              alt: false,
+              cmd: false,
+              insertable: false,
+              sequence: '\x03',
+            });
+            continue;
           }
         } else if (ch === 'M') {
           // X11 mouse mode
@@ -766,12 +782,13 @@ export function useKeypressContext() {
 export function KeypressProvider({
   children,
   config,
-  debugKeystrokeLogging,
 }: {
   children: React.ReactNode;
   config?: Config;
-  debugKeystrokeLogging?: boolean;
 }) {
+  const { settings } = useSettingsStore();
+  const debugKeystrokeLogging = settings.merged.general.debugKeystrokeLogging;
+
   const { stdin, setRawMode } = useStdin();
 
   const subscribersToPriority = useRef<Map<KeypressHandler, number>>(
@@ -828,6 +845,9 @@ export function KeypressProvider({
 
   const broadcast = useCallback(
     (key: Key) => {
+      if (debugKeystrokeLogging) {
+        debugLogger.log('[DEBUG] Keystroke:', JSON.stringify(key));
+      }
       // Use cached sorted priorities to avoid sorting on every keypress
       for (const p of sortedPriorities.current) {
         const set = subscribers.get(p);
@@ -842,18 +862,22 @@ export function KeypressProvider({
         }
       }
     },
-    [subscribers],
+    [subscribers, debugKeystrokeLogging],
   );
 
   useEffect(() => {
     terminalCapabilityManager.enableSupportedModes();
+
+    if (!stdin) {
+      return;
+    }
 
     const wasRaw = stdin.isRaw;
     if (wasRaw === false) {
       setRawMode(true);
     }
 
-    process.stdin.setEncoding('utf8'); // Make data events emit strings
+    stdin.setEncoding?.('utf8'); // Make data events emit strings
 
     let processor = nonKeyboardEventFilter(broadcast);
     if (!terminalCapabilityManager.isKittyProtocolEnabled()) {
@@ -874,6 +898,7 @@ export function KeypressProvider({
     }
 
     stdin.on('data', dataListener);
+    stdin.resume?.();
     return () => {
       stdin.removeListener('data', dataListener);
       if (wasRaw === false) {
@@ -882,8 +907,13 @@ export function KeypressProvider({
     };
   }, [stdin, setRawMode, config, debugKeystrokeLogging, broadcast]);
 
+  const contextValue = useMemo(
+    () => ({ subscribe, unsubscribe }),
+    [subscribe, unsubscribe],
+  );
+
   return (
-    <KeypressContext.Provider value={{ subscribe, unsubscribe }}>
+    <KeypressContext.Provider value={contextValue}>
       {children}
     </KeypressContext.Provider>
   );

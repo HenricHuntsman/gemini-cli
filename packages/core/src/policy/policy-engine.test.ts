@@ -15,12 +15,21 @@ import {
   ApprovalMode,
   PRIORITY_SUBAGENT_TOOL,
   ALWAYS_ALLOW_PRIORITY_FRACTION,
+  PRIORITY_YOLO_ALLOW_ALL,
 } from './types.js';
 import type { FunctionCall } from '@google/genai';
 import { SafetyCheckDecision } from '../safety/protocol.js';
 import type { CheckerRunner } from '../safety/checker-runner.js';
-import { initializeShellParsers } from '../utils/shell-utils.js';
+import {
+  initializeShellParsers,
+  parseCommandDetails,
+} from '../utils/shell-utils.js';
 import { buildArgsPatterns } from './utils.js';
+import {
+  NoopSandboxManager,
+  LocalSandboxManager,
+  type SandboxManager,
+} from '../services/sandboxManager.js';
 
 // Mock shell-utils to ensure consistent behavior across platforms (especially Windows CI)
 // We want to test PolicyEngine logic, not the shell parser's ability to parse commands
@@ -36,6 +45,35 @@ vi.mock('../utils/shell-utils.js', async (importOriginal) => {
         return command.split('&&').map((c) => c.trim());
       }
       return [command];
+    }),
+    parseCommandDetails: vi.fn().mockImplementation((command: string) => {
+      // Basic mock implementation for PolicyEngine test needs
+      const commands = command.includes('&&')
+        ? command.split('&&').map((c) => c.trim())
+        : [command.trim()];
+
+      // Detect $(...) or `...` and add as sub-commands for recursion tests
+      const subCommands = [...commands];
+      for (const cmd of commands) {
+        const subMatch = cmd.match(/\$\((.*)\)/) || cmd.match(/`(.*)`/);
+        if (subMatch?.[1]) {
+          subCommands.push(subMatch[1].trim());
+        }
+      }
+
+      return {
+        details: subCommands.map((c, i) => ({
+          name: c.split(' ')[0],
+          text: c,
+          startIndex: i === 0 ? 0 : -1, // Simple root indication
+        })),
+        hasError: false,
+      };
+    }),
+    stripShellWrapper: vi.fn().mockImplementation((command: string) => {
+      // Simple mock for stripping wrappers
+      const match = command.match(/^(?:bash|sh|zsh)\s+-c\s+["'](.*)["']$/i);
+      return match ? match[1] : command;
     }),
     hasRedirection: vi.fn().mockImplementation(
       (command: string) =>
@@ -95,7 +133,10 @@ describe('PolicyEngine', () => {
       runChecker: vi.fn(),
     } as unknown as CheckerRunner;
     engine = new PolicyEngine(
-      { approvalMode: ApprovalMode.DEFAULT },
+      {
+        approvalMode: ApprovalMode.DEFAULT,
+        sandboxManager: new NoopSandboxManager(),
+      },
       mockCheckerRunner,
     );
   });
@@ -158,6 +199,11 @@ describe('PolicyEngine', () => {
       ];
 
       engine = new PolicyEngine({ rules });
+
+      // Match with unqualified name + serverName
+      expect((await engine.check({ name: 'tool' }, 'my-server')).decision).toBe(
+        PolicyDecision.ALLOW,
+      );
 
       // Match with qualified name (standard)
       expect(
@@ -259,9 +305,25 @@ describe('PolicyEngine', () => {
       expect(decision).toBe(PolicyDecision.DENY);
     });
 
+    it('should match subagent name as alias for invoke_agent', async () => {
+      const rules: PolicyRule[] = [
+        { toolName: 'codebase_investigator', decision: PolicyDecision.DENY },
+      ];
+
+      engine = new PolicyEngine({ rules });
+
+      const toolCall: FunctionCall = {
+        name: 'invoke_agent',
+        args: { agent_name: 'codebase_investigator', prompt: 'Hello' },
+      };
+
+      const { decision } = await engine.check(toolCall, undefined);
+      expect(decision).toBe(PolicyDecision.DENY);
+    });
+
     it('should apply wildcard rules (no toolName)', async () => {
       const rules: PolicyRule[] = [
-        { decision: PolicyDecision.DENY }, // Applies to all tools
+        { toolName: '*', decision: PolicyDecision.DENY }, // Applies to all tools
         { toolName: 'safe-tool', decision: PolicyDecision.ALLOW, priority: 10 },
       ];
 
@@ -279,8 +341,22 @@ describe('PolicyEngine', () => {
       const config: PolicyEngineConfig = {
         nonInteractive: true,
         rules: [
-          { toolName: 'interactive-tool', decision: PolicyDecision.ASK_USER },
+          {
+            toolName: 'interactive-tool',
+            decision: PolicyDecision.ASK_USER,
+            interactive: true,
+          },
+          {
+            toolName: 'interactive-tool',
+            decision: PolicyDecision.DENY,
+            interactive: false,
+          },
           { toolName: 'allowed-tool', decision: PolicyDecision.ALLOW },
+          {
+            toolName: 'ask_user',
+            decision: PolicyDecision.DENY,
+            interactive: false,
+          },
         ],
       };
 
@@ -323,7 +399,11 @@ describe('PolicyEngine', () => {
       );
 
       // Switch to autoEdit mode
-      engine.setApprovalMode(ApprovalMode.AUTO_EDIT);
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.AUTO_EDIT,
+        sandboxManager: new LocalSandboxManager(),
+      });
       expect((await engine.check({ name: 'edit' }, undefined)).decision).toBe(
         PolicyDecision.ALLOW,
       );
@@ -333,6 +413,30 @@ describe('PolicyEngine', () => {
       expect((await engine.check({ name: 'edit' }, undefined)).decision).toBe(
         PolicyDecision.ASK_USER,
       );
+    });
+
+    it('should respect tools approved by the SandboxManager', async () => {
+      const mockSandboxManager = {
+        enabled: true,
+        prepareCommand: vi.fn(),
+        isDangerousCommand: vi.fn().mockReturnValue(false),
+        isKnownSafeCommand: vi
+          .fn()
+          .mockImplementation((args) => args[0] === 'npm'),
+        parseDenials: vi.fn().mockReturnValue(undefined),
+      } as unknown as SandboxManager;
+
+      engine = new PolicyEngine({
+        sandboxManager: mockSandboxManager,
+        defaultDecision: PolicyDecision.ASK_USER,
+      });
+
+      const { decision } = await engine.check(
+        { name: 'run_shell_command', args: { command: 'npm install' } },
+        undefined,
+      );
+
+      expect(decision).toBe(PolicyDecision.ALLOW);
     });
 
     it('should return ALLOW by default in YOLO mode when no rules match', async () => {
@@ -374,6 +478,77 @@ describe('PolicyEngine', () => {
 
       // Priority 20 (DENY) should win over priority 10 (ASK_USER)
       const { decision } = await engine.check({ name: 'test-tool' }, undefined);
+      expect(decision).toBe(PolicyDecision.DENY);
+    });
+
+    it('should fail closed in YOLO mode when shell parsing fails for restricted rule', async () => {
+      const originalMock = vi
+        .mocked(parseCommandDetails)
+        .getMockImplementation();
+      vi.mocked(parseCommandDetails).mockImplementationOnce(
+        (command: string) => {
+          if (command === 'echo bypass') {
+            return { details: [], hasError: true };
+          }
+          return originalMock!(command);
+        },
+      );
+
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+          argsPattern: /"command":"echo/,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+      });
+
+      const { decision } = await engine.check(
+        { name: 'run_shell_command', args: { command: 'echo bypass' } },
+        undefined,
+      );
+
+      expect(decision).toBe(PolicyDecision.DENY);
+    });
+
+    it('should fail closed in YOLO mode when shell parsing has errors for restricted rule', async () => {
+      const originalMock = vi
+        .mocked(parseCommandDetails)
+        .getMockImplementation();
+      vi.mocked(parseCommandDetails).mockImplementationOnce(
+        (command: string) => {
+          if (command === 'echo bypass') {
+            return {
+              details: [{ name: 'echo', text: 'echo bypass', startIndex: 0 }],
+              hasError: true,
+            };
+          }
+          return originalMock!(command);
+        },
+      );
+
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+          argsPattern: /"command":"echo/,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+      });
+
+      const { decision } = await engine.check(
+        { name: 'run_shell_command', args: { command: 'echo bypass' } },
+        undefined,
+      );
+
       expect(decision).toBe(PolicyDecision.DENY);
     });
   });
@@ -686,7 +861,7 @@ describe('PolicyEngine', () => {
   describe('complex scenarios', () => {
     it('should handle multiple matching rules with different priorities', async () => {
       const rules: PolicyRule[] = [
-        { decision: PolicyDecision.DENY, priority: 0 }, // Default deny all
+        { toolName: '*', decision: PolicyDecision.DENY, priority: 0 }, // Default deny all
         { toolName: 'shell', decision: PolicyDecision.ASK_USER, priority: 5 },
         {
           toolName: 'shell',
@@ -1217,6 +1392,51 @@ describe('PolicyEngine', () => {
       ).toBe(PolicyDecision.ALLOW);
     });
 
+    it('should NOT automatically DENY redirected shell commands in non-interactive mode if rules permit it', async () => {
+      const toolName = 'run_shell_command';
+      const command = 'ls > out.txt';
+
+      const rules: PolicyRule[] = [
+        {
+          toolName,
+          decision: PolicyDecision.ALLOW,
+          allowRedirection: true,
+        },
+      ];
+
+      engine = new PolicyEngine({ rules, nonInteractive: true });
+
+      expect(
+        (await engine.check({ name: toolName, args: { command } }, undefined))
+          .decision,
+      ).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should respect DENY rules for redirected shell commands in non-interactive mode', async () => {
+      const toolName = 'run_shell_command';
+      const command = 'ls > out.txt';
+
+      const rules: PolicyRule[] = [
+        {
+          toolName,
+          decision: PolicyDecision.ASK_USER,
+          interactive: true,
+        },
+        {
+          toolName,
+          decision: PolicyDecision.DENY,
+          interactive: false,
+        },
+      ];
+
+      engine = new PolicyEngine({ rules, nonInteractive: true });
+
+      expect(
+        (await engine.check({ name: toolName, args: { command } }, undefined))
+          .decision,
+      ).toBe(PolicyDecision.DENY);
+    });
+
     it('should NOT downgrade ALLOW to ASK_USER for quoted redirection chars', async () => {
       const rules: PolicyRule[] = [
         {
@@ -1259,7 +1479,10 @@ describe('PolicyEngine', () => {
         },
       ];
 
-      engine = new PolicyEngine({ rules });
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: new NoopSandboxManager({ workspace: '/safe/path' }),
+      });
 
       // Compound command. The decomposition will call check() for "echo hello"
       // which should match our specific high-priority rule IF dir_path is preserved.
@@ -1272,6 +1495,73 @@ describe('PolicyEngine', () => {
       );
 
       expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should force ASK_USER when dir_path escapes workspace boundary even if rule allows it', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: new NoopSandboxManager({ workspace: '/safe/path' }),
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'pwd', dir_path: '/outside/path' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should preserve ALLOW in YOLO mode even when dir_path escapes workspace boundary', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+        sandboxManager: new NoopSandboxManager({ workspace: '/safe/path' }),
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'pwd', dir_path: '/outside/path' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should force ASK_USER in default decision path when dir_path escapes workspace boundary', async () => {
+      engine = new PolicyEngine({
+        rules: [],
+        defaultDecision: PolicyDecision.ALLOW,
+        sandboxManager: new NoopSandboxManager({ workspace: '/safe/path' }),
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'pwd', dir_path: '/outside/path' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
     });
 
     it('should upgrade ASK_USER to ALLOW if all sub-commands are allowed', async () => {
@@ -1309,6 +1599,353 @@ describe('PolicyEngine', () => {
       );
 
       expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should upgrade catch-all ASK_USER to ALLOW for compound commands/loops when all decomposed sub-commands match explicit ALLOW rules', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"git status"/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"ls"/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+        {
+          // Catch-all ASK_USER for shell
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ASK_USER,
+          priority: 10,
+        },
+      ];
+
+      engine = new PolicyEngine({ rules });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'git status && ls' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should upgrade catch-all ASK_USER to ALLOW for for-loops when all inner commands match ALLOW rules', async () => {
+      vi.mocked(parseCommandDetails).mockReturnValueOnce({
+        details: [
+          { name: 'echo', text: 'echo "$repo"', startIndex: 10 },
+          { name: 'git', text: 'git -C "$repo" log', startIndex: 30 },
+        ],
+        hasError: false,
+      });
+
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"echo/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"git/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+        {
+          // Catch-all ASK_USER for shell
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ASK_USER,
+          priority: 10,
+        },
+      ];
+
+      engine = new PolicyEngine({ rules });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: {
+            command:
+              'for repo in a b; do echo "$repo"; git -C "$repo" log; done',
+          },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should NOT upgrade compound command when a sub-command lacks an explicit argsPattern ALLOW rule', async () => {
+      vi.mocked(parseCommandDetails).mockReturnValueOnce({
+        details: [
+          { name: 'ls', text: 'ls', startIndex: 0 },
+          { name: 'pwd', text: 'pwd', startIndex: 6 },
+        ],
+        hasError: false,
+      });
+
+      const mockSandboxManager = {
+        enabled: true,
+        prepareCommand: vi.fn(),
+        isDangerousCommand: vi.fn().mockReturnValue(false),
+        isKnownSafeCommand: vi
+          .fn()
+          .mockImplementation((args) => args[0] === 'ls' || args[0] === 'pwd'),
+        parseDenials: vi.fn().mockReturnValue(undefined),
+        getWorkspace: vi.fn().mockReturnValue('/safe/path'),
+      } as unknown as SandboxManager;
+
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"ls"/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+        {
+          // Catch-all ASK_USER for shell
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ASK_USER,
+          priority: 10,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: mockSandboxManager,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'ls && pwd' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should NOT upgrade compound command to ALLOW when dir_path escapes workspace', async () => {
+      const mockSandboxManager = {
+        enabled: true,
+        prepareCommand: vi.fn(),
+        isDangerousCommand: vi.fn().mockReturnValue(false),
+        isKnownSafeCommand: vi.fn().mockReturnValue(true),
+        parseDenials: vi.fn().mockReturnValue(undefined),
+        getWorkspace: vi.fn().mockReturnValue('/safe/path'),
+      } as unknown as SandboxManager;
+
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: mockSandboxManager,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'pwd && ls', dir_path: '/outside/path' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should NOT upgrade compound command to ALLOW when Git is invoked in untrusted workspace', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(false);
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+        },
+      ];
+
+      const engine = new PolicyEngine({
+        rules,
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo "hello" && git status' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should NOT upgrade compound command to ALLOW when a sub-command is dangerous', async () => {
+      const mockSandboxManager = {
+        enabled: true,
+        prepareCommand: vi.fn(),
+        isDangerousCommand: vi
+          .fn()
+          .mockImplementation((args) => args[0] === 'rm'),
+        isKnownSafeCommand: vi.fn().mockReturnValue(false),
+        parseDenials: vi.fn().mockReturnValue(undefined),
+        getWorkspace: vi.fn().mockReturnValue('/safe/path'),
+      } as unknown as SandboxManager;
+
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"echo/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ASK_USER,
+          priority: 10,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: mockSandboxManager,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo hello && rm -rf /' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should NOT upgrade Git commands to ALLOW in untrusted workspace', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(false);
+      const engine = new PolicyEngine({
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'git status' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+      expect(isTrustedMock).toHaveBeenCalled();
+    });
+
+    it('should NOT treat commands with git in arguments or URLs as Git commands', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(false);
+      const engine = new PolicyEngine({
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo git' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should detect chained Git commands as Git commands and force ASK_USER in untrusted workspaces', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(false);
+      const engine = new PolicyEngine({
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo "hello" && git status' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+      expect(isTrustedMock).toHaveBeenCalled();
+    });
+
+    it('should detect Git commands prefixed with environment variable assignments', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(false);
+      const engine = new PolicyEngine({
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'VAR=val git status' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+      expect(isTrustedMock).toHaveBeenCalled();
+    });
+
+    it('should NOT upgrade a DENY decision to ASK_USER for Git commands in untrusted workspaces', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(false);
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"git status"/,
+          decision: PolicyDecision.DENY,
+          priority: 100,
+        },
+      ];
+      const engine = new PolicyEngine({
+        rules,
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'git status' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.DENY);
+    });
+
+    it('should upgrade Git commands to ALLOW in trusted workspace when heuristics apply', async () => {
+      const isTrustedMock = vi.fn().mockReturnValue(true);
+      const engine = new PolicyEngine({
+        isTrustedFolder: isTrustedMock,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'git status' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+      expect(isTrustedMock).toHaveBeenCalled();
     });
 
     it('should respect explicit DENY for compound commands even if parts are allowed', async () => {
@@ -1382,21 +2019,25 @@ describe('PolicyEngine', () => {
       expect(result.decision).toBe(PolicyDecision.DENY);
     });
 
-    it('should DENY redirected shell commands in non-interactive mode', async () => {
+    it('should respect explicit DENY rules for redirected shell commands in non-interactive mode', async () => {
       const config: PolicyEngineConfig = {
         nonInteractive: true,
         rules: [
           {
             toolName: 'run_shell_command',
             decision: PolicyDecision.ALLOW,
+            interactive: true,
+          },
+          {
+            toolName: 'run_shell_command',
+            decision: PolicyDecision.DENY,
+            interactive: false,
           },
         ],
       };
 
       engine = new PolicyEngine(config);
 
-      // Redirected command should be DENIED in non-interactive mode
-      // (Normally ASK_USER, but ASK_USER -> DENY in non-interactive)
       expect(
         (
           await engine.check(
@@ -1421,14 +2062,14 @@ describe('PolicyEngine', () => {
 
       engine = new PolicyEngine({ rules });
 
-      // Atomic command "whoami" matches the wildcard rule (ASK_USER).
+      // Atomic command "unknown_command" matches the wildcard rule (ASK_USER).
       // It should NOT be upgraded to ALLOW.
       expect(
         (
           await engine.check(
             {
               name: 'run_shell_command',
-              args: { command: 'whoami' },
+              args: { command: 'unknown_command' },
             },
             undefined,
           )
@@ -1556,17 +2197,21 @@ describe('PolicyEngine', () => {
       expect(result.decision).toBe(PolicyDecision.ASK_USER);
     });
 
-    it('should allow redirected shell commands in AUTO_EDIT mode if individual commands are allowed', async () => {
+    it('should allow redirected shell commands in AUTO_EDIT mode if allowRedirection is true', async () => {
       const rules: PolicyRule[] = [
         {
           toolName: 'run_shell_command',
           argsPattern: /"command":"echo\b/,
           decision: PolicyDecision.ALLOW,
           priority: 20,
+          allowRedirection: true,
         },
       ];
 
-      engine = new PolicyEngine({ rules });
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: new LocalSandboxManager(),
+      });
       engine.setApprovalMode(ApprovalMode.AUTO_EDIT);
 
       const result = await engine.check(
@@ -1578,6 +2223,88 @@ describe('PolicyEngine', () => {
       );
 
       expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should downgrade restricted argsPattern shell command with redirection in AUTO_EDIT mode', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"echo\b/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        sandboxManager: new LocalSandboxManager(),
+      });
+      engine.setApprovalMode(ApprovalMode.AUTO_EDIT);
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo hello > file.txt' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should downgrade restricted argsPattern shell command with redirection in YOLO mode', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"echo\b/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+        sandboxManager: new NoopSandboxManager(),
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo hello > file.txt' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should return DENY for restricted argsPattern shell command with redirection in nonInteractive YOLO mode', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          argsPattern: /"command":"echo\b/,
+          decision: PolicyDecision.ALLOW,
+          priority: 20,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+        nonInteractive: true,
+        sandboxManager: new NoopSandboxManager(),
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'echo hello > file.txt' },
+        },
+        undefined,
+      );
+
+      expect(result.decision).toBe(PolicyDecision.DENY);
     });
 
     it('should allow compound commands with safe operators (&&, ||) if individual commands are allowed', async () => {
@@ -1607,12 +2334,13 @@ describe('PolicyEngine', () => {
 
   describe('Plan Mode vs Subagent Priority (Regression)', () => {
     it('should DENY subagents in Plan Mode despite dynamic allow rules', async () => {
-      // Plan Mode Deny (1.06) > Subagent Allow (1.05)
+      // Plan Mode Deny (1.04) > Subagent Allow (1.03)
 
       const fixedRules: PolicyRule[] = [
         {
+          toolName: '*',
           decision: PolicyDecision.DENY,
-          priority: 1.06,
+          priority: 1.04,
           modes: [ApprovalMode.PLAN],
         },
         {
@@ -1637,10 +2365,68 @@ describe('PolicyEngine', () => {
   });
 
   describe('shell command parsing failure', () => {
+    it('should return ALLOW in YOLO mode for dangerous commands due to heuristics override', async () => {
+      // Create an engine with YOLO mode and a sandbox manager that flags a command as dangerous
+      const rules: PolicyRule[] = [
+        {
+          toolName: '*',
+          decision: PolicyDecision.ALLOW,
+          priority: 999,
+          modes: [ApprovalMode.YOLO],
+        },
+      ];
+
+      const mockSandboxManager = new NoopSandboxManager();
+      mockSandboxManager.isDangerousCommand = vi.fn().mockReturnValue(true);
+      mockSandboxManager.isKnownSafeCommand = vi.fn().mockReturnValue(false);
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+        sandboxManager: mockSandboxManager,
+      });
+
+      const result = await engine.check(
+        {
+          name: 'run_shell_command',
+          args: { command: 'powershell echo "dangerous"' },
+        },
+        undefined,
+      );
+
+      // Even though the command is flagged as dangerous, YOLO mode should preserve the ALLOW decision
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should NOT downgrade to ASK_USER for redirected commands in YOLO mode even without sandbox', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'run_shell_command',
+          decision: PolicyDecision.ALLOW,
+          priority: 10,
+        },
+      ];
+
+      engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.YOLO,
+        sandboxManager: new NoopSandboxManager(),
+      });
+
+      const command = 'npm test 2>&1 | tail -80';
+      const { decision } = await engine.check(
+        { name: 'run_shell_command', args: { command } },
+        undefined,
+      );
+
+      expect(decision).toBe(PolicyDecision.ALLOW);
+    });
+
     it('should return ALLOW in YOLO mode even if shell command parsing fails', async () => {
       const { splitCommands } = await import('../utils/shell-utils.js');
       const rules: PolicyRule[] = [
         {
+          toolName: '*',
           decision: PolicyDecision.ALLOW,
           priority: 999,
           modes: [ApprovalMode.YOLO],
@@ -1679,6 +2465,7 @@ describe('PolicyEngine', () => {
           priority: 2000, // Very high priority DENY (e.g. Admin)
         },
         {
+          toolName: '*',
           decision: PolicyDecision.ALLOW,
           priority: 999,
           modes: [ApprovalMode.YOLO],
@@ -1702,7 +2489,6 @@ describe('PolicyEngine', () => {
     });
 
     it('should return ASK_USER in non-YOLO mode if shell command parsing fails', async () => {
-      const { splitCommands } = await import('../utils/shell-utils.js');
       const rules: PolicyRule[] = [
         {
           toolName: 'run_shell_command',
@@ -1717,7 +2503,11 @@ describe('PolicyEngine', () => {
       });
 
       // Simulate parsing failure
-      vi.mocked(splitCommands).mockReturnValueOnce([]);
+      const { parseCommandDetails } = await import('../utils/shell-utils.js');
+      vi.mocked(parseCommandDetails).mockReturnValueOnce({
+        details: [],
+        hasError: true,
+      });
 
       const result = await engine.check(
         { name: 'run_shell_command', args: { command: 'complex command' } },
@@ -1972,10 +2762,12 @@ describe('PolicyEngine', () => {
   describe('addChecker', () => {
     it('should add a new checker and maintain priority order', () => {
       const checker1: SafetyCheckerRule = {
+        toolName: '*',
         checker: { type: 'external', name: 'checker1' },
         priority: 5,
       };
       const checker2: SafetyCheckerRule = {
+        toolName: '*',
         checker: { type: 'external', name: 'checker2' },
         priority: 10,
       };
@@ -2028,6 +2820,39 @@ describe('PolicyEngine', () => {
       );
     });
 
+    it('should match global wildcard (*) for checkers', async () => {
+      const rules: PolicyRule[] = [
+        { toolName: '*', decision: PolicyDecision.ALLOW },
+      ];
+      const globalChecker: SafetyCheckerRule = {
+        checker: { type: 'external', name: 'global' },
+        toolName: '*',
+      };
+
+      engine = new PolicyEngine(
+        { rules, checkers: [globalChecker] },
+        mockCheckerRunner,
+      );
+
+      vi.mocked(mockCheckerRunner.runChecker).mockResolvedValue({
+        decision: SafetyCheckDecision.ALLOW,
+      });
+
+      await engine.check({ name: 'any_tool' }, undefined);
+      expect(mockCheckerRunner.runChecker).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ name: 'global' }),
+      );
+
+      vi.mocked(mockCheckerRunner.runChecker).mockClear();
+
+      await engine.check({ name: 'mcp_server_tool' }, 'server');
+      expect(mockCheckerRunner.runChecker).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ name: 'global' }),
+      );
+    });
+
     it('should support wildcard patterns for checkers', async () => {
       const rules: PolicyRule[] = [
         {
@@ -2064,6 +2889,7 @@ describe('PolicyEngine', () => {
       ];
       const checkers: SafetyCheckerRule[] = [
         {
+          toolName: '*',
           checker: {
             type: 'in-process',
             name: InProcessCheckerType.ALLOWED_PATH,
@@ -2089,6 +2915,7 @@ describe('PolicyEngine', () => {
       ];
       const checkers: SafetyCheckerRule[] = [
         {
+          toolName: '*',
           checker: {
             type: 'in-process',
             name: InProcessCheckerType.ALLOWED_PATH,
@@ -2113,6 +2940,7 @@ describe('PolicyEngine', () => {
       ];
       const checkers: SafetyCheckerRule[] = [
         {
+          toolName: '*',
           checker: {
             type: 'in-process',
             name: InProcessCheckerType.ALLOWED_PATH,
@@ -2129,33 +2957,6 @@ describe('PolicyEngine', () => {
 
       const result = await engine.check({ name: 'tool' }, undefined);
       expect(result.decision).toBe(PolicyDecision.ASK_USER);
-    });
-
-    it('should DENY if checker returns ASK_USER in non-interactive mode', async () => {
-      const rules: PolicyRule[] = [
-        { toolName: 'tool', decision: PolicyDecision.ALLOW },
-      ];
-      const checkers: SafetyCheckerRule[] = [
-        {
-          checker: {
-            type: 'in-process',
-            name: InProcessCheckerType.ALLOWED_PATH,
-          },
-        },
-      ];
-
-      engine = new PolicyEngine(
-        { rules, checkers, nonInteractive: true },
-        mockCheckerRunner,
-      );
-
-      vi.mocked(mockCheckerRunner.runChecker).mockResolvedValue({
-        decision: SafetyCheckDecision.ASK_USER,
-        reason: 'Suspicious path',
-      });
-
-      const result = await engine.check({ name: 'tool' }, undefined);
-      expect(result.decision).toBe(PolicyDecision.DENY);
     });
   });
 
@@ -2259,17 +3060,41 @@ describe('PolicyEngine', () => {
         expected: [],
       },
       {
-        name: 'should NOT include ASK_USER tools even in non-interactive mode',
+        name: 'should include tools in exclusion list only if explicitly denied in non-interactive mode',
         rules: [
           {
             toolName: 'tool1',
             decision: PolicyDecision.ASK_USER,
             modes: [ApprovalMode.DEFAULT],
+            interactive: true,
+          },
+          {
+            toolName: 'tool1',
+            decision: PolicyDecision.DENY,
+            modes: [ApprovalMode.DEFAULT],
+            interactive: false,
           },
         ],
         nonInteractive: true,
         allToolNames: ['tool1'],
         expected: ['tool1'],
+      },
+      {
+        name: 'should specifically exclude ask_user tool in non-interactive mode',
+        rules: [
+          {
+            toolName: 'ask_user',
+            decision: PolicyDecision.DENY,
+            interactive: false,
+          },
+          {
+            toolName: 'read_file',
+            decision: PolicyDecision.ALLOW,
+          },
+        ],
+        nonInteractive: true,
+        allToolNames: ['ask_user', 'read_file'],
+        expected: ['ask_user'],
       },
       {
         name: 'should ignore rules with argsPattern',
@@ -2314,6 +3139,7 @@ describe('PolicyEngine', () => {
         name: 'should respect wildcard ALLOW rules (e.g. YOLO mode)',
         rules: [
           {
+            toolName: '*',
             decision: PolicyDecision.ALLOW,
             priority: 999,
             modes: [ApprovalMode.YOLO],
@@ -2390,6 +3216,7 @@ describe('PolicyEngine', () => {
           },
           {
             // Simulates the global deny in Plan Mode
+            toolName: '*',
             decision: PolicyDecision.DENY,
             priority: 60,
             modes: [ApprovalMode.PLAN],
@@ -2500,6 +3327,7 @@ describe('PolicyEngine', () => {
       engine = new PolicyEngine({
         rules: [
           {
+            toolName: '*',
             toolAnnotations: { destructiveHint: true },
             decision: PolicyDecision.DENY,
             priority: 10,
@@ -2517,6 +3345,7 @@ describe('PolicyEngine', () => {
       engine = new PolicyEngine({
         rules: [
           {
+            toolName: '*',
             toolAnnotations: { destructiveHint: true },
             decision: PolicyDecision.DENY,
             priority: 10,
@@ -2538,6 +3367,7 @@ describe('PolicyEngine', () => {
       engine = new PolicyEngine({
         rules: [
           {
+            toolName: '*',
             toolAnnotations: { destructiveHint: true },
             decision: PolicyDecision.DENY,
             priority: 10,
@@ -2609,6 +3439,7 @@ describe('PolicyEngine', () => {
             priority: 70,
           },
           {
+            toolName: '*',
             decision: PolicyDecision.DENY,
             priority: 60,
           },
@@ -2655,6 +3486,7 @@ describe('PolicyEngine', () => {
             priority: 70,
           },
           {
+            toolName: '*',
             decision: PolicyDecision.DENY,
             priority: 60,
           },
@@ -2695,6 +3527,7 @@ describe('PolicyEngine', () => {
             priority: 70,
           },
           {
+            toolName: '*',
             decision: PolicyDecision.DENY,
             priority: 60,
           },
@@ -2757,12 +3590,6 @@ describe('PolicyEngine', () => {
             modes: [ApprovalMode.PLAN],
           },
           {
-            toolName: 'save_memory',
-            decision: PolicyDecision.ASK_USER,
-            priority: 70,
-            modes: [ApprovalMode.PLAN],
-          },
-          {
             toolName: 'exit_plan_mode',
             decision: PolicyDecision.ASK_USER,
             priority: 70,
@@ -2776,6 +3603,13 @@ describe('PolicyEngine', () => {
             modes: [ApprovalMode.PLAN],
           },
           {
+            toolName: 'web_fetch',
+            decision: PolicyDecision.ASK_USER,
+            priority: 70,
+            modes: [ApprovalMode.PLAN],
+          },
+          {
+            toolName: '*',
             decision: PolicyDecision.DENY,
             priority: 60,
             modes: [ApprovalMode.PLAN],
@@ -2799,7 +3633,6 @@ describe('PolicyEngine', () => {
         'web_fetch',
         'write_todos',
         'memory',
-        'save_memory',
         'mcp_mcp-server_read_tool',
         'mcp_mcp-server_write_tool',
       ]);
@@ -2817,7 +3650,6 @@ describe('PolicyEngine', () => {
       const excluded = engine.getExcludedTools(toolMetadata, allToolNames);
       // These should be excluded (caught by catch-all DENY)
       expect(excluded.has('shell')).toBe(true);
-      expect(excluded.has('web_fetch')).toBe(true);
       expect(excluded.has('write_todos')).toBe(true);
       expect(excluded.has('memory')).toBe(true);
       // write_file and replace are excluded unless they have argsPattern rules
@@ -2833,9 +3665,9 @@ describe('PolicyEngine', () => {
       expect(excluded.has('list_directory')).toBe(false);
       expect(excluded.has('google_web_search')).toBe(false);
       expect(excluded.has('activate_skill')).toBe(false);
+      expect(excluded.has('web_fetch')).toBe(false);
       expect(excluded.has('ask_user')).toBe(false);
       expect(excluded.has('exit_plan_mode')).toBe(false);
-      expect(excluded.has('save_memory')).toBe(false);
       // Read-only MCP tool allowed by annotation rule (matched via _serverName)
       expect(excluded.has('mcp_mcp-server_read_tool')).toBe(false);
     });
@@ -2851,8 +3683,9 @@ describe('PolicyEngine', () => {
           modes: [ApprovalMode.YOLO],
         },
         {
+          toolName: '*',
           decision: PolicyDecision.ALLOW,
-          priority: 998,
+          priority: PRIORITY_YOLO_ALLOW_ALL,
           modes: [ApprovalMode.YOLO],
         },
       ];
@@ -2878,8 +3711,9 @@ describe('PolicyEngine', () => {
           modes: [ApprovalMode.YOLO],
         },
         {
+          toolName: '*',
           decision: PolicyDecision.ALLOW,
-          priority: 998,
+          priority: PRIORITY_YOLO_ALLOW_ALL,
           modes: [ApprovalMode.YOLO],
         },
       ];
@@ -2901,6 +3735,7 @@ describe('PolicyEngine', () => {
     it('should allow activate_skill but deny shell commands in Plan Mode', async () => {
       const rules: PolicyRule[] = [
         {
+          toolName: '*',
           decision: PolicyDecision.DENY,
           priority: 60,
           modes: [ApprovalMode.PLAN],
@@ -3104,14 +3939,17 @@ describe('PolicyEngine', () => {
   describe('removeCheckersByTier', () => {
     it('should remove checkers matching a specific tier', () => {
       engine.addChecker({
+        toolName: '*',
         checker: { type: 'external', name: 'c1' },
         priority: 1.1,
       });
       engine.addChecker({
+        toolName: '*',
         checker: { type: 'external', name: 'c2' },
         priority: 1.9,
       });
       engine.addChecker({
+        toolName: '*',
         checker: { type: 'external', name: 'c3' },
         priority: 2.5,
       });
@@ -3129,14 +3967,17 @@ describe('PolicyEngine', () => {
   describe('removeCheckersBySource', () => {
     it('should remove checkers matching a specific source', () => {
       engine.addChecker({
+        toolName: '*',
         checker: { type: 'external', name: 'c1' },
         source: 'sourceA',
       });
       engine.addChecker({
+        toolName: '*',
         checker: { type: 'external', name: 'c2' },
         source: 'sourceB',
       });
       engine.addChecker({
+        toolName: '*',
         checker: { type: 'external', name: 'c3' },
         source: 'sourceA',
       });
@@ -3155,6 +3996,7 @@ describe('PolicyEngine', () => {
       engine = new PolicyEngine({
         rules: [
           {
+            toolName: '*',
             toolAnnotations: { readOnlyHint: true },
             decision: PolicyDecision.ALLOW,
             priority: 10,
@@ -3340,6 +4182,389 @@ describe('PolicyEngine', () => {
         new Set(['test-tool']),
       );
       expect(excluded.has('test-tool')).toBe(false);
+    });
+  });
+
+  describe('interactive matching', () => {
+    it('should ignore interactive rules in non-interactive mode', async () => {
+      const engine = new PolicyEngine({
+        rules: [
+          {
+            toolName: 'my_tool',
+            decision: PolicyDecision.ALLOW,
+            interactive: true,
+          },
+        ],
+        nonInteractive: true,
+        defaultDecision: PolicyDecision.DENY,
+      });
+
+      const result = await engine.check(
+        { name: 'my_tool', args: {} },
+        undefined,
+      );
+      expect(result.decision).toBe(PolicyDecision.DENY);
+    });
+
+    it('should allow interactive rules in interactive mode', async () => {
+      const engine = new PolicyEngine({
+        rules: [
+          {
+            toolName: 'my_tool',
+            decision: PolicyDecision.ALLOW,
+            interactive: true,
+          },
+        ],
+        nonInteractive: false,
+        defaultDecision: PolicyDecision.DENY,
+      });
+
+      const result = await engine.check(
+        { name: 'my_tool', args: {} },
+        undefined,
+      );
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should ignore non-interactive rules in interactive mode', async () => {
+      const engine = new PolicyEngine({
+        rules: [
+          {
+            toolName: 'my_tool',
+            decision: PolicyDecision.ALLOW,
+            interactive: false,
+          },
+        ],
+        nonInteractive: false,
+        defaultDecision: PolicyDecision.DENY,
+      });
+
+      const result = await engine.check(
+        { name: 'my_tool', args: {} },
+        undefined,
+      );
+      expect(result.decision).toBe(PolicyDecision.DENY);
+    });
+
+    it('should allow non-interactive rules in non-interactive mode', async () => {
+      const engine = new PolicyEngine({
+        rules: [
+          {
+            toolName: 'my_tool',
+            decision: PolicyDecision.ALLOW,
+            interactive: false,
+          },
+        ],
+        nonInteractive: true,
+        defaultDecision: PolicyDecision.DENY,
+      });
+
+      const result = await engine.check(
+        { name: 'my_tool', args: {} },
+        undefined,
+      );
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
+    });
+
+    it('should apply rules without interactive flag to both', async () => {
+      const rule: PolicyRule = {
+        toolName: 'my_tool',
+        decision: PolicyDecision.ALLOW,
+      };
+
+      const engineInteractive = new PolicyEngine({
+        rules: [rule],
+        nonInteractive: false,
+        defaultDecision: PolicyDecision.DENY,
+      });
+      const engineNonInteractive = new PolicyEngine({
+        rules: [rule],
+        nonInteractive: true,
+        defaultDecision: PolicyDecision.DENY,
+      });
+
+      expect(
+        (
+          await engineInteractive.check(
+            { name: 'my_tool', args: {} },
+            undefined,
+          )
+        ).decision,
+      ).toBe(PolicyDecision.ALLOW);
+      expect(
+        (
+          await engineNonInteractive.check(
+            { name: 'my_tool', args: {} },
+            undefined,
+          )
+        ).decision,
+      ).toBe(PolicyDecision.ALLOW);
+    });
+  });
+
+  describe('additional_permissions', () => {
+    const workspace = '/workspace';
+    let mockSandboxManager: SandboxManager;
+    let engine: PolicyEngine;
+
+    beforeEach(() => {
+      mockSandboxManager = {
+        prepareCommand: vi.fn(),
+        isKnownSafeCommand: vi.fn().mockReturnValue(false),
+        isDangerousCommand: vi.fn().mockReturnValue(false),
+        parseDenials: vi.fn(),
+        getWorkspace: vi.fn().mockReturnValue(workspace),
+      } as never as SandboxManager;
+
+      engine = new PolicyEngine({
+        rules: [
+          {
+            toolName: 'run_shell_command',
+            decision: PolicyDecision.ALLOW,
+            modes: [ApprovalMode.AUTO_EDIT],
+          },
+        ],
+        approvalMode: ApprovalMode.AUTO_EDIT,
+        sandboxManager: mockSandboxManager,
+      });
+    });
+
+    it('should allow permissions exactly at the workspace root', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            fileSystem: {
+              read: [workspace],
+            },
+          },
+        },
+      };
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ALLOW,
+      );
+    });
+
+    it('should allow permissions for subpaths of the workspace', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            fileSystem: {
+              read: [`${workspace}/subdir/file.txt`],
+            },
+          },
+        },
+      };
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ALLOW,
+      );
+    });
+
+    it('should downgrade ALLOW to ASK_USER if a read path is outside workspace', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            fileSystem: {
+              read: ['/outside'],
+            },
+          },
+        },
+      };
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ASK_USER,
+      );
+    });
+
+    it('should downgrade ALLOW to ASK_USER if a write path is outside workspace', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            fileSystem: {
+              write: ['/outside/secret.txt'],
+            },
+          },
+        },
+      };
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ASK_USER,
+      );
+    });
+
+    it('should downgrade ALLOW to ASK_USER if any path in a list is outside workspace', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            fileSystem: {
+              read: [`${workspace}/safe`, '/outside'],
+            },
+          },
+        },
+      };
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ASK_USER,
+      );
+    });
+
+    it('should handle missing or empty fileSystem permissions gracefully (ALLOW)', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            network: true,
+          },
+        },
+      };
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ALLOW,
+      );
+    });
+
+    it('should handle non-array fileSystem paths gracefully', async () => {
+      const call = {
+        name: 'run_shell_command',
+        args: {
+          command: 'ls',
+          additional_permissions: {
+            fileSystem: {
+              read: '/not/an/array' as never as string[],
+            },
+          },
+        },
+      };
+      // It should just ignore the non-array and keep ALLOW if no other rules trigger
+      expect((await engine.check(call, undefined)).decision).toBe(
+        PolicyDecision.ALLOW,
+      );
+    });
+  });
+
+  describe('Build File Protection', () => {
+    it('should allow regular files in AUTO_EDIT mode but require ASK_USER for build files', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'replace',
+          decision: PolicyDecision.ALLOW,
+          modes: [ApprovalMode.AUTO_EDIT],
+        },
+        {
+          toolName: 'write_file',
+          decision: PolicyDecision.ALLOW,
+          modes: [ApprovalMode.AUTO_EDIT],
+        },
+      ];
+      const engine = new PolicyEngine({
+        rules,
+        approvalMode: ApprovalMode.AUTO_EDIT,
+      });
+
+      // Regular source file should be ALLOWed
+      const regularCheck = await engine.check(
+        {
+          name: 'replace',
+          args: { file_path: 'src/index.ts', instruction: 'edit' },
+        },
+        undefined,
+      );
+      expect(regularCheck.decision).toBe(PolicyDecision.ALLOW);
+
+      // Bazel BUILD file should require ASK_USER
+      const buildCheck = await engine.check(
+        {
+          name: 'replace',
+          args: { file_path: 'pkg/BUILD', instruction: 'edit' },
+        },
+        undefined,
+      );
+      expect(buildCheck.decision).toBe(PolicyDecision.ASK_USER);
+      expect(buildCheck.rule?.source).toBe('Build File Protection');
+
+      // WORKSPACE file should require ASK_USER
+      const workspaceCheck = await engine.check(
+        {
+          name: 'replace',
+          args: { file_path: 'WORKSPACE', instruction: 'edit' },
+        },
+        undefined,
+      );
+      expect(workspaceCheck.decision).toBe(PolicyDecision.ASK_USER);
+
+      // package.json should require ASK_USER
+      const packageJsonCheck = await engine.check(
+        {
+          name: 'write_file',
+          args: { file_path: 'package.json', content: '{}' },
+        },
+        undefined,
+      );
+      expect(packageJsonCheck.decision).toBe(PolicyDecision.ASK_USER);
+
+      // Makefile should require ASK_USER
+      const makefileCheck = await engine.check(
+        {
+          name: 'write_file',
+          args: { file_path: 'Makefile', content: 'all:\n\techo hi' },
+        },
+        undefined,
+      );
+      expect(makefileCheck.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should require ASK_USER for build files even in YOLO mode', async () => {
+      const engine = new PolicyEngine({
+        approvalMode: ApprovalMode.YOLO,
+      });
+
+      // Regular file should be ALLOWed in YOLO mode
+      const regularCheck = await engine.check(
+        {
+          name: 'replace',
+          args: { file_path: 'src/main.py', instruction: 'edit' },
+        },
+        undefined,
+      );
+      expect(regularCheck.decision).toBe(PolicyDecision.ALLOW);
+
+      // BUILD.bazel must still require ASK_USER
+      const buildCheck = await engine.check(
+        {
+          name: 'replace',
+          args: { file_path: 'BUILD.bazel', instruction: 'edit' },
+        },
+        undefined,
+      );
+      expect(buildCheck.decision).toBe(PolicyDecision.ASK_USER);
+    });
+
+    it('should return DENY for build files in nonInteractive mode when otherwise ALLOWed', async () => {
+      const rules: PolicyRule[] = [
+        {
+          toolName: 'replace',
+          decision: PolicyDecision.ALLOW,
+        },
+      ];
+      const engine = new PolicyEngine({
+        rules,
+        nonInteractive: true,
+      });
+
+      const buildCheck = await engine.check(
+        {
+          name: 'replace',
+          args: { file_path: 'BUILD', instruction: 'edit' },
+        },
+        undefined,
+      );
+      expect(buildCheck.decision).toBe(PolicyDecision.DENY);
     });
   });
 });

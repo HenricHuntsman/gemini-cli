@@ -131,6 +131,7 @@ describe('E2E Tests', () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('should create a new task and stream status updates (text-content) via POST /', async () => {
@@ -228,7 +229,7 @@ describe('E2E Tests', () => {
     expect(toolCallUpdateEvent.status.message?.parts).toMatchObject([
       {
         data: {
-          status: 'validating',
+          status: 'scheduled',
           request: { callId: 'test-call-id' },
         },
       },
@@ -330,7 +331,7 @@ describe('E2E Tests', () => {
     expect(toolCallValidateEvent1.status.message?.parts).toMatchObject([
       {
         data: {
-          status: 'validating',
+          status: 'scheduled',
           request: { callId: 'test-call-id-1' },
         },
       },
@@ -352,7 +353,7 @@ describe('E2E Tests', () => {
       kind: 'state-change',
     });
 
-    // 4. Tool 1 is validating.
+    // 4. Tool 1 is scheduled.
     const toolCallUpdate1 = events[3].result as TaskStatusUpdateEvent;
     expect(toolCallUpdate1.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
@@ -361,12 +362,12 @@ describe('E2E Tests', () => {
       {
         data: {
           request: { callId: 'test-call-id-1' },
-          status: 'validating',
+          status: 'scheduled',
         },
       },
     ]);
 
-    // 5. Tool 2 is validating.
+    // 5. Tool 2 is scheduled.
     const toolCallUpdate2 = events[4].result as TaskStatusUpdateEvent;
     expect(toolCallUpdate2.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
@@ -375,17 +376,17 @@ describe('E2E Tests', () => {
       {
         data: {
           request: { callId: 'test-call-id-2' },
-          status: 'validating',
+          status: 'scheduled',
         },
       },
     ]);
 
     // 6. Tool 1 is awaiting approval.
-    const toolCallAwaitEvent = events[5].result as TaskStatusUpdateEvent;
-    expect(toolCallAwaitEvent.metadata?.['coderAgent']).toMatchObject({
+    const toolCallAwaitEvent1 = events[5].result as TaskStatusUpdateEvent;
+    expect(toolCallAwaitEvent1.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-confirmation',
     });
-    expect(toolCallAwaitEvent.status.message?.parts).toMatchObject([
+    expect(toolCallAwaitEvent1.status.message?.parts).toMatchObject([
       {
         data: {
           request: { callId: 'test-call-id-1' },
@@ -394,14 +395,257 @@ describe('E2E Tests', () => {
       },
     ]);
 
-    // 7. The final event is "input-required".
-    const finalEvent = events[6].result as TaskStatusUpdateEvent;
+    // 7. Tool 2 is awaiting approval.
+    const toolCallAwaitEvent2 = events[6].result as TaskStatusUpdateEvent;
+    expect(toolCallAwaitEvent2.metadata?.['coderAgent']).toMatchObject({
+      kind: 'tool-call-confirmation',
+    });
+    expect(toolCallAwaitEvent2.status.message?.parts).toMatchObject([
+      {
+        data: {
+          request: { callId: 'test-call-id-2' },
+          status: 'awaiting_approval',
+        },
+      },
+    ]);
+
+    // 8. The final event is "input-required".
+    const finalEvent = events[7].result as TaskStatusUpdateEvent;
     expect(finalEvent.final).toBe(true);
     expect(finalEvent.status.state).toBe('input-required');
 
     // The scheduler now waits for approval, so no more events are sent.
     assertUniqueFinalEventIsLast(events);
-    expect(events.length).toBe(7);
+    expect(events.length).toBe(8);
+  });
+
+  it('should continue to the next sequential edit tool call when the first is rejected', async () => {
+    const coreMod = await import('@google/gemini-cli-core');
+    const originalGetMessageBus = config?.getMessageBus;
+
+    sendMessageStreamSpy.mockImplementationOnce(async function* () {
+      yield* [
+        {
+          type: GeminiEventType.ToolCallRequest,
+          value: {
+            callId: 'write-call-1',
+            name: 'write_file',
+            args: { file_path: '/tmp/file1.txt', content: 'one' },
+          },
+        },
+        {
+          type: GeminiEventType.ToolCallRequest,
+          value: {
+            callId: 'write-call-2',
+            name: 'write_file',
+            args: { file_path: '/tmp/file2.txt', content: 'two' },
+          },
+        },
+      ];
+    });
+    sendMessageStreamSpy.mockImplementation(async function* () {
+      yield* [{ type: 'content', value: 'Completed batch.' }];
+    });
+
+    const mockWriteTool = new MockTool({
+      name: 'write_file',
+      displayName: 'Write File',
+      shouldConfirmExecute: vi.fn(
+        async () =>
+          ({
+            type: 'edit',
+            title: 'Confirm write_file',
+            fileName: 'file.txt',
+            fileDiff: 'diff',
+            filePath: '/tmp/file.txt',
+            originalContent: '',
+            newContent: 'content',
+          }) as unknown as ToolCallConfirmationDetails,
+      ),
+      execute: vi.fn().mockResolvedValue({
+        llmContent: 'File written successfully.',
+        returnDisplay: 'File written successfully.',
+      }),
+    });
+
+    getToolRegistrySpy.mockReturnValue({
+      getAllTools: vi.fn().mockReturnValue([mockWriteTool]),
+      getToolsByServer: vi.fn().mockReturnValue([]),
+      getAllToolNames: vi.fn().mockReturnValue(['write_file']),
+      getTool: vi.fn().mockImplementation((name: string) => {
+        if (name === 'write_file') return mockWriteTool;
+        return undefined;
+      }),
+    });
+
+    const configMod = await import('../config/config.js');
+    vi.mocked(configMod.loadConfig).mockImplementationOnce(async () => {
+      const mockConfig = createMockConfig({
+        getToolRegistry: getToolRegistrySpy,
+        getApprovalMode: getApprovalModeSpy,
+        getShellExecutionConfig: getShellExecutionConfigSpy,
+        getExtensions: getExtensionsSpy,
+      }) as Config;
+      const realBus = new coreMod.MessageBus(mockConfig.getPolicyEngine());
+      mockConfig.getMessageBus = vi.fn().mockReturnValue(realBus);
+      config = mockConfig;
+      return config;
+    });
+
+    const agent = request.agent(app);
+
+    // 1. Initial prompt schedules write-call-1 and write-call-2.
+    // write-call-1 transitions to awaiting_approval while write-call-2 stays queued.
+    const res1 = await agent
+      .post('/')
+      .send(
+        createStreamMessageRequest('create two files', 'a2a-seq-edit-msg-1'),
+      )
+      .set('Content-Type', 'application/json')
+      .expect(200);
+
+    const events1 = streamToSSEEvents(res1.text);
+    assertTaskCreationAndWorkingStatus(events1);
+    assertUniqueFinalEventIsLast(events1);
+
+    const taskId = (events1[0].result as { id: string }).id;
+
+    // Verify write-call-1 is awaiting_approval in stream 1
+    const awaitingCall1 = events1.find((e) => {
+      const update = e.result as TaskStatusUpdateEvent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const part = update.status?.message?.parts?.[0] as any;
+      return (
+        part?.data?.request?.callId === 'write-call-1' &&
+        part?.data?.status === 'awaiting_approval'
+      );
+    });
+    expect(awaitingCall1).toBeDefined();
+
+    // 2. Reject write-call-1 (outcome: 'cancel')
+    const res2 = await agent
+      .post('/')
+      .send({
+        jsonrpc: '2.0',
+        id: '2',
+        method: 'message/stream',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId,
+            parts: [
+              {
+                kind: 'data',
+                data: {
+                  callId: 'write-call-1',
+                  outcome: 'cancel',
+                },
+              },
+            ],
+            messageId: 'a2a-seq-edit-msg-2',
+          },
+          metadata: {
+            coderAgent: {
+              kind: 'agent-settings',
+              workspacePath: '/tmp',
+            },
+          },
+        },
+      })
+      .set('Content-Type', 'application/json')
+      .expect(200);
+
+    const events2 = streamToSSEEvents(res2.text);
+    assertUniqueFinalEventIsLast(events2);
+
+    // Verify write-call-1 was cancelled, and write-call-2 was NOT auto-cancelled,
+    // instead transitioning to awaiting_approval!
+    const cancelledCall1 = events2.find((e) => {
+      const update = e.result as TaskStatusUpdateEvent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const part = update.status?.message?.parts?.[0] as any;
+      return (
+        part?.data?.request?.callId === 'write-call-1' &&
+        part?.data?.status === 'cancelled'
+      );
+    });
+    expect(cancelledCall1).toBeDefined();
+
+    const cancelledCall2 = events2.find((e) => {
+      const update = e.result as TaskStatusUpdateEvent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const part = update.status?.message?.parts?.[0] as any;
+      return (
+        part?.data?.request?.callId === 'write-call-2' &&
+        part?.data?.status === 'cancelled'
+      );
+    });
+    expect(cancelledCall2).toBeUndefined();
+
+    const awaitingCall2 = events2.find((e) => {
+      const update = e.result as TaskStatusUpdateEvent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const part = update.status?.message?.parts?.[0] as any;
+      return (
+        part?.data?.request?.callId === 'write-call-2' &&
+        part?.data?.status === 'awaiting_approval'
+      );
+    });
+    expect(awaitingCall2).toBeDefined();
+
+    // 3. Approve write-call-2 (outcome: 'proceed_once')
+    const res3 = await agent
+      .post('/')
+      .send({
+        jsonrpc: '2.0',
+        id: '3',
+        method: 'message/stream',
+        params: {
+          message: {
+            kind: 'message',
+            role: 'user',
+            taskId,
+            parts: [
+              {
+                kind: 'data',
+                data: {
+                  callId: 'write-call-2',
+                  outcome: 'proceed_once',
+                },
+              },
+            ],
+            messageId: 'a2a-seq-edit-msg-3',
+          },
+          metadata: {
+            coderAgent: {
+              kind: 'agent-settings',
+              workspacePath: '/tmp',
+            },
+          },
+        },
+      })
+      .set('Content-Type', 'application/json')
+      .expect(200);
+
+    const events3 = streamToSSEEvents(res3.text);
+    assertUniqueFinalEventIsLast(events3);
+
+    const successCall2 = events3.find((e) => {
+      const update = e.result as TaskStatusUpdateEvent;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const part = update.status?.message?.parts?.[0] as any;
+      return (
+        part?.data?.request?.callId === 'write-call-2' &&
+        part?.data?.status === 'success'
+      );
+    });
+    expect(successCall2).toBeDefined();
+    expect(mockWriteTool.execute).toHaveBeenCalledTimes(1);
+
+    if (originalGetMessageBus && config) {
+      config.getMessageBus = originalGetMessageBus;
+    }
   });
 
   it('should handle multiple tool calls sequentially in YOLO mode', async () => {
@@ -499,7 +743,7 @@ describe('E2E Tests', () => {
       // Tool 1 Lifecycle
       {
         kind: 'tool-call-update',
-        status: 'validating',
+        status: 'scheduled',
         callId: 'test-call-id-1',
       },
       {
@@ -520,7 +764,7 @@ describe('E2E Tests', () => {
       // Tool 2 Lifecycle
       {
         kind: 'tool-call-update',
-        status: 'validating',
+        status: 'scheduled',
         callId: 'test-call-id-2',
       },
       {
@@ -603,26 +847,40 @@ describe('E2E Tests', () => {
     expect(workingEvent2.kind).toBe('status-update');
     expect(workingEvent2.status.state).toBe('working');
 
-    // Status update: tool-call-update (validating)
-    const validatingEvent = events[3].result as TaskStatusUpdateEvent;
-    expect(validatingEvent.metadata?.['coderAgent']).toMatchObject({
+    // Status update: tool-call-update (scheduled)
+    const scheduledEvent1 = events[3].result as TaskStatusUpdateEvent;
+    expect(scheduledEvent1.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
-    expect(validatingEvent.status.message?.parts).toMatchObject([
+    expect(scheduledEvent1.status.message?.parts).toMatchObject([
       {
         data: {
-          status: 'validating',
+          status: 'scheduled',
           request: { callId: 'test-call-id-no-approval' },
         },
       },
     ]);
 
     // Status update: tool-call-update (scheduled)
-    const scheduledEvent = events[4].result as TaskStatusUpdateEvent;
-    expect(scheduledEvent.metadata?.['coderAgent']).toMatchObject({
+    const scheduledEvent2 = events[4].result as TaskStatusUpdateEvent;
+    expect(scheduledEvent2.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
-    expect(scheduledEvent.status.message?.parts).toMatchObject([
+    expect(scheduledEvent2.status.message?.parts).toMatchObject([
+      {
+        data: {
+          status: 'scheduled',
+          request: { callId: 'test-call-id-no-approval' },
+        },
+      },
+    ]);
+
+    // Status update: tool-call-update (scheduled)
+    const scheduledEvent3 = events[5].result as TaskStatusUpdateEvent;
+    expect(scheduledEvent3.metadata?.['coderAgent']).toMatchObject({
+      kind: 'tool-call-update',
+    });
+    expect(scheduledEvent3.status.message?.parts).toMatchObject([
       {
         data: {
           status: 'scheduled',
@@ -632,7 +890,7 @@ describe('E2E Tests', () => {
     ]);
 
     // Status update: tool-call-update (executing)
-    const executingEvent = events[5].result as TaskStatusUpdateEvent;
+    const executingEvent = events[6].result as TaskStatusUpdateEvent;
     expect(executingEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
@@ -646,7 +904,7 @@ describe('E2E Tests', () => {
     ]);
 
     // Status update: tool-call-update (success)
-    const successEvent = events[6].result as TaskStatusUpdateEvent;
+    const successEvent = events[7].result as TaskStatusUpdateEvent;
     expect(successEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
@@ -660,12 +918,12 @@ describe('E2E Tests', () => {
     ]);
 
     // Status update: working (before sending tool result to LLM)
-    const workingEvent3 = events[7].result as TaskStatusUpdateEvent;
+    const workingEvent3 = events[8].result as TaskStatusUpdateEvent;
     expect(workingEvent3.kind).toBe('status-update');
     expect(workingEvent3.status.state).toBe('working');
 
     // Status update: text-content (final LLM response)
-    const textContentEvent = events[8].result as TaskStatusUpdateEvent;
+    const textContentEvent = events[9].result as TaskStatusUpdateEvent;
     expect(textContentEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'text-content',
     });
@@ -674,7 +932,7 @@ describe('E2E Tests', () => {
     ]);
 
     assertUniqueFinalEventIsLast(events);
-    expect(events.length).toBe(10);
+    expect(events.length).toBe(11);
   });
 
   it('should bypass tool approval in YOLO mode', async () => {
@@ -734,15 +992,15 @@ describe('E2E Tests', () => {
     expect(workingEvent2.kind).toBe('status-update');
     expect(workingEvent2.status.state).toBe('working');
 
-    // Status update: tool-call-update (validating)
-    const validatingEvent = events[3].result as TaskStatusUpdateEvent;
-    expect(validatingEvent.metadata?.['coderAgent']).toMatchObject({
+    // Status update: tool-call-update (scheduled)
+    const scheduledEvent = events[3].result as TaskStatusUpdateEvent;
+    expect(scheduledEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
-    expect(validatingEvent.status.message?.parts).toMatchObject([
+    expect(scheduledEvent.status.message?.parts).toMatchObject([
       {
         data: {
-          status: 'validating',
+          status: 'scheduled',
           request: { callId: 'test-call-id-yolo' },
         },
       },
@@ -762,8 +1020,22 @@ describe('E2E Tests', () => {
       },
     ]);
 
+    // Status update: tool-call-update (scheduled)
+    const scheduledEvent3 = events[5].result as TaskStatusUpdateEvent;
+    expect(scheduledEvent3.metadata?.['coderAgent']).toMatchObject({
+      kind: 'tool-call-update',
+    });
+    expect(scheduledEvent3.status.message?.parts).toMatchObject([
+      {
+        data: {
+          status: 'scheduled',
+          request: { callId: 'test-call-id-yolo' },
+        },
+      },
+    ]);
+
     // Status update: tool-call-update (executing)
-    const executingEvent = events[5].result as TaskStatusUpdateEvent;
+    const executingEvent = events[6].result as TaskStatusUpdateEvent;
     expect(executingEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
@@ -777,7 +1049,7 @@ describe('E2E Tests', () => {
     ]);
 
     // Status update: tool-call-update (success)
-    const successEvent = events[6].result as TaskStatusUpdateEvent;
+    const successEvent = events[7].result as TaskStatusUpdateEvent;
     expect(successEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'tool-call-update',
     });
@@ -791,12 +1063,12 @@ describe('E2E Tests', () => {
     ]);
 
     // Status update: working (before sending tool result to LLM)
-    const workingEvent3 = events[7].result as TaskStatusUpdateEvent;
+    const workingEvent3 = events[8].result as TaskStatusUpdateEvent;
     expect(workingEvent3.kind).toBe('status-update');
     expect(workingEvent3.status.state).toBe('working');
 
     // Status update: text-content (final LLM response)
-    const textContentEvent = events[8].result as TaskStatusUpdateEvent;
+    const textContentEvent = events[9].result as TaskStatusUpdateEvent;
     expect(textContentEvent.metadata?.['coderAgent']).toMatchObject({
       kind: 'text-content',
     });
@@ -805,7 +1077,7 @@ describe('E2E Tests', () => {
     ]);
 
     assertUniqueFinalEventIsLast(events);
-    expect(events.length).toBe(10);
+    expect(events.length).toBe(11);
   });
 
   it('should include traceId in status updates when available', async () => {
@@ -1017,7 +1289,7 @@ describe('E2E Tests', () => {
       };
       vi.spyOn(commandRegistry, 'get').mockReturnValue(mockCommand);
 
-      delete process.env['CODER_AGENT_WORKSPACE_PATH'];
+      vi.stubEnv('CODER_AGENT_WORKSPACE_PATH', '');
       const response = await request(app)
         .post('/executeCommand')
         .send({ command: 'test-command', args: [] });
@@ -1037,7 +1309,7 @@ describe('E2E Tests', () => {
       };
       vi.spyOn(commandRegistry, 'get').mockReturnValue(mockWorkspaceCommand);
 
-      delete process.env['CODER_AGENT_WORKSPACE_PATH'];
+      vi.stubEnv('CODER_AGENT_WORKSPACE_PATH', '');
       const response = await request(app)
         .post('/executeCommand')
         .send({ command: 'workspace-command', args: [] });
@@ -1059,7 +1331,7 @@ describe('E2E Tests', () => {
       };
       vi.spyOn(commandRegistry, 'get').mockReturnValue(mockWorkspaceCommand);
 
-      process.env['CODER_AGENT_WORKSPACE_PATH'] = '/tmp/test-workspace';
+      vi.stubEnv('CODER_AGENT_WORKSPACE_PATH', '/tmp/test-workspace');
       const response = await request(app)
         .post('/executeCommand')
         .send({ command: 'workspace-command', args: [] });
@@ -1218,6 +1490,55 @@ describe('E2E Tests', () => {
 
       listenSpy.mockRestore();
       exitSpy.mockRestore();
+    });
+  });
+
+  describe('createApp V2 settings compatibility', () => {
+    it('should read V2 security.folderTrust.enabled from loadSettings during app initialization', async () => {
+      const settingsMod = await import('../config/settings.js');
+      const coreMod = await import('@google/gemini-cli-core');
+      const configMod = await import('../config/config.js');
+
+      const loadSettingsSpy = vi
+        .spyOn(settingsMod, 'loadSettings')
+        .mockReturnValue({
+          security: {
+            folderTrust: {
+              enabled: false,
+            },
+          },
+          logging: {
+            level: 'debug',
+          },
+        });
+      const checkPathTrustSpy = vi
+        .spyOn(coreMod, 'checkPathTrust')
+        .mockReturnValue({ isTrusted: true, source: 'file' });
+
+      await createApp();
+
+      expect(loadSettingsSpy).toHaveBeenCalled();
+      expect(checkPathTrustSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          isFolderTrustEnabled: false,
+        }),
+      );
+      expect(configMod.loadConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          security: {
+            folderTrust: {
+              enabled: false,
+            },
+          },
+        }),
+        expect.anything(),
+        'a2a-server',
+        true,
+        expect.any(String),
+      );
+
+      loadSettingsSpy.mockRestore();
+      checkPathTrustSpy.mockRestore();
     });
   });
 });

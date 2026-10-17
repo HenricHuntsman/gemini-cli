@@ -15,6 +15,7 @@ import { debugLogger } from './debugLogger.js';
 import {
   TerminalQuotaError,
   RetryableQuotaError,
+  ValidationRequiredError,
 } from './googleQuotaErrors.js';
 import { PREVIEW_GEMINI_MODEL } from '../config/models.js';
 import type { ModelPolicy } from '../availability/modelPolicy.js';
@@ -451,6 +452,25 @@ describe('retryWithBackoff', () => {
       });
       await vi.runAllTimersAsync();
       await expect(promise).resolves.toBe('success');
+      expect(mockFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should retry on undici timeout error codes (UND_ERR_HEADERS_TIMEOUT)', async () => {
+      const error = new Error('Headers timeout error');
+      (error as any).code = 'UND_ERR_HEADERS_TIMEOUT';
+      const mockFn = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      const promise = retryWithBackoff(mockFn, {
+        retryFetchErrors: false,
+        initialDelayMs: 1,
+        maxDelayMs: 1,
+      });
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBe('success');
+      expect(mockFn).toHaveBeenCalledTimes(2);
     });
 
     it('should retry on SSL error code (ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC)', async () => {
@@ -497,6 +517,40 @@ describe('retryWithBackoff', () => {
     it('should retry on EPROTO error (generic protocol/SSL error)', async () => {
       const error = new Error('Protocol error');
       (error as any).code = 'EPROTO';
+      const mockFn = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      const promise = retryWithBackoff(mockFn, {
+        initialDelayMs: 1,
+        maxDelayMs: 1,
+      });
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBe('success');
+      expect(mockFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should retry on OpenSSL 3.x SSL error code (ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC)', async () => {
+      const error = new Error('SSL error');
+      (error as any).code = 'ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC';
+      const mockFn = vi
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('success');
+
+      const promise = retryWithBackoff(mockFn, {
+        initialDelayMs: 1,
+        maxDelayMs: 1,
+      });
+      await vi.runAllTimersAsync();
+      await expect(promise).resolves.toBe('success');
+      expect(mockFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should retry on unknown SSL BAD_RECORD_MAC variant via substring fallback', async () => {
+      const error = new Error('SSL error');
+      (error as any).code = 'ERR_SSL_SOME_FUTURE_BAD_RECORD_MAC';
       const mockFn = vi
         .fn()
         .mockRejectedValueOnce(error)
@@ -634,6 +688,58 @@ describe('retryWithBackoff', () => {
     );
     expect(mockFn).toHaveBeenCalledTimes(1);
   });
+
+  it('should not emit onRetry when aborted before catch retry handling', async () => {
+    const abortController = new AbortController();
+    const onRetry = vi.fn();
+    const mockFn = vi.fn().mockImplementation(async () => {
+      const error = new Error('Server error') as HttpError;
+      error.status = 500;
+      abortController.abort();
+      throw error;
+    });
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 100,
+      signal: abortController.signal,
+      onRetry,
+    });
+
+    await expect(promise).rejects.toThrow(
+      expect.objectContaining({ name: 'AbortError' }),
+    );
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(debugLogger.warn).not.toHaveBeenCalled();
+    expect(mockFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('should not emit onRetry when aborted before content retry handling', async () => {
+    const abortController = new AbortController();
+    const onRetry = vi.fn();
+    const shouldRetryOnContent = vi.fn().mockImplementation(() => {
+      abortController.abort();
+      return true;
+    });
+    const mockFn = vi.fn().mockResolvedValue({});
+
+    const promise = retryWithBackoff(mockFn, {
+      maxAttempts: 3,
+      initialDelayMs: 100,
+      signal: abortController.signal,
+      onRetry,
+      shouldRetryOnContent,
+    });
+
+    await expect(promise).rejects.toThrow(
+      expect.objectContaining({ name: 'AbortError' }),
+    );
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(debugLogger.warn).not.toHaveBeenCalled();
+    expect(shouldRetryOnContent).toHaveBeenCalledTimes(1);
+    expect(mockFn).toHaveBeenCalledTimes(1);
+  });
+
   it('should trigger fallback for OAuth personal users on persistent 500 errors', async () => {
     const fallbackCallback = vi.fn().mockResolvedValue('gemini-2.5-flash');
 
@@ -831,6 +937,169 @@ describe('retryWithBackoff', () => {
         getAvailabilityContext: getContext,
       }).catch(() => {});
       expect(mockService.markTerminal).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Capacity Exhaustion Context-Aware Retries (Option 2)', () => {
+    it('should retry automatically when onPersistent429 is undefined (unattended runs)', async () => {
+      const capacityError = new TerminalQuotaError(
+        'Resource has been exhausted (e.g. MODEL_CAPACITY_EXHAUSTED).',
+        {
+          code: 429,
+          message: 'MODEL_CAPACITY_EXHAUSTED',
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: 'MODEL_CAPACITY_EXHAUSTED',
+            },
+          ],
+        },
+        undefined,
+        'MODEL_CAPACITY_EXHAUSTED',
+      );
+
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(capacityError)
+        .mockResolvedValue('success');
+
+      const promise = retryWithBackoff(fn, {
+        maxAttempts: 3,
+        initialDelayMs: 1,
+        maxDelayMs: 2,
+        onPersistent429: undefined, // unattended mode
+      });
+
+      await vi.runAllTimersAsync();
+      const result = await promise;
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should silently retry up to 2 times and succeed on the 3rd attempt in interactive mode without calling onPersistent429', async () => {
+      const capacityError = new TerminalQuotaError(
+        'Resource has been exhausted (e.g. MODEL_CAPACITY_EXHAUSTED).',
+        {
+          code: 429,
+          message: 'MODEL_CAPACITY_EXHAUSTED',
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: 'MODEL_CAPACITY_EXHAUSTED',
+            },
+          ],
+        },
+        undefined,
+        'MODEL_CAPACITY_EXHAUSTED',
+      );
+
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(capacityError)
+        .mockRejectedValueOnce(capacityError)
+        .mockResolvedValue('success');
+
+      const onPersistent429 = vi.fn().mockResolvedValue(null);
+
+      const promise = retryWithBackoff(fn, {
+        maxAttempts: 5,
+        initialDelayMs: 1,
+        maxDelayMs: 2,
+        onPersistent429, // interactive mode
+      });
+
+      await vi.runAllTimersAsync();
+      const result = await promise;
+      expect(result).toBe('success');
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(onPersistent429).not.toHaveBeenCalled();
+    });
+
+    it('should silently retry up to 2 times and invoke onPersistent429 on the 3rd failure in interactive mode', async () => {
+      const capacityError = new TerminalQuotaError(
+        'Resource has been exhausted (e.g. MODEL_CAPACITY_EXHAUSTED).',
+        {
+          code: 429,
+          message: 'MODEL_CAPACITY_EXHAUSTED',
+          details: [
+            {
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: 'MODEL_CAPACITY_EXHAUSTED',
+            },
+          ],
+        },
+        undefined,
+        'MODEL_CAPACITY_EXHAUSTED',
+      );
+
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(capacityError)
+        .mockRejectedValueOnce(capacityError)
+        .mockRejectedValueOnce(capacityError)
+        .mockResolvedValue('success');
+
+      const onPersistent429 = vi.fn().mockResolvedValue(null);
+
+      const promise = retryWithBackoff(fn, {
+        maxAttempts: 5,
+        initialDelayMs: 1,
+        maxDelayMs: 2,
+        onPersistent429, // interactive mode
+      });
+
+      await Promise.all([
+        expect(promise).rejects.toThrow(TerminalQuotaError),
+        vi.runAllTimersAsync(),
+      ]);
+      expect(fn).toHaveBeenCalledTimes(3);
+      expect(onPersistent429).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('ValidationRequiredError handling', () => {
+    it('should retry and resolve when onValidationRequired returns verify', async () => {
+      const validationError = new ValidationRequiredError(
+        'Validation required',
+        undefined,
+        'https://accounts.google.com/verify',
+        'Please verify',
+      );
+      const fn = vi
+        .fn()
+        .mockRejectedValueOnce(validationError)
+        .mockResolvedValueOnce('verified-success');
+      const onValidationRequired = vi.fn().mockResolvedValue('verify');
+
+      const result = await retryWithBackoff(fn, {
+        maxAttempts: 2,
+        onValidationRequired,
+      });
+
+      expect(result).toBe('verified-success');
+      expect(onValidationRequired).toHaveBeenCalledTimes(1);
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it('should bound verification retries to prevent an infinite verification loop', async () => {
+      const validationError = new ValidationRequiredError(
+        'Validation required',
+        undefined,
+        'https://accounts.google.com/verify',
+        'Please verify',
+      );
+      const fn = vi.fn().mockRejectedValue(validationError);
+      const onValidationRequired = vi.fn().mockResolvedValue('verify');
+
+      await expect(
+        retryWithBackoff(fn, {
+          maxAttempts: 2,
+          onValidationRequired,
+        }),
+      ).rejects.toThrow(ValidationRequiredError);
+
+      expect(onValidationRequired).toHaveBeenCalledTimes(3);
+      expect(fn).toHaveBeenCalledTimes(4);
     });
   });
 });

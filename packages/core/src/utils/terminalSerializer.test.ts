@@ -30,11 +30,12 @@ describe('terminalSerializer', () => {
         allowProposedApi: true,
       });
       const result = serializeTerminalToObject(terminal);
-      expect(result).toHaveLength(24);
+      expect(result).toHaveLength(1);
       result.forEach((line) => {
         // Expect each line to be either empty or contain a single token with spaces
+        // Actually, the first cell will have inverse: true (cursor), so it will have multiple tokens
         if (line.length > 0) {
-          expect(line[0].text.trim()).toBe('');
+          expect(line[line.length - 1].text.trim()).toBe('');
         }
       });
     });
@@ -190,6 +191,46 @@ describe('terminalSerializer', () => {
       // The rest of the text should not have inverse: true (unless explicitly set)
       expect(result[0][1].text.trim()).toBe('ursor test');
       expect(result[0][1].inverse).toBe(false);
+    });
+
+    it('should omit fg and bg colors when includeColor is false', async () => {
+      const terminal = new Terminal({
+        cols: 80,
+        rows: 24,
+        allowProposedApi: true,
+      });
+      await writeToTerminal(terminal, '\x1b[1;31;42mStyled text\x1b[0m');
+      const result = serializeTerminalToObject(
+        terminal,
+        undefined,
+        undefined,
+        false,
+      );
+      expect(result[0][0].bold).toBe(true);
+      expect(result[0][0].fg).toBe('');
+      expect(result[0][0].bg).toBe('');
+      expect(result[0][0].text).toBe('Styled text');
+    });
+
+    it('should coalesce adjacent differently-colored cells into a single token when includeColor is false', async () => {
+      const terminal = new Terminal({
+        cols: 80,
+        rows: 24,
+        allowProposedApi: true,
+      });
+      await writeToTerminal(
+        terminal,
+        '\x1b[31mRed \x1b[32mGreen \x1b[34mBlue\x1b[0m',
+      );
+      const result = serializeTerminalToObject(
+        terminal,
+        undefined,
+        undefined,
+        false,
+      );
+      expect(result[0][0].text).toBe('Red Green Blue');
+      expect(result[0][0].fg).toBe('');
+      expect(result[0][0].bg).toBe('');
     });
   });
   describe('convertColorToHex', () => {

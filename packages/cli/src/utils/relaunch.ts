@@ -5,7 +5,13 @@
  */
 
 import { spawn } from 'node:child_process';
-import { RELAUNCH_EXIT_CODE } from './processUtils.js';
+import {
+  RELAUNCH_EXIT_CODE,
+  getSpawnConfig,
+  getScriptArgs,
+  setupSignalForwarding,
+  handleChildProcessClose,
+} from './processUtils.js';
 import {
   writeToStderr,
   type AdminControlsSettings,
@@ -16,7 +22,7 @@ export async function relaunchOnExitCode(runner: () => Promise<number>) {
     try {
       const exitCode = await runner();
 
-      if (exitCode !== RELAUNCH_EXIT_CODE) {
+      if (process.platform === 'android' || exitCode !== RELAUNCH_EXIT_CODE) {
         process.exit(exitCode);
       }
     } catch (error) {
@@ -43,44 +49,50 @@ export async function relaunchAppInChildProcess(
   let latestAdminSettings = remoteAdminSettings;
 
   const runner = () => {
-    // process.argv is [node, script, ...args]
-    // We want to construct [ ...nodeArgs, script, ...scriptArgs]
-    const script = process.argv[1];
-    const scriptArgs = process.argv.slice(2);
-
-    const nodeArgs = [
-      ...process.execArgv,
-      ...additionalNodeArgs,
-      script,
+    const scriptArgs = getScriptArgs();
+    const { spawnArgs, env: newEnv } = getSpawnConfig(additionalNodeArgs, [
       ...additionalScriptArgs,
       ...scriptArgs,
-    ];
-    const newEnv = { ...process.env, GEMINI_CLI_NO_RELAUNCH: 'true' };
+    ]);
 
     // The parent process should not be reading from stdin while the child is running.
     process.stdin.pause();
 
-    const child = spawn(process.execPath, nodeArgs, {
+    const child = spawn(process.execPath, spawnArgs, {
       stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
       env: newEnv,
     });
+
+    // Clear one-time auth override from supervisor environment after passing to child
+    delete process.env['GEMINI_CLI_AUTH_OVERRIDE'];
+    delete newEnv['GEMINI_CLI_AUTH_OVERRIDE'];
 
     if (latestAdminSettings) {
       child.send({ type: 'admin-settings', settings: latestAdminSettings });
     }
 
-    child.on('message', (msg: { type?: string; settings?: unknown }) => {
-      if (msg.type === 'admin-settings-update' && msg.settings) {
-        latestAdminSettings = msg.settings as AdminControlsSettings;
-      }
-    });
+    child.on(
+      'message',
+      (msg: { type?: string; settings?: unknown; authType?: string }) => {
+        if (msg.type === 'admin-settings-update' && msg.settings) {
+          latestAdminSettings = msg.settings as AdminControlsSettings;
+        }
+        if (msg.type === 'auth-selected-type' && msg.authType) {
+          process.env['GEMINI_CLI_AUTH_OVERRIDE'] = msg.authType;
+          newEnv['GEMINI_CLI_AUTH_OVERRIDE'] = msg.authType;
+        }
+      },
+    );
+
+    const removeForwarders = setupSignalForwarding(child);
 
     return new Promise<number>((resolve, reject) => {
-      child.on('error', reject);
-      child.on('close', (code) => {
-        // Resume stdin before the parent process exits.
-        process.stdin.resume();
-        resolve(code ?? 1);
+      child.on('error', (err) => {
+        removeForwarders();
+        reject(err);
+      });
+      child.on('close', (code, signal) => {
+        handleChildProcessClose(code, signal, removeForwarders, resolve);
       });
     });
   };

@@ -7,13 +7,18 @@
 import { CoreToolCallStatus } from '@google/gemini-cli-core';
 import { isShellTool } from '../components/messages/ToolShared.js';
 import { theme } from '../semantic-colors.js';
+export {
+  renderBorder,
+  safeRepeat,
+  renderNodeToOutput,
+} from './renderBorder.js';
 import type {
   HistoryItem,
   HistoryItemWithoutId,
   HistoryItemToolGroup,
   IndividualToolCallDisplay,
 } from '../types.js';
-import type { BackgroundShell } from '../hooks/shellReducer.js';
+import type { BackgroundTask } from '../hooks/shellReducer.js';
 import type { TrackedToolCall } from '../hooks/useToolScheduler.js';
 
 function isTrackedToolCall(
@@ -29,11 +34,14 @@ export function getToolGroupBorderAppearance(
   item:
     | HistoryItem
     | HistoryItemWithoutId
-    | { type: 'tool_group'; tools: TrackedToolCall[] },
+    | {
+        type: 'tool_group';
+        tools: Array<IndividualToolCallDisplay | TrackedToolCall>;
+      },
   activeShellPtyId: number | null | undefined,
   embeddedShellFocused: boolean | undefined,
   allPendingItems: HistoryItemWithoutId[] = [],
-  backgroundShells: Map<number, BackgroundShell> = new Map(),
+  backgroundTasks: Map<number, BackgroundTask> = new Map(),
 ): { borderColor: string; borderDimColor: boolean } {
   if (item.type !== 'tool_group') {
     return { borderColor: '', borderDimColor: false };
@@ -41,7 +49,7 @@ export function getToolGroupBorderAppearance(
 
   // If this item has no tools, it's a closing slice for the current batch.
   // We need to look at the last pending item to determine the batch's appearance.
-  const toolsToInspect: Array<IndividualToolCallDisplay | TrackedToolCall> =
+  const toolsToInspect =
     item.tools.length > 0
       ? item.tools
       : allPendingItems
@@ -100,7 +108,7 @@ export function getToolGroupBorderAppearance(
   // If we have an active PTY that isn't a background shell, then the current
   // pending batch is definitely a shell batch.
   const isCurrentlyInShellTurn =
-    !!activeShellPtyId && !backgroundShells.has(activeShellPtyId);
+    !!activeShellPtyId && !backgroundTasks.has(activeShellPtyId);
 
   const isShell =
     isShellCommand || (item.tools.length === 0 && isCurrentlyInShellTurn);

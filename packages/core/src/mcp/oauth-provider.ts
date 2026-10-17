@@ -10,7 +10,13 @@ import { openBrowserSecurely } from '../utils/secure-browser-launcher.js';
 import type { OAuthToken } from './token-storage/types.js';
 import { MCPOAuthTokenStorage } from './oauth-token-storage.js';
 import { getErrorMessage, FatalCancellationError } from '../utils/errors.js';
-import { OAuthUtils, ResourceMismatchError } from './oauth-utils.js';
+import {
+  OAuthUtils,
+  ResourceMismatchError,
+  OAuthSecurityError,
+  isLoopbackUrl,
+  validateOAuthEndpointUrl,
+} from './oauth-utils.js';
 import { coreEvents } from '../utils/events.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import { getConsentForOauth } from '../utils/authConsent.js';
@@ -21,7 +27,7 @@ import {
   buildAuthorizationUrl,
   exchangeCodeForToken,
   refreshAccessToken as refreshAccessTokenShared,
-  REDIRECT_PATH,
+  getRedirectUri,
   type OAuthFlowConfig,
   type OAuthTokenResponse,
 } from '../utils/oauth-flow.js';
@@ -47,6 +53,7 @@ export interface MCPOAuthConfig {
   redirectUri?: string;
   tokenParamName?: string; // For SSE connections, specifies the query parameter name for the token
   registrationUrl?: string;
+  authorizationResponseIssParameterSupported?: boolean;
 }
 
 /**
@@ -98,9 +105,19 @@ export class MCPOAuthProvider {
     registrationUrl: string,
     config: MCPOAuthConfig,
     redirectPort: number,
+    mcpServerUrl?: string,
   ): Promise<OAuthClientRegistrationResponse> {
-    const redirectUri =
-      config.redirectUri || `http://localhost:${redirectPort}${REDIRECT_PATH}`;
+    const allowLoopback = mcpServerUrl
+      ? isLoopbackUrl(mcpServerUrl)
+      : isLoopbackUrl(registrationUrl);
+    const validatedRegistrationUrl = await validateOAuthEndpointUrl(
+      registrationUrl,
+      {
+        allowLoopback,
+      },
+    );
+
+    const redirectUri = getRedirectUri(config, redirectPort);
 
     const registrationRequest: OAuthClientRegistrationRequest = {
       client_name: 'Gemini CLI MCP Client',
@@ -111,7 +128,7 @@ export class MCPOAuthProvider {
       scope: config.scopes?.join(' ') || '',
     };
 
-    const response = await fetch(registrationUrl, {
+    const response = await fetch(validatedRegistrationUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -145,12 +162,16 @@ export class MCPOAuthProvider {
 
   private async discoverAuthServerMetadataForRegistration(
     issuer: string,
+    mcpServerUrl?: string,
   ): Promise<{
     issuerUrl: string;
     metadata: NonNullable<
       Awaited<ReturnType<typeof OAuthUtils.discoverAuthorizationServerMetadata>>
     >;
   }> {
+    const allowLoopback = mcpServerUrl
+      ? isLoopbackUrl(mcpServerUrl)
+      : isLoopbackUrl(issuer);
     const authUrl = new URL(issuer);
 
     // Preserve path components for issuers with path-based discovery (e.g., Keycloak)
@@ -198,12 +219,14 @@ export class MCPOAuthProvider {
       Awaited<ReturnType<typeof OAuthUtils.discoverAuthorizationServerMetadata>>
     > | null = null;
 
-    for (const issuer of attemptedIssuers) {
-      debugLogger.debug(`   Trying issuer URL: ${issuer}`);
-      const metadata =
-        await OAuthUtils.discoverAuthorizationServerMetadata(issuer);
+    for (const issuerCandidate of attemptedIssuers) {
+      debugLogger.debug(`   Trying issuer URL: ${issuerCandidate}`);
+      const metadata = await OAuthUtils.discoverAuthorizationServerMetadata(
+        issuerCandidate,
+        { allowLoopback },
+      );
       if (metadata) {
-        selectedIssuer = issuer;
+        selectedIssuer = issuerCandidate;
         discoveredMetadata = metadata;
         break;
       }
@@ -322,6 +345,9 @@ export class MCPOAuthProvider {
                 issuer: discoveredConfig.issuer,
                 tokenUrl: discoveredConfig.tokenUrl,
                 scopes: config.scopes || discoveredConfig.scopes || [],
+                authorizationResponseIssParameterSupported:
+                  config.authorizationResponseIssParameterSupported ??
+                  discoveredConfig.authorizationResponseIssParameterSupported,
                 // Preserve existing client credentials
                 clientId: config.clientId,
                 clientSecret: config.clientSecret,
@@ -331,7 +357,10 @@ export class MCPOAuthProvider {
         }
       } catch (error) {
         // Re-throw security validation errors
-        if (error instanceof ResourceMismatchError) {
+        if (
+          error instanceof ResourceMismatchError ||
+          error instanceof OAuthSecurityError
+        ) {
           throw error;
         }
 
@@ -353,6 +382,9 @@ export class MCPOAuthProvider {
             issuer: discoveredConfig.issuer,
             scopes: config.scopes || discoveredConfig.scopes || [],
             registrationUrl: discoveredConfig.registrationUrl,
+            authorizationResponseIssParameterSupported:
+              config.authorizationResponseIssParameterSupported ??
+              discoveredConfig.authorizationResponseIssParameterSupported,
             // Preserve existing client credentials
             clientId: config.clientId,
             clientSecret: config.clientSecret,
@@ -372,8 +404,22 @@ export class MCPOAuthProvider {
     const preferredPort = getPortFromUrl(config.redirectUri);
 
     // Start callback server first to allocate port
-    // This ensures we only create one server and eliminates race conditions
-    const callbackServer = startCallbackServer(pkceParams.state, preferredPort);
+    // Pass config.issuer for RFC 9207 Authorization Server Issuer Identification / Mix-Up defense
+    debugLogger.debug(
+      `Starting callback server for "${serverName}" (expected issuer: ${config.issuer || 'none'})...`,
+    );
+    // RFC 9207: discovered metadata (or an explicit user setting) provides an
+    // explicit boolean. When the issuer was configured explicitly without
+    // discovery metadata, the "iss" parameter remains required by default.
+    const requireIssInResponse =
+      config.authorizationResponseIssParameterSupported ??
+      Boolean(config.issuer);
+    const callbackServer = startCallbackServer(
+      pkceParams.state,
+      preferredPort,
+      config.issuer,
+      requireIssInResponse,
+    );
 
     // Wait for server to start and get the allocated port
     // We need this port for client registration and auth URL building
@@ -393,7 +439,10 @@ export class MCPOAuthProvider {
 
         debugLogger.debug('→ Attempting dynamic client registration...');
         const { metadata: authServerMetadata } =
-          await this.discoverAuthServerMetadataForRegistration(config.issuer);
+          await this.discoverAuthServerMetadataForRegistration(
+            config.issuer,
+            mcpServerUrl,
+          );
         registrationUrl = authServerMetadata.registration_endpoint;
       }
 
@@ -403,6 +452,7 @@ export class MCPOAuthProvider {
           registrationUrl,
           config,
           redirectPort,
+          mcpServerUrl,
         );
 
         config.clientId = clientRegistration.client_id;
@@ -424,6 +474,19 @@ export class MCPOAuthProvider {
         'Missing required OAuth configuration after discovery and registration',
       );
     }
+
+    const allowLoopback = mcpServerUrl
+      ? isLoopbackUrl(mcpServerUrl)
+      : (config.authorizationUrl
+          ? isLoopbackUrl(config.authorizationUrl)
+          : false) ||
+        (config.tokenUrl ? isLoopbackUrl(config.tokenUrl) : false);
+    await validateOAuthEndpointUrl(config.authorizationUrl, {
+      allowLoopback,
+    });
+    await validateOAuthEndpointUrl(config.tokenUrl, {
+      allowLoopback,
+    });
 
     // Build flow config for shared utilities
     const flowConfig: OAuthFlowConfig = {
@@ -568,15 +631,18 @@ ${authUrl}
       return token.accessToken;
     }
 
-    // Try to refresh if we have a refresh token
-    if (token.refreshToken && config.clientId && credentials.tokenUrl) {
+    // Try to refresh if we have a refresh token. Fall back to the client ID
+    // persisted during dynamic client registration when the static config
+    // does not provide one.
+    const clientId = config.clientId ?? credentials.clientId;
+    if (token.refreshToken && clientId && credentials.tokenUrl) {
       try {
         debugLogger.log(
           `Refreshing expired token for MCP server: ${serverName}`,
         );
 
         const newTokenResponse = await this.refreshAccessToken(
-          config,
+          { ...config, clientId },
           token.refreshToken,
           credentials.tokenUrl,
           credentials.mcpServerUrl,
@@ -597,7 +663,7 @@ ${authUrl}
         await this.tokenStorage.saveToken(
           serverName,
           newToken,
-          config.clientId,
+          clientId,
           credentials.tokenUrl,
           credentials.mcpServerUrl,
         );
@@ -615,5 +681,75 @@ ${authUrl}
     }
 
     return null;
+  }
+  async getValidTokenWithMetadata(
+    serverName: string,
+    config: MCPOAuthConfig,
+  ): Promise<{
+    accessToken: string;
+    tokenType: string;
+    expiresAt?: number;
+    scope?: string;
+    refreshToken?: string;
+  } | null> {
+    const credentials = await this.tokenStorage.getCredentials(serverName);
+    if (!credentials) return null;
+
+    let current = credentials.token;
+
+    if (this.tokenStorage.isTokenExpired(current)) {
+      const clientId = config.clientId ?? credentials.clientId;
+      if (current.refreshToken && clientId && credentials.tokenUrl) {
+        try {
+          const newTokenResponse = await this.refreshAccessToken(
+            { ...config, clientId },
+            current.refreshToken,
+            credentials.tokenUrl,
+            credentials.mcpServerUrl,
+          );
+
+          const refreshed: OAuthToken = {
+            accessToken: newTokenResponse.access_token,
+            tokenType: newTokenResponse.token_type,
+            refreshToken:
+              newTokenResponse.refresh_token || current.refreshToken,
+            scope: newTokenResponse.scope || current.scope,
+          };
+
+          if (newTokenResponse.expires_in) {
+            refreshed.expiresAt =
+              Date.now() + newTokenResponse.expires_in * 1000;
+          }
+
+          await this.tokenStorage.saveToken(
+            serverName,
+            refreshed,
+            clientId,
+            credentials.tokenUrl,
+            credentials.mcpServerUrl,
+          );
+
+          current = refreshed;
+        } catch (error) {
+          coreEvents.emitFeedback(
+            'error',
+            'Failed to refresh auth token.',
+            error,
+          );
+          await this.tokenStorage.deleteCredentials(serverName);
+          return null;
+        }
+      } else {
+        return null;
+      }
+    }
+
+    return {
+      accessToken: current.accessToken,
+      tokenType: current.tokenType || 'Bearer',
+      expiresAt: current.expiresAt,
+      scope: current.scope,
+      refreshToken: current.refreshToken,
+    };
   }
 }

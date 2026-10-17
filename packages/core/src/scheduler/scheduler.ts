@@ -10,6 +10,7 @@ import type { MessageBus } from '../confirmation-bus/message-bus.js';
 import { SchedulerStateManager } from './state-manager.js';
 import { resolveConfirmation } from './confirmation.js';
 import { checkPolicy, updatePolicy, getPolicyDenialError } from './policy.js';
+import { evaluateBeforeToolHook } from './hook-utils.js';
 import { ToolExecutor } from './tool-executor.js';
 import { ToolModificationHandler } from './tool-modifier.js';
 import {
@@ -25,15 +26,18 @@ import {
   type ScheduledToolCall,
 } from './types.js';
 import { ToolErrorType } from '../tools/tool-error.js';
+import { UPDATE_TOPIC_TOOL_NAME } from '../tools/tool-names.js';
 import { PolicyDecision, type ApprovalMode } from '../policy/types.js';
 import {
+  Kind,
   ToolConfirmationOutcome,
   type AnyDeclarativeTool,
 } from '../tools/tools.js';
-import { getToolSuggestion } from '../utils/tool-utils.js';
+import { getToolSuggestion, isParallelizable } from '../utils/tool-utils.js';
 import { runInDevTraceSpan } from '../telemetry/trace.js';
 import { logToolCall } from '../telemetry/loggers.js';
 import { ToolCallEvent } from '../telemetry/types.js';
+import { populateToolDisplay } from '../agent/tool-display-utils.js';
 import type { EditorType } from '../utils/editor.js';
 import {
   MessageBusType,
@@ -63,6 +67,23 @@ export interface SchedulerOptions {
   subagent?: string;
   parentCallId?: string;
   onWaitingForConfirmation?: (waiting: boolean) => void;
+  cancelAllQueuedOnCancel?: boolean;
+}
+
+interface TaintRiskDetectable {
+  hasTaintedOrBuildFileRisk: () => boolean;
+}
+
+function isTaintRiskDetectable(
+  invocation: unknown,
+): invocation is TaintRiskDetectable {
+  return (
+    typeof invocation === 'object' &&
+    invocation !== null &&
+    'hasTaintedOrBuildFileRisk' in invocation &&
+    typeof (invocation as { hasTaintedOrBuildFileRisk?: unknown })
+      .hasTaintedOrBuildFileRisk === 'function'
+  );
 }
 
 const createErrorResponse = (
@@ -76,7 +97,7 @@ const createErrorResponse = (
     {
       functionResponse: {
         id: request.callId,
-        name: request.name,
+        name: request.originalRequestName ?? request.name,
         response: { error: error.message },
       },
     },
@@ -87,12 +108,36 @@ const createErrorResponse = (
 });
 
 /**
+ * Assigns a group ID to every run of two or more adjacent requests for which
+ * `isGroupable` returns true. All requests in a run get the call ID of the
+ * first request in it. Requests that are not part of a run get `undefined`.
+ */
+function getToolCallGroupIds(
+  requests: readonly ToolCallRequestInfo[],
+  isGroupable: (request: ToolCallRequestInfo) => boolean,
+): Array<string | undefined> {
+  const groupable = requests.map(isGroupable);
+  const groupIds: Array<string | undefined> = requests.map(() => undefined);
+
+  let runStart = 0;
+  for (let i = 0; i <= requests.length; i++) {
+    if (i < requests.length && groupable[i]) continue;
+
+    // The run of groupable requests in [runStart, i) has ended.
+    if (i - runStart >= 2) {
+      groupIds.fill(requests[runStart].callId, runStart, i);
+    }
+    runStart = i + 1;
+  }
+  return groupIds;
+}
+
+/**
  * Event-Driven Orchestrator for Tool Execution.
  * Coordinates execution via state updates and event listening.
  */
 export class Scheduler {
-  // Tracks which MessageBus instances have the legacy listener attached to prevent duplicates.
-  private static subscribedMessageBuses = new WeakSet<MessageBus>();
+  private readonly disposeController = new AbortController();
 
   private readonly state: SchedulerStateManager;
   private readonly executor: ToolExecutor;
@@ -105,6 +150,7 @@ export class Scheduler {
   private readonly subagent?: string;
   private readonly parentCallId?: string;
   private readonly onWaitingForConfirmation?: (waiting: boolean) => void;
+  private readonly cancelAllQueuedOnCancel: boolean;
 
   private isProcessing = false;
   private isCancelling = false;
@@ -119,6 +165,7 @@ export class Scheduler {
     this.subagent = options.subagent;
     this.parentCallId = options.parentCallId;
     this.onWaitingForConfirmation = options.onWaitingForConfirmation;
+    this.cancelAllQueuedOnCancel = options.cancelAllQueuedOnCancel ?? true;
     this.state = new SchedulerStateManager(
       this.messageBus,
       this.schedulerId,
@@ -134,6 +181,7 @@ export class Scheduler {
 
   dispose(): void {
     coreEvents.off(CoreEvent.McpProgress, this.handleMcpProgress);
+    this.disposeController.abort();
   }
 
   private readonly handleMcpProgress = (payload: McpProgressPayload) => {
@@ -161,26 +209,25 @@ export class Scheduler {
     });
   };
 
-  private setupMessageBusListener(messageBus: MessageBus): void {
-    if (Scheduler.subscribedMessageBuses.has(messageBus)) {
-      return;
-    }
+  private readonly handleToolConfirmationRequest = async (
+    request: ToolConfirmationRequest,
+  ) => {
+    await this.messageBus.publish({
+      type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+      correlationId: request.correlationId,
+      confirmed: false,
+      requiresUserConfirmation: true,
+    });
+  };
 
+  private setupMessageBusListener(messageBus: MessageBus): void {
     // TODO: Optimize policy checks. Currently, tools check policy via
     // MessageBus even though the Scheduler already checked it.
     messageBus.subscribe(
       MessageBusType.TOOL_CONFIRMATION_REQUEST,
-      async (request: ToolConfirmationRequest) => {
-        await messageBus.publish({
-          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-          correlationId: request.correlationId,
-          confirmed: false,
-          requiresUserConfirmation: true,
-        });
-      },
+      this.handleToolConfirmationRequest,
+      { signal: this.disposeController.signal },
     );
-
-    Scheduler.subscribedMessageBuses.add(messageBus);
   }
 
   /**
@@ -192,7 +239,12 @@ export class Scheduler {
     signal: AbortSignal,
   ): Promise<CompletedToolCall[]> {
     return runInDevTraceSpan(
-      { operation: GeminiCliOperation.ScheduleToolCalls },
+      {
+        operation: GeminiCliOperation.ScheduleToolCalls,
+        logPrompts: this.context.config.getTelemetryLogPromptsEnabled(),
+        tracesEnabled: this.context.config.getTelemetryTracesEnabled(),
+        sessionId: this.context.config.getSessionId(),
+      },
       async ({ metadata: spanMetadata }) => {
         const requests = Array.isArray(request) ? request : [request];
 
@@ -268,6 +320,7 @@ export class Scheduler {
           CoreToolCallStatus.Cancelled,
           'Operation cancelled by user',
         );
+        this.state.finalizeCall(activeCall.request.callId);
       }
     }
 
@@ -298,13 +351,25 @@ export class Scheduler {
     this.state.clearBatch();
     const currentApprovalMode = this.config.getApprovalMode();
 
+    // Sort requests to ensure Topic changes happen before actions in the same batch.
+    const sortedRequests = [...requests].sort((a, b) => {
+      if (a.name === UPDATE_TOPIC_TOOL_NAME) return -1;
+      if (b.name === UPDATE_TOPIC_TOOL_NAME) return 1;
+      return 0;
+    });
+
     try {
       const toolRegistry = this.context.toolRegistry;
-      const newCalls: ToolCall[] = requests.map((request) => {
+      const groupIds = getToolCallGroupIds(
+        sortedRequests,
+        (request) => toolRegistry.getTool(request.name)?.kind === Kind.Agent,
+      );
+      const newCalls: ToolCall[] = sortedRequests.map((request, index) => {
         const enrichedRequest: ToolCallRequestInfo = {
           ...request,
           schedulerId: this.schedulerId,
           parentCallId: this.parentCallId,
+          groupId: groupIds[index],
         };
         const tool = toolRegistry.getTool(request.name);
 
@@ -363,10 +428,21 @@ export class Scheduler {
         callId: request.callId,
         schedulerId: this.schedulerId,
         parentCallId: this.parentCallId,
+        subagent: this.subagent,
       },
       () => {
         try {
           const invocation = tool.build(request.args);
+          if (!request.display) {
+            request.display = populateToolDisplay({
+              name: tool.name,
+              invocation,
+              displayName: tool.displayName,
+            });
+            if (!request.display.description) {
+              request.display.description = tool.description;
+            }
+          }
           return {
             status: CoreToolCallStatus.Validating,
             request,
@@ -410,6 +486,14 @@ export class Scheduler {
    */
   private async _processNextItem(signal: AbortSignal): Promise<boolean> {
     if (signal.aborted || this.isCancelling) {
+      // Finalize active calls that are terminal
+      const activeCalls = this.state.allActiveCalls;
+      for (const call of activeCalls) {
+        if (this.isTerminal(call.status)) {
+          this.state.finalizeCall(call.request.callId);
+        }
+      }
+
       this.state.cancelAllQueued('Operation cancelled');
       return false;
     }
@@ -433,10 +517,10 @@ export class Scheduler {
       }
 
       // If the first tool is parallelizable, batch all contiguous parallelizable tools.
-      if (this._isParallelizable(next.request)) {
+      if (isParallelizable(next.request)) {
         while (this.state.queueLength > 0) {
           const peeked = this.state.peekQueue();
-          if (peeked && this._isParallelizable(peeked.request)) {
+          if (peeked && isParallelizable(peeked.request)) {
             this.state.dequeue();
           } else {
             break;
@@ -512,25 +596,13 @@ export class Scheduler {
 
     if (isWaitingForExternal && this.state.isActive) {
       // Yield to the event loop to allow external events (tool completion, user input) to progress.
-      await new Promise((resolve) => queueMicrotask(() => resolve(true)));
+      await new Promise((resolve) => setTimeout(resolve, 10));
       return true;
     }
 
     // If we are here, we have active calls (likely Validating or Scheduled) but none progressed.
     // This is a stuck state.
     return false;
-  }
-
-  private _isParallelizable(request: ToolCallRequestInfo): boolean {
-    if (request.args) {
-      const wait = request.args['wait_for_previous'];
-      if (typeof wait === 'boolean') {
-        return !wait;
-      }
-    }
-
-    // Default to parallel if the flag is omitted.
-    return true;
   }
 
   private async _processValidatingCall(
@@ -571,12 +643,57 @@ export class Scheduler {
   ): Promise<void> {
     const callId = toolCall.request.callId;
 
-    // Policy & Security
-    const { decision, rule } = await checkPolicy(
+    // 1. Hook Check (BeforeTool)
+    const hookResult = await evaluateBeforeToolHook(
+      this.config,
+      toolCall.tool,
+      toolCall.request,
+      toolCall.invocation,
+    );
+
+    if (hookResult.status === 'error') {
+      this.state.updateStatus(
+        callId,
+        CoreToolCallStatus.Error,
+        createErrorResponse(
+          toolCall.request,
+          hookResult.error,
+          hookResult.errorType,
+        ),
+      );
+      return;
+    }
+
+    const { hookDecision, hookSystemMessage, modifiedArgs, newInvocation } =
+      hookResult;
+
+    if (modifiedArgs && newInvocation) {
+      toolCall.request.args = modifiedArgs;
+      toolCall.request.inputModifiedByHook = true;
+      toolCall.invocation = newInvocation;
+    }
+
+    // 2. Policy & Security
+    const { decision: policyDecision, rule } = await checkPolicy(
       toolCall,
       this.config,
       this.subagent,
     );
+    let decision = policyDecision;
+    if (hookDecision === 'ask') {
+      decision = PolicyDecision.ASK_USER;
+    }
+
+    const hasTaintRisk =
+      isTaintRiskDetectable(toolCall.invocation) &&
+      toolCall.invocation.hasTaintedOrBuildFileRisk();
+
+    if (decision === PolicyDecision.ALLOW && hasTaintRisk) {
+      decision =
+        (this.config.isInteractive?.() ?? true)
+          ? PolicyDecision.ASK_USER
+          : PolicyDecision.DENY;
+    }
 
     if (decision === PolicyDecision.DENY) {
       const { errorMessage, errorType } = getPolicyDenialError(
@@ -601,6 +718,12 @@ export class Scheduler {
     let lastDetails: SerializableConfirmationDetails | undefined;
 
     if (decision === PolicyDecision.ASK_USER) {
+      const forcedDecision =
+        hookDecision === 'ask' ||
+        (policyDecision === PolicyDecision.ALLOW && hasTaintRisk)
+          ? 'ask_user'
+          : undefined;
+
       const result = await resolveConfirmation(toolCall, signal, {
         config: this.config,
         messageBus: this.messageBus,
@@ -609,6 +732,8 @@ export class Scheduler {
         getPreferredEditor: this.getPreferredEditor,
         schedulerId: this.schedulerId,
         onWaitingForConfirmation: this.onWaitingForConfirmation,
+        systemMessage: hookSystemMessage,
+        forcedDecision,
       });
       outcome = result.outcome;
       lastDetails = result.lastDetails;
@@ -628,14 +753,16 @@ export class Scheduler {
       );
     }
 
-    // Handle cancellation (cascades to entire batch)
+    // Handle cancellation (cascades to entire batch by default unless disabled)
     if (outcome === ToolConfirmationOutcome.Cancel) {
       this.state.updateStatus(
         callId,
         CoreToolCallStatus.Cancelled,
         'User denied execution.',
       );
-      this.state.cancelAllQueued('User cancelled operation');
+      if (this.cancelAllQueuedOnCancel) {
+        this.state.cancelAllQueued('User cancelled operation');
+      }
       return; // Skip execution
     }
 
@@ -670,6 +797,7 @@ export class Scheduler {
         callId: activeCall.request.callId,
         schedulerId: this.schedulerId,
         parentCallId: this.parentCallId,
+        subagent: this.subagent,
       },
       () =>
         this.executor.execute({
@@ -724,9 +852,12 @@ export class Scheduler {
         name: tailRequest.name,
         args: tailRequest.args,
         originalRequestName,
+        originalRequestArgs:
+          result.request.originalRequestArgs ?? result.request.args,
         isClientInitiated: result.request.isClientInitiated,
         prompt_id: result.request.prompt_id,
         schedulerId: this.schedulerId,
+        groupId: result.request.groupId,
       };
 
       if (!newTool) {
@@ -748,6 +879,110 @@ export class Scheduler {
 
       // Loop continues, picking up the new tail call at the front of the queue.
       return true;
+    }
+
+    let isSandboxError = false;
+    let sandboxDetailsStr = '';
+
+    if (
+      result.status === CoreToolCallStatus.Error &&
+      result.response.errorType === 'sandbox_expansion_required'
+    ) {
+      isSandboxError = true;
+      sandboxDetailsStr = result.response.error?.message || '';
+    }
+
+    if (isSandboxError) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        const parsedError = JSON.parse(sandboxDetailsStr) as {
+          rootCommand: string;
+          additionalPermissions: import('../services/sandboxManager.js').SandboxPermissions;
+        };
+
+        const confirmationDetails: SerializableConfirmationDetails = {
+          type: 'sandbox_expansion',
+          title: 'Sandbox Expansion Request',
+          command: String(
+            activeCall.request.args['command'] ?? parsedError.rootCommand,
+          ),
+          rootCommand: parsedError.rootCommand,
+          additionalPermissions: parsedError.additionalPermissions,
+        };
+
+        const correlationId = crypto.randomUUID();
+
+        // Mutate the active call so resolveConfirmation generates the correct Sandbox Expansion details
+        activeCall.request.args['additional_permissions'] =
+          parsedError.additionalPermissions;
+        activeCall.invocation = activeCall.tool.build(activeCall.request.args);
+
+        // CRITICAL: We must push the new args and invocation into the state manager
+        // before calling resolveConfirmation, because resolveConfirmation fetches
+        // the tool call directly from the state manager!
+        this.state.updateArgs(
+          callId,
+          activeCall.request.args,
+          activeCall.invocation,
+        );
+
+        this.state.updateStatus(callId, CoreToolCallStatus.AwaitingApproval, {
+          confirmationDetails,
+          correlationId,
+        });
+
+        const validatingCall = {
+          ...activeCall,
+          status: CoreToolCallStatus.Validating,
+        } as ValidatingToolCall;
+
+        const confResult = await resolveConfirmation(validatingCall, signal, {
+          config: this.config,
+          messageBus: this.messageBus,
+          state: this.state,
+          modifier: this.modifier,
+          getPreferredEditor: this.getPreferredEditor,
+          schedulerId: this.schedulerId,
+          onWaitingForConfirmation: this.onWaitingForConfirmation,
+        });
+
+        if (confResult.outcome === ToolConfirmationOutcome.Cancel) {
+          type LegacyHack = ToolCallResponseInfo & {
+            llmContent?: string;
+            returnDisplay?: string;
+          };
+          const errorResponse = { ...result.response } as LegacyHack;
+          errorResponse.llmContent =
+            'User cancelled sandbox expansion. The command failed with a sandbox denial. Shell output:\n' +
+            String(errorResponse.returnDisplay);
+
+          this.state.updateStatus(
+            callId,
+            CoreToolCallStatus.Error,
+            errorResponse,
+          );
+          return false;
+        }
+
+        activeCall.request.args['additional_permissions'] =
+          parsedError.additionalPermissions;
+
+        // Reset the output stream visual so it replaces the error text
+        this.state.updateStatus(callId, CoreToolCallStatus.Executing, {
+          liveOutput: undefined,
+        });
+
+        // Call _execute synchronously and properly return its promise to loop internally!
+        return await this._execute(
+          {
+            ...activeCall,
+            status: CoreToolCallStatus.Scheduled,
+          } as ScheduledToolCall,
+          signal,
+        );
+      } catch {
+        // Fallback to normal error handling if parsing/looping fails
+      }
     }
 
     if (result.status === CoreToolCallStatus.Success) {

@@ -29,8 +29,8 @@ describe('ProQuotaDialog', () => {
   });
 
   describe('for flash model failures', () => {
-    it('should render "Keep trying" and "Stop" options', () => {
-      const { unmount } = render(
+    it('should render "Keep trying" and "Stop" options', async () => {
+      const { unmount } = await render(
         <ProQuotaDialog
           failedModel={DEFAULT_GEMINI_FLASH_MODEL}
           fallbackModel={DEFAULT_GEMINI_FLASH_MODEL}
@@ -63,8 +63,8 @@ describe('ProQuotaDialog', () => {
 
   describe('for non-flash model failures', () => {
     describe('when it is a terminal quota error', () => {
-      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE', () => {
-        const { unmount } = render(
+      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
@@ -101,8 +101,8 @@ describe('ProQuotaDialog', () => {
         unmount();
       });
 
-      it('should NOT render upgrade option for USE_GEMINI', () => {
-        const { unmount } = render(
+      it('should NOT render upgrade option for USE_GEMINI', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
@@ -134,8 +134,8 @@ describe('ProQuotaDialog', () => {
         unmount();
       });
 
-      it('should render "Keep trying" and "Stop" options when failed model and fallback model are the same', () => {
-        const { unmount } = render(
+      it('should render "Keep trying" and "Stop" options when failed model and fallback model are the same', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel={PREVIEW_GEMINI_MODEL}
             fallbackModel={PREVIEW_GEMINI_MODEL}
@@ -165,8 +165,8 @@ describe('ProQuotaDialog', () => {
         unmount();
       });
 
-      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE (free tier)', () => {
-        const { unmount } = render(
+      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE (free tier)', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
@@ -203,8 +203,8 @@ describe('ProQuotaDialog', () => {
         unmount();
       });
 
-      it('should NOT render upgrade option for LOGIN_WITH_GOOGLE if tier is Ultra', () => {
-        const { unmount } = render(
+      it('should NOT render upgrade option for LOGIN_WITH_GOOGLE if tier is Ultra', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
@@ -239,8 +239,8 @@ describe('ProQuotaDialog', () => {
     });
 
     describe('when it is a capacity error', () => {
-      it('should render keep trying, switch, and stop options', () => {
-        const { unmount } = render(
+      it('should render keep trying, switch, and stop options', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-2.5-pro"
             fallbackModel="gemini-2.5-flash"
@@ -271,11 +271,45 @@ describe('ProQuotaDialog', () => {
         );
         unmount();
       });
+
+      it('should render keep trying, switch, and stop options even if isTerminalQuotaError is true when isCapacityExceeded is true', async () => {
+        const { unmount } = await render(
+          <ProQuotaDialog
+            failedModel="gemini-2.5-pro"
+            fallbackModel="gemini-2.5-flash"
+            message="capacity error"
+            isTerminalQuotaError={true}
+            isCapacityExceeded={true}
+            isModelNotFoundError={false}
+            onChoice={mockOnChoice}
+          />,
+        );
+
+        expect(RadioButtonSelect).toHaveBeenCalledWith(
+          expect.objectContaining({
+            items: [
+              {
+                label: 'Keep trying',
+                value: 'retry_once',
+                key: 'retry_once',
+              },
+              {
+                label: 'Switch to gemini-2.5-flash',
+                value: 'retry_always',
+                key: 'retry_always',
+              },
+              { label: 'Stop', value: 'retry_later', key: 'retry_later' },
+            ],
+          }),
+          undefined,
+        );
+        unmount();
+      });
     });
 
     describe('when it is a model not found error', () => {
-      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE', () => {
-        const { unmount } = render(
+      it('should render switch, upgrade, and stop options for LOGIN_WITH_GOOGLE', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-3-pro-preview"
             fallbackModel="gemini-2.5-pro"
@@ -312,8 +346,8 @@ describe('ProQuotaDialog', () => {
         unmount();
       });
 
-      it('should NOT render upgrade option for USE_GEMINI', () => {
-        const { unmount } = render(
+      it('should NOT render upgrade option for USE_GEMINI', async () => {
+        const { unmount } = await render(
           <ProQuotaDialog
             failedModel="gemini-3-pro-preview"
             fallbackModel="gemini-2.5-pro"
@@ -348,8 +382,8 @@ describe('ProQuotaDialog', () => {
   });
 
   describe('onChoice handling', () => {
-    it('should call onChoice with the selected value', () => {
-      const { unmount } = render(
+    it('should call onChoice with the selected value', async () => {
+      const { unmount } = await render(
         <ProQuotaDialog
           failedModel="gemini-2.5-pro"
           fallbackModel="gemini-2.5-flash"

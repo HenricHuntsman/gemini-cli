@@ -104,10 +104,10 @@ describe('WebSearchTool', () => {
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toBe(
-        'Web search results for "successful query":\n\nHere are your results.',
+        'Web search results for "successful query":\n\n<untrusted_context>\nHere are your results.\n</untrusted_context>',
       );
       expect(result.returnDisplay).toBe(
         'Search results for "successful query" returned.',
@@ -129,7 +129,7 @@ describe('WebSearchTool', () => {
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toBe(
         'No search results or information found for query: "no results query"',
@@ -143,7 +143,7 @@ describe('WebSearchTool', () => {
       (mockGeminiClient.generateContent as Mock).mockRejectedValue(testError);
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.error?.type).toBe(ToolErrorType.WEB_SEARCH_FAILED);
       expect(result.llmContent).toContain('Error:');
@@ -151,7 +151,7 @@ describe('WebSearchTool', () => {
       expect(result.returnDisplay).toBe('Error performing web search.');
     });
 
-    it('should correctly format results with sources and citations', async () => {
+    it('should correctly format results with sources and citations wrapped in untrusted_context', async () => {
       const params: WebSearchToolParams = { query: 'grounding query' };
       (mockGeminiClient.generateContent as Mock).mockResolvedValue({
         candidates: [
@@ -181,15 +181,17 @@ describe('WebSearchTool', () => {
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       const expectedLlmContent = `Web search results for "grounding query":
 
+<untrusted_context>
 This is a test[1] response.[1][2]
 
 Sources:
 [1] Example Site (https://example.com)
-[2] Google (https://google.com)`;
+[2] Google (https://google.com)
+</untrusted_context>`;
 
       expect(result.llmContent).toBe(expectedLlmContent);
       expect(result.returnDisplay).toBe(
@@ -252,16 +254,18 @@ Sources:
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       const expectedLlmContent = `Web search results for "multibyte query":
 
+<untrusted_context>
 こんにちは![1] Gemini CLI✨️[2][3]
 
 Sources:
 [1] Japanese Greeting (https://example.test/japanese-greeting)
 [2] google-gemini/gemini-cli (https://github.com/google-gemini/gemini-cli)
-[3] Gemini CLI: your open-source AI agent (https://blog.google/technology/developers/introducing-gemini-cli-open-source-ai-agent/)`;
+[3] Gemini CLI: your open-source AI agent (https://blog.google/technology/developers/introducing-gemini-cli-open-source-ai-agent/)
+</untrusted_context>`;
 
       expect(result.llmContent).toBe(expectedLlmContent);
       expect(result.returnDisplay).toBe(

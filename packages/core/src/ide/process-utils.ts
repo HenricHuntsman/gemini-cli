@@ -37,9 +37,15 @@ async function getProcessTableWindows(): Promise<Map<number, ProcessInfo>> {
     const powershellCommand =
       'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress';
     // Increase maxBuffer to handle large process lists (default is 1MB)
-    const { stdout } = await execAsync(`powershell "${powershellCommand}"`, {
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const { stdout } = await execAsync(
+      'powershell -NoProfile -NonInteractive -Command "' +
+        powershellCommand +
+        '"',
+      {
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 5000,
+      },
+    );
 
     if (!stdout.trim()) {
       return processMap;
@@ -49,7 +55,7 @@ async function getProcessTableWindows(): Promise<Map<number, ProcessInfo>> {
     try {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       processes = JSON.parse(stdout);
-    } catch (_e) {
+    } catch {
       return processMap;
     }
 
@@ -67,7 +73,7 @@ async function getProcessTableWindows(): Promise<Map<number, ProcessInfo>> {
         });
       }
     }
-  } catch (_e) {
+  } catch {
     // Fallback or error handling if PowerShell fails
   }
   return processMap;
@@ -86,7 +92,7 @@ async function getProcessInfo(pid: number): Promise<{
 }> {
   try {
     const command = `ps -o ppid=,command= -p ${pid}`;
-    const { stdout } = await execAsync(command);
+    const { stdout } = await execAsync(command, { timeout: 3000 });
     const trimmedStdout = stdout.trim();
     if (!trimmedStdout) {
       return { parentPid: 0, name: '', command: '' };
@@ -102,7 +108,7 @@ async function getProcessInfo(pid: number): Promise<{
       name: processName,
       command: fullCommand,
     };
-  } catch (_e) {
+  } catch {
     return { parentPid: 0, name: '', command: '' };
   }
 }

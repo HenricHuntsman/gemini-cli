@@ -63,7 +63,7 @@ import {
   getMockMessageBusInstance,
 } from '../test-utils/mock-message-bus.js';
 import path from 'node:path';
-import { isSubpath } from '../utils/paths.js';
+import { isSubpath, resolveToRealPath } from '../utils/paths.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import { ApprovalMode } from '../policy/types.js';
@@ -84,7 +84,10 @@ describe('EditTool', () => {
 
   beforeEach(() => {
     vi.restoreAllMocks();
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edit-tool-test-'));
+    const rawTempDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'edit-tool-test-'),
+    );
+    tempDir = resolveToRealPath(rawTempDir);
     rootDir = path.join(tempDir, 'root');
     fs.mkdirSync(rootDir);
 
@@ -107,6 +110,7 @@ describe('EditTool', () => {
       getGeminiClient: vi.fn().mockReturnValue(geminiClient),
       getBaseLlmClient: vi.fn().mockReturnValue(baseLlmClient),
       getTargetDir: () => rootDir,
+      getProjectRoot: () => rootDir,
       getApprovalMode: vi.fn(),
       setApprovalMode: vi.fn(),
       getWorkspaceContext: () => createMockWorkspaceContext(rootDir),
@@ -131,8 +135,10 @@ describe('EditTool', () => {
       isInteractive: () => false,
       getDisableLLMCorrection: vi.fn(() => true),
       getExperiments: () => {},
+      isPlanMode: vi.fn(() => false),
       storage: {
         getProjectTempDir: vi.fn().mockReturnValue('/tmp/project'),
+        getPlansDir: vi.fn().mockReturnValue('/tmp/plans'),
       },
       isPathAllowed(this: Config, absolutePath: string): boolean {
         const workspaceContext = this.getWorkspaceContext();
@@ -508,6 +514,42 @@ function doIt() {
       expect(result.newContent).toBe(expectedContent);
     });
 
+    it('should preserve trailing newlines in flexible replacement (regression)', async () => {
+      const content = '  line1\n  line2\n  line3\n';
+      const result = await calculateReplacement(mockConfig, {
+        params: {
+          file_path: 'test.txt',
+          old_string: 'line1\nline2',
+          new_string: 'line1-replaced\nline2-replaced',
+        },
+        currentContent: content,
+        abortSignal,
+      });
+
+      expect(result.newContent).toBe(
+        '  line1-replaced\n  line2-replaced\n  line3\n',
+      );
+    });
+
+    it('should correctly increment loop index in flexible replacement when allow_multiple is true (regression)', async () => {
+      const content = '  match1\n  match2\n  match1\n  match2\n';
+      const result = await calculateReplacement(mockConfig, {
+        params: {
+          file_path: 'test.txt',
+          old_string: 'match1\nmatch2',
+          new_string: 'replaced1\nreplaced2\nreplaced3',
+          allow_multiple: true,
+        },
+        currentContent: content,
+        abortSignal,
+      });
+
+      expect(result.occurrences).toBe(2);
+      expect(result.newContent).toBe(
+        '  replaced1\n  replaced2\n  replaced3\n  replaced1\n  replaced2\n  replaced3\n',
+      );
+    });
+
     it('should correctly rebase indentation in flexible replacement without double-indenting', async () => {
       const content = '    if (a) {\n        foo();\n    }\n';
       // old_string and new_string are unindented. They should be rebased to 4-space.
@@ -662,6 +704,30 @@ function doIt() {
       };
       expect(tool.validateToolParams(params)).toBeNull();
     });
+
+    it('should sanitize null bytes in absolute path during validation', () => {
+      const badPath = path.resolve(rootDir, 'test\0.txt');
+      const params: EditToolParams = {
+        file_path: badPath,
+        instruction: 'An instruction',
+        old_string: 'old',
+        new_string: 'new',
+      };
+      expect(tool.validateToolParams(params)).toBeNull();
+    });
+
+    it('should sanitize null bytes in absolute path during invocation setup', () => {
+      const badPath = path.resolve(rootDir, 'test\0.txt');
+      const invocation = tool.build({
+        file_path: badPath,
+        instruction: 'test',
+        old_string: 'old',
+        new_string: 'new',
+      });
+      expect((invocation as any).resolvedPath).toBe(
+        path.resolve(rootDir, 'test.txt'),
+      );
+    });
   });
 
   describe('execute', () => {
@@ -693,9 +759,9 @@ function doIt() {
           throw abortError;
         });
 
-      await expect(invocation.execute(abortController.signal)).rejects.toBe(
-        abortError,
-      );
+      await expect(
+        invocation.execute({ abortSignal: abortController.signal }),
+      ).rejects.toBe(abortError);
 
       calculateSpy.mockRestore();
     });
@@ -712,9 +778,22 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(result.llmContent).toMatch(/Successfully modified file/);
+      expect(result.display).toEqual(
+        expect.objectContaining({
+          name: 'Edit',
+          resultSummary: expect.stringContaining('added'),
+          result: expect.objectContaining({
+            type: 'diff',
+            beforeText: initialContent,
+            afterText: newContent,
+          }),
+        }),
+      );
       expect(fs.readFileSync(filePath, 'utf8')).toBe(newContent);
       const display = result.returnDisplay as FileDiff;
       expect(display.fileDiff).toMatch(initialContent);
@@ -735,11 +814,11 @@ function doIt() {
         new_string: 'replacement',
       };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
-      expect(result.llmContent).toMatch(/0 occurrences found for old_string/);
-      expect(result.returnDisplay).toMatch(
-        /Failed to edit, could not find the string to replace./,
-      );
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+      expect(result.llmContent).toMatch(/Could not find an exact match/);
+      expect(result.returnDisplay).toMatch(/Could not find an exact match/);
       expect(mockFixLLMEditWithInstruction).toHaveBeenCalled();
     });
 
@@ -766,7 +845,9 @@ function doIt() {
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(result.error).toBeUndefined();
       expect(result.llmContent).toMatch(/Successfully modified file/);
@@ -786,7 +867,7 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      await invocation.execute(new AbortController().signal);
+      await invocation.execute({ abortSignal: new AbortController().signal });
 
       const finalContent = fs.readFileSync(filePath, 'utf8');
       expect(finalContent).toBe(newContent);
@@ -802,7 +883,7 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      await invocation.execute(new AbortController().signal);
+      await invocation.execute({ abortSignal: new AbortController().signal });
 
       const finalContent = fs.readFileSync(filePath, 'utf8');
       expect(finalContent).toBe(newContentWithCRLF);
@@ -830,7 +911,9 @@ function doIt() {
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(result.error?.type).toBe(
         ToolErrorType.EDIT_NO_CHANGE_LLM_JUDGEMENT,
@@ -874,7 +957,7 @@ function doIt() {
         .mockResolvedValueOnce(externallyModifiedContent); // Second call in `attemptSelfCorrection`
 
       const invocation = tool.build(params);
-      await invocation.execute(new AbortController().signal);
+      await invocation.execute({ abortSignal: new AbortController().signal });
 
       // Assert that the file was read twice (initial read, then re-read for hash comparison).
       expect(readTextFileSpy).toHaveBeenCalledTimes(2);
@@ -936,7 +1019,9 @@ function doIt() {
           instruction: 'test',
           ...params,
         });
-        const result = await invocation.execute(new AbortController().signal);
+        const result = await invocation.execute({
+          abortSignal: new AbortController().signal,
+        });
         expect(result.error?.type).toBe(expectedError);
       },
     );
@@ -1018,7 +1103,9 @@ function doIt() {
           ...(allow_multiple !== undefined && { allow_multiple }),
         };
         const invocation = tool.build(params);
-        const result = await invocation.execute(new AbortController().signal);
+        const result = await invocation.execute({
+          abortSignal: new AbortController().signal,
+        });
 
         if (shouldSucceed) {
           expect(result.error).toBeUndefined();
@@ -1160,7 +1247,9 @@ function doIt() {
           ai_proposed_content: '',
         };
         const invocation = tool.build(params);
-        const result = await invocation.execute(new AbortController().signal);
+        const result = await invocation.execute({
+          abortSignal: new AbortController().signal,
+        });
 
         if (
           result.returnDisplay &&
@@ -1213,7 +1302,9 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(result.error?.type).toBe(ToolErrorType.EDIT_NO_OCCURRENCE_FOUND);
       expect(mockFixLLMEditWithInstruction).not.toHaveBeenCalled();
@@ -1234,9 +1325,71 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      await invocation.execute(new AbortController().signal);
+      await invocation.execute({ abortSignal: new AbortController().signal });
 
       expect(mockFixLLMEditWithInstruction).toHaveBeenCalled();
+    });
+
+    it('should NOT call FixLLMEditWithInstruction for .json files even when disableLLMCorrection is false', async () => {
+      const filePath = path.join(rootDir, 'test.json');
+      fs.writeFileSync(filePath, '{"key": "value"}', 'utf8');
+
+      (mockConfig.getDisableLLMCorrection as Mock).mockReturnValue(false);
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        instruction: 'Replace value',
+        old_string: 'nonexistent',
+        new_string: 'replacement',
+      };
+
+      const invocation = tool.build(params);
+      await invocation.execute({ abortSignal: new AbortController().signal });
+
+      expect(mockFixLLMEditWithInstruction).not.toHaveBeenCalled();
+    });
+
+    it('should NOT call FixLLMEditWithInstruction for .ipynb files even when disableLLMCorrection is false', async () => {
+      const filePath = path.join(rootDir, 'notebook.ipynb');
+      fs.writeFileSync(filePath, '{"cells": []}', 'utf8');
+
+      (mockConfig.getDisableLLMCorrection as Mock).mockReturnValue(false);
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        instruction: 'Replace cell',
+        old_string: 'nonexistent',
+        new_string: 'replacement',
+      };
+
+      const invocation = tool.build(params);
+      await invocation.execute({ abortSignal: new AbortController().signal });
+
+      expect(mockFixLLMEditWithInstruction).not.toHaveBeenCalled();
+    });
+
+    it('fails fast without calling FixLLMEditWithInstruction when old_string is empty', async () => {
+      const filePath = path.join(rootDir, 'empty_old_string_test.txt');
+      fs.writeFileSync(filePath, 'Some content.', 'utf8');
+
+      // Enable LLM correction for this test
+      (mockConfig.getDisableLLMCorrection as Mock).mockReturnValue(false);
+
+      const params = {
+        file_path: filePath,
+        instruction: 'Replace empty text',
+        old_string: '   ',
+        new_string: 'replacement',
+      };
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+
+      expect(mockFixLLMEditWithInstruction).not.toHaveBeenCalled();
+      expect(result.error?.type).toBe(ToolErrorType.INVALID_TOOL_PARAMS);
+      expect(result.error?.message).toContain('ReadFile');
     });
   });
 
@@ -1263,7 +1416,9 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(discoverJitContext).toHaveBeenCalled();
       expect(result.llmContent).toContain('Newly Discovered Project Context');
@@ -1292,11 +1447,149 @@ function doIt() {
       };
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(result.llmContent).not.toContain(
         'Newly Discovered Project Context',
       );
+    });
+  });
+
+  describe('plan mode', () => {
+    it('should allow edits to plans directory when isPlanMode is true', async () => {
+      const mockProjectTempDir = path.join(tempDir, 'project');
+      fs.mkdirSync(mockProjectTempDir);
+      vi.mocked(mockConfig.storage.getProjectTempDir).mockReturnValue(
+        mockProjectTempDir,
+      );
+
+      const plansDir = path.join(mockProjectTempDir, 'plans');
+      fs.mkdirSync(plansDir);
+
+      vi.mocked(mockConfig.isPlanMode).mockReturnValue(true);
+      vi.mocked(mockConfig.storage.getPlansDir).mockReturnValue(plansDir);
+
+      const filePath = 'test-file.txt';
+      const planFilePath = path.join(plansDir, filePath);
+      const initialContent = 'some initial content';
+      fs.writeFileSync(planFilePath, initialContent, 'utf8');
+
+      const params: EditToolParams = {
+        file_path: filePath,
+        instruction: 'Replace initial with new',
+        old_string: 'initial',
+        new_string: 'new',
+      };
+
+      const invocation = tool.build(params);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+
+      expect(result.llmContent).toMatch(/Successfully modified file/);
+
+      // Verify plan file is written with new content
+      expect(fs.readFileSync(planFilePath, 'utf8')).toBe('some new content');
+
+      fs.rmSync(plansDir, { recursive: true, force: true });
+    });
+  });
+
+  describe('concurrent edits to the same file', () => {
+    it('applies both edits rather than losing one', async () => {
+      const filePath = path.join(rootDir, 'shared.txt');
+      fs.writeFileSync(filePath, 'alpha\nbeta\n', 'utf8');
+
+      const first = tool.build({
+        file_path: filePath,
+        instruction: 'Uppercase alpha',
+        old_string: 'alpha',
+        new_string: 'ALPHA',
+      });
+      const second = tool.build({
+        file_path: filePath,
+        instruction: 'Uppercase beta',
+        old_string: 'beta',
+        new_string: 'BETA',
+      });
+
+      const signal = new AbortController().signal;
+      const results = await Promise.all([
+        first.execute({ abortSignal: signal }),
+        second.execute({ abortSignal: signal }),
+      ]);
+
+      for (const result of results) {
+        expect(result.error).toBeUndefined();
+      }
+
+      // Both tool calls reported success, so neither edit may be missing.
+      const finalContent = fs.readFileSync(filePath, 'utf8');
+      expect(finalContent).toContain('ALPHA');
+      expect(finalContent).toContain('BETA');
+    });
+
+    it('serializes concurrent edits with different path spellings (relative vs absolute)', async () => {
+      const fileName = 'spelling.txt';
+      const absolutePath = path.join(rootDir, fileName);
+      const relativePath = `./${fileName}`;
+      fs.writeFileSync(absolutePath, 'line1\nline2\n', 'utf8');
+
+      const first = tool.build({
+        file_path: absolutePath,
+        instruction: 'Uppercase line1',
+        old_string: 'line1',
+        new_string: 'LINE1',
+      });
+      const second = tool.build({
+        file_path: relativePath,
+        instruction: 'Uppercase line2',
+        old_string: 'line2',
+        new_string: 'LINE2',
+      });
+
+      const signal = new AbortController().signal;
+      const results = await Promise.all([
+        first.execute({ abortSignal: signal }),
+        second.execute({ abortSignal: signal }),
+      ]);
+
+      for (const result of results) {
+        expect(result.error).toBeUndefined();
+      }
+
+      const finalContent = fs.readFileSync(absolutePath, 'utf8');
+      expect(finalContent).toContain('LINE1');
+      expect(finalContent).toContain('LINE2');
+    });
+
+    it('aborts immediately if signal is aborted while waiting for path lock', async () => {
+      const filePath = path.join(rootDir, 'abort_test.txt');
+      fs.writeFileSync(filePath, 'original content', 'utf8');
+
+      const first = tool.build({
+        file_path: filePath,
+        instruction: 'Change to first',
+        old_string: 'original',
+        new_string: 'FIRST',
+      });
+      const second = tool.build({
+        file_path: filePath,
+        instruction: 'Change to second',
+        old_string: 'original',
+        new_string: 'SECOND',
+      });
+
+      const controller = new AbortController();
+
+      const p1 = first.execute({ abortSignal: new AbortController().signal });
+      controller.abort();
+      const p2 = second.execute({ abortSignal: controller.signal });
+
+      await expect(p2).rejects.toThrow('Edit aborted');
+      await p1;
     });
   });
 });

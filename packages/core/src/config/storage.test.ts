@@ -16,10 +16,15 @@ import * as fs from 'node:fs';
 
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
+  const mockedRealpath = vi.fn(actual.realpathSync);
+  Object.defineProperty(mockedRealpath, 'native', {
+    value: (p: fs.PathLike) => mockedRealpath(p),
+    writable: true,
+  });
   return {
     ...actual,
     mkdirSync: vi.fn(),
-    realpathSync: vi.fn(actual.realpathSync),
+    realpathSync: mockedRealpath,
   };
 });
 
@@ -103,7 +108,7 @@ describe('Storage - Security', () => {
 });
 
 describe('Storage – additional helpers', () => {
-  const projectRoot = '/tmp/project';
+  const projectRoot = resolveToRealPath(path.resolve('/tmp/project'));
   const storage = new Storage(projectRoot);
 
   beforeEach(() => {
@@ -145,6 +150,18 @@ describe('Storage – additional helpers', () => {
   it('getProjectAgentsDir returns project/.gemini/agents', () => {
     const expected = path.join(projectRoot, GEMINI_DIR, 'agents');
     expect(storage.getProjectAgentsDir()).toBe(expected);
+  });
+
+  it('getProjectMemoryDir returns ~/.gemini/tmp/<identifier>/memory', async () => {
+    await storage.initialize();
+    const expected = path.join(
+      os.homedir(),
+      GEMINI_DIR,
+      'tmp',
+      PROJECT_SLUG,
+      'memory',
+    );
+    expect(storage.getProjectMemoryDir()).toBe(expected);
   });
 
   it('getMcpOAuthTokensPath returns ~/.gemini/mcp-oauth-tokens.json', () => {
@@ -197,6 +214,27 @@ describe('Storage – additional helpers', () => {
     const tempDir = storageWithSession.getProjectTempDir();
     const expected = path.join(tempDir, sessionId, 'tracker');
     expect(storageWithSession.getProjectTempTrackerDir()).toBe(expected);
+  });
+
+  it('updates session-scoped directories when the sessionId changes', async () => {
+    const storageWithSession = new Storage(projectRoot, 'session-one');
+    ProjectRegistry.prototype.getShortId = vi
+      .fn()
+      .mockReturnValue(PROJECT_SLUG);
+    await storageWithSession.initialize();
+    const tempDir = storageWithSession.getProjectTempDir();
+
+    storageWithSession.setSessionId('session-two');
+
+    expect(storageWithSession.getProjectTempPlansDir()).toBe(
+      path.join(tempDir, 'session-two', 'plans'),
+    );
+    expect(storageWithSession.getProjectTempTrackerDir()).toBe(
+      path.join(tempDir, 'session-two', 'tracker'),
+    );
+    expect(storageWithSession.getProjectTempTasksDir()).toBe(
+      path.join(tempDir, 'session-two', 'tasks'),
+    );
   });
 
   describe('Session and JSON Loading', () => {
@@ -296,9 +334,9 @@ describe('Storage – additional helpers', () => {
       },
       {
         name: 'custom absolute path outside throws',
-        customDir: '/absolute/path/to/plans',
+        customDir: path.resolve('/absolute/path/to/plans'),
         expected: '',
-        expectedError: `Custom plans directory '/absolute/path/to/plans' resolves to '/absolute/path/to/plans', which is outside the project root '${resolveToRealPath(projectRoot)}'.`,
+        expectedError: `Custom plans directory '${path.resolve('/absolute/path/to/plans')}' resolves to '${path.resolve('/absolute/path/to/plans')}', which is outside the project root '${resolveToRealPath(projectRoot)}'.`,
       },
       {
         name: 'absolute path that happens to be inside project root',
@@ -337,15 +375,14 @@ describe('Storage – additional helpers', () => {
         setup: () => {
           vi.mocked(fs.realpathSync).mockImplementation((p: fs.PathLike) => {
             if (p.toString().includes('symlink-to-outside')) {
-              return '/outside/project/root';
+              return path.resolve('/outside/project/root');
             }
             return p.toString();
           });
           return () => vi.mocked(fs.realpathSync).mockRestore();
         },
         expected: '',
-        expectedError:
-          "Custom plans directory 'symlink-to-outside' resolves to '/outside/project/root', which is outside the project root '/tmp/project'.",
+        expectedError: `Custom plans directory 'symlink-to-outside' resolves to '${path.resolve('/outside/project/root')}', which is outside the project root '${resolveToRealPath(projectRoot)}'.`,
       },
     ];
 
@@ -422,5 +459,161 @@ describe('Storage - System Paths', () => {
     } else {
       expect(result).toBe('/etc/gemini-cli/policies');
     }
+  });
+
+  describe('Storage - Runtime Directory Resolution', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('identifies sandbox mode when SANDBOX environment variable is set', () => {
+      vi.stubEnv('SANDBOX', '');
+      expect(Storage.isSandbox()).toBe(false);
+
+      vi.stubEnv('SANDBOX', 'docker');
+      expect(Storage.isSandbox()).toBe(true);
+    });
+
+    it('consistently resolves getGlobalRuntimeDir to getGlobalGeminiDir in both normal and sandbox mode', () => {
+      vi.stubEnv('SANDBOX', '');
+      expect(Storage.getGlobalRuntimeDir()).toBe(Storage.getGlobalGeminiDir());
+      expect(Storage.getGoogleAccountsPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'google_accounts.json'),
+      );
+      expect(Storage.getMcpOAuthTokensPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'mcp-oauth-tokens.json'),
+      );
+      expect(Storage.getA2AOAuthTokensPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'a2a-oauth-tokens.json'),
+      );
+      expect(Storage.getTrustedFoldersPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'trustedFolders.json'),
+      );
+      expect(Storage.getPolicyIntegrityStoragePath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'policy_integrity.json'),
+      );
+
+      vi.stubEnv('SANDBOX', 'docker');
+      expect(Storage.getGlobalRuntimeDir()).toBe(Storage.getGlobalGeminiDir());
+      expect(Storage.getGoogleAccountsPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'google_accounts.json'),
+      );
+      expect(Storage.getMcpOAuthTokensPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'mcp-oauth-tokens.json'),
+      );
+      expect(Storage.getA2AOAuthTokensPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'a2a-oauth-tokens.json'),
+      );
+      expect(Storage.getTrustedFoldersPath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'trustedFolders.json'),
+      );
+      expect(Storage.getPolicyIntegrityStoragePath()).toBe(
+        path.join(Storage.getGlobalGeminiDir(), 'policy_integrity.json'),
+      );
+    });
+
+    it('routes getGlobalRuntimeDir to ~/.cache/.gemini under macOS Seatbelt (sandbox-exec)', () => {
+      vi.stubEnv('SANDBOX', 'sandbox-exec');
+
+      const expectedDir = path.join(os.homedir(), '.cache', GEMINI_DIR);
+      expect(Storage.getGlobalRuntimeDir()).toBe(expectedDir);
+      expect(Storage.getGoogleAccountsPath()).toBe(
+        path.join(expectedDir, 'google_accounts.json'),
+      );
+      expect(Storage.getMcpOAuthTokensPath()).toBe(
+        path.join(expectedDir, 'mcp-oauth-tokens.json'),
+      );
+      expect(Storage.getA2AOAuthTokensPath()).toBe(
+        path.join(expectedDir, 'a2a-oauth-tokens.json'),
+      );
+      expect(Storage.getTrustedFoldersPath()).toBe(
+        path.join(expectedDir, 'trustedFolders.json'),
+      );
+      expect(Storage.getPolicyIntegrityStoragePath()).toBe(
+        path.join(expectedDir, 'policy_integrity.json'),
+      );
+    });
+
+    it('falls back to getGlobalGeminiDir under sandbox-exec if homedir is empty', () => {
+      vi.stubEnv('SANDBOX', 'sandbox-exec');
+      vi.mocked(homedir).mockReturnValue('');
+
+      expect(Storage.getGlobalRuntimeDir()).toBe(Storage.getGlobalGeminiDir());
+
+      vi.mocked(homedir).mockReturnValue(os.homedir());
+    });
+
+    it('asynchronously creates runtime directory recursively in ensureGlobalRuntimeDirExists', async () => {
+      vi.stubEnv('SANDBOX', 'sandbox-exec');
+      const expectedDir = path.join(os.homedir(), '.cache', GEMINI_DIR);
+      const mkdirSpy = vi
+        .spyOn(fs.promises, 'mkdir')
+        .mockResolvedValue(undefined);
+
+      const result = await Storage.ensureGlobalRuntimeDirExists();
+
+      expect(result).toBe(expectedDir);
+      expect(mkdirSpy).toHaveBeenCalledWith(expectedDir, {
+        recursive: true,
+      });
+      mkdirSpy.mockRestore();
+    });
+
+    it('silently ignores directory creation errors in ensureGlobalRuntimeDirExists', async () => {
+      vi.stubEnv('SANDBOX', 'sandbox-exec');
+      const expectedDir = path.join(os.homedir(), '.cache', GEMINI_DIR);
+      const mkdirSpy = vi
+        .spyOn(fs.promises, 'mkdir')
+        .mockRejectedValue(new Error('EACCES: permission denied'));
+
+      await expect(Storage.ensureGlobalRuntimeDirExists()).resolves.toBe(
+        expectedDir,
+      );
+      mkdirSpy.mockRestore();
+    });
+
+    it('does not perform synchronous filesystem operations in getGlobalRuntimeDir', () => {
+      vi.stubEnv('SANDBOX', 'sandbox-exec');
+      const expectedDir = path.join(os.homedir(), '.cache', GEMINI_DIR);
+      const existsSyncSpy = vi.spyOn(fs, 'existsSync');
+      const mkdirSyncSpy = vi.spyOn(fs, 'mkdirSync');
+
+      const result = Storage.getGlobalRuntimeDir();
+
+      expect(result).toBe(expectedDir);
+      expect(existsSyncSpy).not.toHaveBeenCalled();
+      expect(mkdirSyncSpy).not.toHaveBeenCalled();
+      existsSyncSpy.mockRestore();
+      mkdirSyncSpy.mockRestore();
+    });
+  });
+
+  describe('isWorkspaceHomeDir', () => {
+    it('returns false when homedir is empty without throwing', () => {
+      vi.mocked(homedir).mockReturnValue('');
+      const storage = new Storage('/some/workspace');
+      expect(storage.isWorkspaceHomeDir()).toBe(false);
+      vi.mocked(homedir).mockReturnValue(os.homedir());
+    });
+
+    it('returns true when targetDir is the home directory', () => {
+      vi.mocked(homedir).mockReturnValue(os.homedir());
+      const storage = new Storage(os.homedir());
+      expect(storage.isWorkspaceHomeDir()).toBe(true);
+    });
+
+    it('returns false when targetDir is not the home directory', () => {
+      vi.mocked(homedir).mockReturnValue(os.homedir());
+      const storage = new Storage(
+        path.join(os.homedir(), 'projects', 'my-project'),
+      );
+      expect(storage.isWorkspaceHomeDir()).toBe(false);
+    });
+
+    it('returns false when targetDir is empty', () => {
+      vi.mocked(homedir).mockReturnValue(os.homedir());
+      const storage = new Storage('');
+      expect(storage.isWorkspaceHomeDir()).toBe(false);
+    });
   });
 });

@@ -50,11 +50,8 @@ exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlterna
 `;
 
 exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlternateBuffer = false > should handle diff with only header and no changes 1`] = `
-"╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
-│                                                                                                  │
-│ No changes detected.                                                                             │
-│                                                                                                  │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+"
+ No changes detected.
 "
 `;
 
@@ -78,6 +75,16 @@ exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlterna
 `;
 
 exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlternateBuffer = false > should render a gap indicator for skipped lines 1`] = `
+" 1   context line 1
+ 2 - deleted line
+ 2 + added line
+════════════════════════════════════════════════════════════════════════════════
+10   context line 10
+11   context line 11
+"
+`;
+
+exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlternateBuffer = false > should render a gap indicator for skipped lines 2`] = `
 " 1   context line 1
  2 - deleted line
  2 + added line
@@ -143,11 +150,8 @@ exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlterna
 `;
 
 exports[`<OverflowProvider><DiffRenderer /></OverflowProvider> > with useAlternateBuffer = true > should handle diff with only header and no changes 1`] = `
-"╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
-│                                                                                                  │
-│ No changes detected.                                                                             │
-│                                                                                                  │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+"
+ No changes detected.
 "
 `;
 

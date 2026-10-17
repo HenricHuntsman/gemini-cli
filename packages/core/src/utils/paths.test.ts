@@ -15,14 +15,29 @@ import {
   shortenPath,
   normalizePath,
   resolveToRealPath,
+  makeRelative,
+  deduplicateAbsolutePaths,
+  toAbsolutePath,
+  toPathKey,
+  isTrustedSystemPath,
+  resolveDefensiveToolPath,
+  hasBlockedPathSegment,
+  stripExtendedLengthPrefix,
 } from './paths.js';
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof fs>();
-  return {
+  const mockRealpath = (p: string) => p;
+  const mockedFs = {
     ...(actual as object),
-    realpathSync: (p: string) => p,
+    realpathSync: mockRealpath,
   };
+  Object.defineProperty(mockRealpath, 'native', {
+    value: (p: string) => mockedFs.realpathSync(p),
+    writable: true,
+    configurable: true,
+  });
+  return mockedFs;
 });
 
 const mockPlatform = (platform: string) => {
@@ -215,7 +230,7 @@ describe('isSubpath', () => {
   });
 });
 
-describe('isSubpath on Windows', () => {
+describe.skipIf(process.platform !== 'win32')('isSubpath on Windows', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   beforeEach(() => mockPlatform('win32'));
@@ -265,6 +280,20 @@ describe('isSubpath on Windows', () => {
   it('should handle relative paths correctly on Windows', () => {
     expect(isSubpath('Users\\Test', 'Users\\Test\\file.txt')).toBe(true);
     expect(isSubpath('Users\\Test\\file.txt', 'Users\\Test')).toBe(false);
+  });
+});
+
+describe.skipIf(process.platform !== 'darwin')('isSubpath on Darwin', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  beforeEach(() => mockPlatform('darwin'));
+
+  it('should be case-insensitive for path components on Darwin', () => {
+    expect(isSubpath('/PROJECT', '/project/src')).toBe(true);
+  });
+
+  it('should return true for a direct subpath on Darwin', () => {
+    expect(isSubpath('/Users/Test', '/Users/Test/file.txt')).toBe(true);
   });
 });
 
@@ -584,6 +613,145 @@ describe('resolveToRealPath', () => {
       /Infinite recursion detected/,
     );
   });
+
+  describe('on Windows realpathSync.native prefixes', () => {
+    beforeEach(() => {
+      mockPlatform('win32');
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('should strip long path prefix \\\\?\\', () => {
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValueOnce(
+        '\\\\?\\C:\\foo\\bar',
+      );
+      expect(resolveToRealPath('C:\\foo\\bar')).toBe('C:\\foo\\bar');
+    });
+
+    it('should strip UNC long path prefix \\\\?\\UNC\\ and keep UNC slash structure', () => {
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValueOnce(
+        '\\\\?\\UNC\\server\\share\\foo',
+      );
+      expect(resolveToRealPath('\\\\server\\share\\foo')).toBe(
+        '\\\\server\\share\\foo',
+      );
+    });
+
+    it('should strip lowercase UNC long path prefix \\\\?\\unc\\ case-insensitively', () => {
+      vi.spyOn(fs.realpathSync, 'native').mockReturnValueOnce(
+        '\\\\?\\unc\\server\\share\\foo',
+      );
+      expect(resolveToRealPath('\\\\server\\share\\foo')).toBe(
+        '\\\\server\\share\\foo',
+      );
+    });
+  });
+});
+
+describe('stripExtendedLengthPrefix', () => {
+  it('strips \\\\?\\ prefix', () => {
+    expect(stripExtendedLengthPrefix('\\\\?\\C:\\foo\\bar')).toBe(
+      'C:\\foo\\bar',
+    );
+  });
+
+  it('strips \\\\?\\UNC\\ prefix and replaces with \\\\', () => {
+    expect(
+      stripExtendedLengthPrefix('\\\\?\\UNC\\server\\share\\foo\\bar'),
+    ).toBe('\\\\server\\share\\foo\\bar');
+  });
+
+  it('preserves normal paths without extended prefixes', () => {
+    expect(stripExtendedLengthPrefix('C:\\foo\\bar')).toBe('C:\\foo\\bar');
+    expect(stripExtendedLengthPrefix('/foo/bar')).toBe('/foo/bar');
+    expect(stripExtendedLengthPrefix('\\\\server\\share\\file')).toBe(
+      '\\\\server\\share\\file',
+    );
+  });
+});
+
+describe('makeRelative', () => {
+  describe.skipIf(process.platform === 'win32')('on POSIX', () => {
+    it('should return relative path if targetPath is already relative', () => {
+      expect(makeRelative('foo/bar', '/root')).toBe('foo/bar');
+    });
+
+    it('should return relative path from root to target', () => {
+      const root = '/Users/test/project';
+      const target = '/Users/test/project/src/file.ts';
+      expect(makeRelative(target, root)).toBe('src/file.ts');
+    });
+
+    it('should return "." if target and root are the same', () => {
+      const root = '/Users/test/project';
+      expect(makeRelative(root, root)).toBe('.');
+    });
+
+    it('should handle parent directories with ..', () => {
+      const root = '/Users/test/project/src';
+      const target = '/Users/test/project/docs/readme.md';
+      expect(makeRelative(target, root)).toBe('../docs/readme.md');
+    });
+  });
+
+  describe.skipIf(process.platform !== 'win32')('on Windows', () => {
+    it('should return relative path if targetPath is already relative', () => {
+      expect(makeRelative('foo/bar', 'C:\\root')).toBe('foo/bar');
+    });
+
+    it('should return relative path from root to target', () => {
+      const root = 'C:\\Users\\test\\project';
+      const target = 'C:\\Users\\test\\project\\src\\file.ts';
+      expect(makeRelative(target, root)).toBe('src\\file.ts');
+    });
+
+    it('should return "." if target and root are the same', () => {
+      const root = 'C:\\Users\\test\\project';
+      expect(makeRelative(root, root)).toBe('.');
+    });
+
+    it('should handle parent directories with ..', () => {
+      const root = 'C:\\Users\\test\\project\\src';
+      const target = 'C:\\Users\\test\\project\\docs\\readme.md';
+      expect(makeRelative(target, root)).toBe('..\\docs\\readme.md');
+    });
+  });
+});
+
+describe('toAbsolutePath', () => {
+  it('should resolve a relative path to an absolute path', () => {
+    const result = toAbsolutePath('some/relative/path');
+    expect(result).toMatch(/^\/|^[A-Za-z]:\//);
+  });
+
+  it('should convert all backslashes to forward slashes', () => {
+    const result = toAbsolutePath(path.resolve('some', 'path'));
+    expect(result).not.toContain('\\');
+  });
+
+  describe.skipIf(process.platform !== 'darwin')(
+    'on Darwin (case-preserving)',
+    () => {
+      beforeEach(() => mockPlatform('darwin'));
+      afterEach(() => vi.unstubAllGlobals());
+
+      it('should preserve the original casing of every segment', () => {
+        const result = toAbsolutePath('/Users/Sandy/Memory/MEMORY.md');
+        expect(result).toBe('/Users/Sandy/Memory/MEMORY.md');
+      });
+    },
+  );
+
+  describe.skipIf(
+    process.platform === 'win32' || process.platform === 'darwin',
+  )('on Linux', () => {
+    it('should preserve case', () => {
+      const result = toAbsolutePath('/usr/Local/Bin');
+      expect(result).toBe('/usr/Local/Bin');
+    });
+  });
 });
 
 describe('normalizePath', () => {
@@ -615,7 +783,19 @@ describe('normalizePath', () => {
     });
   });
 
-  describe.skipIf(process.platform === 'win32')('on POSIX', () => {
+  describe.skipIf(process.platform !== 'darwin')('on Darwin', () => {
+    beforeEach(() => mockPlatform('darwin'));
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('should lowercase the entire path', () => {
+      const result = normalizePath('/Users/TEST');
+      expect(result).toBe('/users/test');
+    });
+  });
+
+  describe.skipIf(
+    process.platform === 'win32' || process.platform === 'darwin',
+  )('on Linux', () => {
     it('should preserve case', () => {
       const result = normalizePath('/usr/Local/Bin');
       expect(result).toContain('Local');
@@ -625,6 +805,239 @@ describe('normalizePath', () => {
     it('should use forward slashes', () => {
       const result = normalizePath('/usr/local/bin');
       expect(result).toBe('/usr/local/bin');
+    });
+  });
+
+  describe('deduplicateAbsolutePaths', () => {
+    it('should return an empty array if no paths are provided', () => {
+      expect(deduplicateAbsolutePaths(undefined)).toEqual([]);
+      expect(deduplicateAbsolutePaths(null)).toEqual([]);
+      expect(deduplicateAbsolutePaths([])).toEqual([]);
+    });
+
+    it('should deduplicate paths using their normalized identity', () => {
+      const paths = ['/workspace/foo', '/workspace/foo/'];
+      expect(deduplicateAbsolutePaths(paths)).toEqual(['/workspace/foo']);
+    });
+
+    it('should handle case-insensitivity on Windows and macOS', () => {
+      mockPlatform('win32');
+      const paths = ['/workspace/foo', '/Workspace/Foo'];
+      expect(deduplicateAbsolutePaths(paths)).toEqual(['/workspace/foo']);
+
+      mockPlatform('darwin');
+      const macPaths = ['/tmp/foo', '/Tmp/Foo'];
+      expect(deduplicateAbsolutePaths(macPaths)).toEqual(['/tmp/foo']);
+
+      mockPlatform('linux');
+      const linuxPaths = ['/tmp/foo', '/tmp/FOO'];
+      expect(deduplicateAbsolutePaths(linuxPaths)).toEqual([
+        '/tmp/foo',
+        '/tmp/FOO',
+      ]);
+    });
+
+    it('should throw an error if a path is not absolute', () => {
+      const paths = ['relative/path'];
+      expect(() => deduplicateAbsolutePaths(paths)).toThrow(
+        'Path must be absolute: relative/path',
+      );
+    });
+  });
+
+  describe('toPathKey', () => {
+    it('should normalize paths and strip trailing slashes', () => {
+      expect(toPathKey('/foo/bar//baz/')).toBe(path.normalize('/foo/bar/baz'));
+    });
+
+    it('should convert paths to lowercase on Windows and macOS', () => {
+      mockPlatform('win32');
+      expect(toPathKey('/Workspace/Foo')).toBe(
+        path.normalize('/workspace/foo'),
+      );
+      // Ensure drive roots are preserved
+      expect(toPathKey('C:\\')).toBe('c:\\');
+
+      mockPlatform('darwin');
+      expect(toPathKey('/Tmp/Foo')).toBe(path.normalize('/tmp/foo'));
+
+      mockPlatform('linux');
+      expect(toPathKey('/Tmp/Foo')).toBe(path.normalize('/Tmp/Foo'));
+    });
+  });
+
+  describe('isTrustedSystemPath', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    });
+
+    it('should reject paths in the current working directory', () => {
+      const cwd = process.cwd();
+      expect(isTrustedSystemPath(path.join(cwd, 'bin/rg'))).toBe(false);
+      expect(isTrustedSystemPath(cwd)).toBe(false);
+    });
+
+    it('should not reject paths if the current working directory is the root directory', () => {
+      mockPlatform('linux');
+      const originalCwd = process.cwd;
+      process.cwd = vi.fn().mockReturnValue('/');
+      expect(isTrustedSystemPath('/usr/bin/rg')).toBe(true);
+      process.cwd = originalCwd;
+    });
+
+    it('should not reject paths if the current working directory is a Windows root directory', () => {
+      mockPlatform('win32');
+      vi.stubEnv('SystemRoot', 'C:\\Windows');
+      const originalCwd = process.cwd;
+      process.cwd = vi.fn().mockReturnValue('C:\\');
+      expect(isTrustedSystemPath('C:\\Windows\\System32\\rg.exe')).toBe(true);
+      process.cwd = originalCwd;
+      vi.unstubAllEnvs();
+    });
+
+    it('should allow trusted paths on Windows', () => {
+      mockPlatform('win32');
+      vi.stubEnv('SystemRoot', 'C:\\Windows');
+      vi.stubEnv('ProgramFiles', 'C:\\Program Files');
+      vi.stubEnv('ProgramFiles(x86)', 'C:\\Program Files (x86)');
+
+      expect(isTrustedSystemPath('C:\\Windows\\System32\\rg.exe')).toBe(true);
+      expect(isTrustedSystemPath('C:\\Program Files\\ripgrep\\rg.exe')).toBe(
+        true,
+      );
+      expect(
+        isTrustedSystemPath('C:\\Program Files (x86)\\ripgrep\\rg.exe'),
+      ).toBe(true);
+
+      // Case insensitive
+      expect(isTrustedSystemPath('c:\\windows\\system32\\rg.exe')).toBe(true);
+
+      // Untrusted paths
+      expect(isTrustedSystemPath('D:\\Downloads\\rg.exe')).toBe(false);
+      expect(isTrustedSystemPath('C:\\Users\\User\\rg.exe')).toBe(false);
+    });
+
+    it('should allow trusted paths on macOS and Linux', () => {
+      mockPlatform('darwin');
+
+      expect(isTrustedSystemPath('/usr/bin/rg')).toBe(true);
+      expect(isTrustedSystemPath('/bin/rg')).toBe(true);
+      expect(isTrustedSystemPath('/usr/local/bin/rg')).toBe(true);
+      expect(isTrustedSystemPath('/opt/homebrew/bin/rg')).toBe(true);
+      expect(
+        isTrustedSystemPath('/opt/homebrew/Cellar/ripgrep/13.0.0/bin/rg'),
+      ).toBe(true);
+      expect(
+        isTrustedSystemPath('/usr/local/Cellar/ripgrep/13.0.0/bin/rg'),
+      ).toBe(true);
+      expect(isTrustedSystemPath('/usr/sbin/rg')).toBe(true);
+      expect(isTrustedSystemPath('/sbin/rg')).toBe(true);
+
+      // Untrusted paths
+      expect(isTrustedSystemPath('/home/user/bin/rg')).toBe(false);
+      expect(isTrustedSystemPath('/tmp/rg')).toBe(false);
+      expect(isTrustedSystemPath('/Library/rg')).toBe(false);
+    });
+
+    it('should allow 1P internal hermetic execution paths', () => {
+      mockPlatform('linux');
+
+      expect(isTrustedSystemPath('/google/bin/rg')).toBe(true);
+      expect(
+        isTrustedSystemPath(
+          '/google/src/cloud/user/workspace/bazel-out/k8-fastbuild/bin/rg',
+        ),
+      ).toBe(true);
+      expect(
+        isTrustedSystemPath(
+          '/google/src/cloud/user/workspace/blaze-out/k8-opt/bin/rg',
+        ),
+      ).toBe(true);
+    });
+
+    describe('in secure hermetic environments', () => {
+      const originalCwd = process.cwd;
+      const cwd = '/sandbox';
+
+      beforeEach(() => {
+        mockPlatform('linux');
+        process.cwd = vi.fn().mockReturnValue(cwd);
+      });
+
+      afterEach(() => {
+        process.cwd = originalCwd;
+        vi.unstubAllEnvs();
+      });
+
+      it('should reject paths in the CWD by default', () => {
+        expect(isTrustedSystemPath(path.join(cwd, 'bin/rg'))).toBe(false);
+      });
+
+      it.each([
+        ['TEST_SRCDIR', '/mock/runfiles'],
+        ['BAZEL_TEST', '1'],
+        ['TEST_WORKSPACE', 'my_workspace'],
+        ['RUNFILES_DIR', '/mock/runfiles'],
+      ])('should bypass CWD rejection when %s is set', (envVar, value) => {
+        vi.stubEnv(envVar, value);
+        expect(isTrustedSystemPath(path.join(cwd, 'bin/rg'))).toBe(true);
+      });
+    });
+  });
+
+  describe('resolveDefensiveToolPath', () => {
+    it('should sanitize paths by stripping null bytes', () => {
+      const targetDir = '/workspace';
+      const filePathWithNull = 'src/index.ts\0.exe';
+      const result = resolveDefensiveToolPath(filePathWithNull, targetDir);
+      expect(result).toBe('src/index.ts.exe');
+    });
+
+    it('should sanitize @ prefixed paths by stripping null bytes', () => {
+      const targetDir = '/workspace';
+      const filePathWithNull = '@/components/Button.tsx\0';
+      const result = resolveDefensiveToolPath(filePathWithNull, targetDir);
+      expect(result).toBe('components/Button.tsx');
+    });
+  });
+
+  describe('hasBlockedPathSegment', () => {
+    it('should identify standard blocked segments', () => {
+      expect(hasBlockedPathSegment('src/.git/config')).toBe(true);
+      expect(hasBlockedPathSegment('.env')).toBe(true);
+      expect(hasBlockedPathSegment('node_modules/lodash')).toBe(true);
+      expect(hasBlockedPathSegment('safe/path/here')).toBe(false);
+    });
+
+    it('should block .env variants while allowing safe templates', () => {
+      expect(hasBlockedPathSegment('.env.local')).toBe(true);
+      expect(hasBlockedPathSegment('.env.production')).toBe(true);
+      expect(hasBlockedPathSegment('config/.env.stage')).toBe(true);
+      expect(hasBlockedPathSegment('.env.development.local')).toBe(true);
+      expect(hasBlockedPathSegment('.env.example')).toBe(false);
+      expect(hasBlockedPathSegment('.env.sample')).toBe(false);
+      expect(hasBlockedPathSegment('.env.template')).toBe(false);
+      expect(hasBlockedPathSegment('.env.dist')).toBe(false);
+      expect(hasBlockedPathSegment('docs/.env.example')).toBe(false);
+    });
+
+    it('should identify NTFS 8.3 short name (SFN) blocked segments', () => {
+      expect(hasBlockedPathSegment('git~1/config')).toBe(true);
+      expect(hasBlockedPathSegment('gi1a2b~1/config')).toBe(true);
+      expect(hasBlockedPathSegment('env~1')).toBe(true);
+      expect(hasBlockedPathSegment('ENV~1.LOC')).toBe(true);
+      expect(hasBlockedPathSegment('env~1.loc')).toBe(true);
+      expect(hasBlockedPathSegment('en1a2b~1.pro')).toBe(true);
+      expect(hasBlockedPathSegment('node_m~1/lodash')).toBe(true);
+    });
+
+    it('should block standard and SFN patterns for gha-creds-*.json', () => {
+      expect(hasBlockedPathSegment('gha-creds-1234.json')).toBe(true);
+      expect(hasBlockedPathSegment('gha-cr~1.json')).toBe(true);
+      expect(hasBlockedPathSegment('gh1a2b~1.json')).toBe(true);
+      expect(hasBlockedPathSegment('gha-cr~1.jso')).toBe(true);
+      expect(hasBlockedPathSegment('gh1a2b~1.jso')).toBe(true);
     });
   });
 });

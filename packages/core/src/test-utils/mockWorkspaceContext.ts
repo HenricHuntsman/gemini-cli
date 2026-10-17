@@ -6,6 +6,7 @@
 
 import { vi } from 'vitest';
 import type { WorkspaceContext } from '../utils/workspaceContext.js';
+import { resolveToRealPath } from '../utils/paths.js';
 
 /**
  * Creates a mock WorkspaceContext for testing
@@ -17,9 +18,18 @@ export function createMockWorkspaceContext(
   rootDir: string,
   additionalDirs: string[] = [],
 ): WorkspaceContext {
-  const allDirs = [rootDir, ...additionalDirs];
+  const resolveToRealPathSafe = (p: string) => {
+    try {
+      return resolveToRealPath(p);
+    } catch {
+      return p;
+    }
+  };
 
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+  const resolvedRootDir = resolveToRealPathSafe(rootDir);
+  const resolvedAdditionalDirs = additionalDirs.map(resolveToRealPathSafe);
+  const allDirs = [resolvedRootDir, ...resolvedAdditionalDirs];
+
   const mockWorkspaceContext = {
     addDirectory: vi.fn(),
     getDirectories: vi.fn().mockReturnValue(allDirs),

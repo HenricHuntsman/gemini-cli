@@ -4,9 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { lookup } from 'node:dns/promises';
 import type { MCPOAuthConfig } from './oauth-provider.js';
 import { getErrorMessage } from '../utils/errors.js';
 import { debugLogger } from '../utils/debugLogger.js';
+import {
+  isAddressPrivate,
+  isLoopbackHost,
+  sanitizeHostname,
+} from '../utils/fetch.js';
 
 /**
  * Error thrown when the discovered resource metadata does not match the expected resource.
@@ -16,6 +22,142 @@ export class ResourceMismatchError extends Error {
     super(message);
     this.name = 'ResourceMismatchError';
   }
+}
+
+/**
+ * Error thrown when an OAuth endpoint fails SSRF or URL security validation.
+ */
+export class OAuthSecurityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OAuthSecurityError';
+  }
+}
+
+/**
+ * Checks if a given URL string points to a loopback address.
+ */
+export function isLoopbackUrl(urlStr: string): boolean {
+  try {
+    const url = new URL(urlStr);
+    return isLoopbackHost(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Options for validating OAuth endpoint URLs.
+ */
+export interface OAuthUrlValidationOptions {
+  allowLoopback?: boolean;
+  expectedOrigin?: string;
+  allowRelative?: boolean;
+  baseUri?: string;
+}
+
+/**
+ * Validates an OAuth endpoint URL against SSRF, scheme, and origin constraints per RFC 9728 Section 7.7.
+ */
+export async function validateOAuthEndpointUrl(
+  urlStr: string,
+  options?: OAuthUrlValidationOptions,
+): Promise<string> {
+  let resolvedUrl = urlStr.trim();
+  if (options?.allowRelative && options.baseUri) {
+    try {
+      resolvedUrl = new URL(resolvedUrl, options.baseUri).toString();
+    } catch (e) {
+      throw new OAuthSecurityError(
+        `Failed to resolve relative OAuth URL "${urlStr}" against base "${options.baseUri}": ${getErrorMessage(e)}`,
+      );
+    }
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(resolvedUrl);
+  } catch (e) {
+    throw new OAuthSecurityError(
+      `Invalid OAuth endpoint URL "${resolvedUrl}": ${getErrorMessage(e)}`,
+    );
+  }
+
+  const isHttp = parsed.protocol === 'http:';
+  const isHttps = parsed.protocol === 'https:';
+  if (!isHttp && !isHttps) {
+    throw new OAuthSecurityError(
+      `Invalid OAuth endpoint protocol "${parsed.protocol}". Only HTTPS (and HTTP for local development) is supported.`,
+    );
+  }
+
+  const hostname = sanitizeHostname(parsed.hostname);
+  const isLoopback = isLoopbackHost(hostname);
+
+  if (isHttp && (!options?.allowLoopback || !isLoopback)) {
+    throw new OAuthSecurityError(
+      `Insecure HTTP OAuth endpoint "${resolvedUrl}" is not allowed. OAuth endpoints must use HTTPS unless connecting to localhost.`,
+    );
+  }
+
+  if (options?.expectedOrigin) {
+    let expected: string;
+    try {
+      expected = new URL(options.expectedOrigin).origin;
+    } catch {
+      throw new OAuthSecurityError(
+        `Invalid expected origin "${options.expectedOrigin}".`,
+      );
+    }
+    if (parsed.origin !== expected) {
+      throw new OAuthSecurityError(
+        `OAuth endpoint origin "${parsed.origin}" does not match expected origin "${expected}".`,
+      );
+    }
+  }
+
+  if (isLoopback) {
+    if (!options?.allowLoopback) {
+      throw new OAuthSecurityError(
+        `Loopback OAuth endpoint "${resolvedUrl}" is not allowed for remote MCP servers.`,
+      );
+    }
+    return parsed.toString();
+  }
+
+  // Non-loopback host: check literal IP
+  if (isAddressPrivate(hostname)) {
+    throw new OAuthSecurityError(
+      `OAuth endpoint "${resolvedUrl}" points to private or reserved IP address which is blocked.`,
+    );
+  }
+
+  // Asynchronous DNS resolution to prevent DNS rebinding / SSRF
+  try {
+    const addresses = await lookup(hostname, { all: true });
+    if (!addresses || addresses.length === 0) {
+      throw new OAuthSecurityError(
+        `Failed to resolve hostname "${hostname}" for OAuth endpoint "${resolvedUrl}".`,
+      );
+    }
+
+    for (const addr of addresses) {
+      if (isAddressPrivate(addr.address)) {
+        throw new OAuthSecurityError(
+          `OAuth endpoint "${resolvedUrl}" resolves to private network address "${addr.address}" which is blocked.`,
+        );
+      }
+    }
+  } catch (error) {
+    if (error instanceof OAuthSecurityError) {
+      throw error;
+    }
+    throw new OAuthSecurityError(
+      `DNS lookup failed for OAuth endpoint host "${hostname}": ${getErrorMessage(error)}`,
+    );
+  }
+
+  return parsed.toString();
 }
 
 /**
@@ -33,6 +175,12 @@ export interface OAuthAuthorizationServerMetadata {
   grant_types_supported?: string[];
   code_challenge_methods_supported?: string[];
   scopes_supported?: string[];
+  /**
+   * RFC 9207 Section 3: Indicates whether the authorization server provides
+   * the "iss" parameter in the authorization response. Defaults to false when
+   * omitted.
+   */
+  authorization_response_iss_parameter_supported?: boolean;
 }
 
 /**
@@ -91,19 +239,29 @@ export class OAuthUtils {
    * Fetch OAuth protected resource metadata.
    *
    * @param resourceMetadataUrl The protected resource metadata URL
+   * @param options Validation options including loopback allowance and expected origin
    * @returns The protected resource metadata or null if not available
    */
   static async fetchProtectedResourceMetadata(
     resourceMetadataUrl: string,
+    options?: { allowLoopback?: boolean; expectedOrigin?: string },
   ): Promise<OAuthProtectedResourceMetadata | null> {
     try {
-      const response = await fetch(resourceMetadataUrl);
+      const validatedUrl = await validateOAuthEndpointUrl(resourceMetadataUrl, {
+        allowLoopback: options?.allowLoopback,
+        expectedOrigin: options?.expectedOrigin,
+      });
+
+      const response = await fetch(validatedUrl);
       if (!response.ok) {
         return null;
       }
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       return (await response.json()) as OAuthProtectedResourceMetadata;
     } catch (error) {
+      if (error instanceof OAuthSecurityError) {
+        throw error;
+      }
       debugLogger.debug(
         `Failed to fetch protected resource metadata from ${resourceMetadataUrl}: ${getErrorMessage(error)}`,
       );
@@ -115,19 +273,31 @@ export class OAuthUtils {
    * Fetch OAuth authorization server metadata.
    *
    * @param authServerMetadataUrl The authorization server metadata URL
+   * @param options Validation options including loopback allowance
    * @returns The authorization server metadata or null if not available
    */
   static async fetchAuthorizationServerMetadata(
     authServerMetadataUrl: string,
+    options?: { allowLoopback?: boolean },
   ): Promise<OAuthAuthorizationServerMetadata | null> {
     try {
-      const response = await fetch(authServerMetadataUrl);
+      const validatedUrl = await validateOAuthEndpointUrl(
+        authServerMetadataUrl,
+        {
+          allowLoopback: options?.allowLoopback,
+        },
+      );
+
+      const response = await fetch(validatedUrl);
       if (!response.ok) {
         return null;
       }
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       return (await response.json()) as OAuthAuthorizationServerMetadata;
     } catch (error) {
+      if (error instanceof OAuthSecurityError) {
+        throw error;
+      }
       debugLogger.debug(
         `Failed to fetch authorization server metadata from ${authServerMetadataUrl}: ${getErrorMessage(error)}`,
       );
@@ -150,6 +320,13 @@ export class OAuthUtils {
       tokenUrl: metadata.token_endpoint,
       scopes: metadata.scopes_supported || [],
       registrationUrl: metadata.registration_endpoint,
+      // RFC 9207 Section 3: the flag defaults to false when omitted. Discovered
+      // configurations therefore always carry an explicit boolean, which lets
+      // the callback policy distinguish them from an explicitly configured issuer.
+      // Only a literal boolean `true` enables the flag, so loosely typed values
+      // returned by some servers (e.g. "false" or "0") are not coerced to true.
+      authorizationResponseIssParameterSupported:
+        metadata.authorization_response_iss_parameter_supported === true,
     };
   }
 
@@ -158,12 +335,18 @@ export class OAuthUtils {
    * trying the standard well-known endpoints.
    *
    * @param authServerUrl The authorization server URL
+   * @param options Validation options including loopback allowance
    * @returns The authorization server metadata or null if not found
    */
   static async discoverAuthorizationServerMetadata(
     authServerUrl: string,
+    options?: { allowLoopback?: boolean },
   ): Promise<OAuthAuthorizationServerMetadata | null> {
-    const authServerUrlObj = new URL(authServerUrl);
+    const validatedBaseUrl = await validateOAuthEndpointUrl(authServerUrl, {
+      allowLoopback: options?.allowLoopback,
+    });
+
+    const authServerUrlObj = new URL(validatedBaseUrl);
     const base = `${authServerUrlObj.protocol}//${authServerUrlObj.host}`;
 
     const endpointsToTry: string[] = [];
@@ -210,8 +393,10 @@ export class OAuthUtils {
     );
 
     for (const endpoint of endpointsToTry) {
-      const authServerMetadata =
-        await this.fetchAuthorizationServerMetadata(endpoint);
+      const authServerMetadata = await this.fetchAuthorizationServerMetadata(
+        endpoint,
+        options,
+      );
       if (authServerMetadata) {
         return authServerMetadata;
       }
@@ -233,11 +418,15 @@ export class OAuthUtils {
     serverUrl: string,
   ): Promise<MCPOAuthConfig | null> {
     try {
+      const allowLoopback = isLoopbackUrl(serverUrl);
+      const expectedOrigin = new URL(serverUrl).origin;
+
       // RFC 9728 §3.1: Construct well-known URL by inserting /.well-known/oauth-protected-resource
       // between the host and path. This is the RFC-compliant approach.
       const wellKnownUrls = this.buildWellKnownUrls(serverUrl);
       let resourceMetadata = await this.fetchProtectedResourceMetadata(
         wellKnownUrls.protectedResource,
+        { allowLoopback, expectedOrigin },
       );
 
       // Fallback: If path-based discovery fails and we have a path, try root-based discovery
@@ -248,6 +437,7 @@ export class OAuthUtils {
           const rootBasedUrls = this.buildWellKnownUrls(serverUrl, true);
           resourceMetadata = await this.fetchProtectedResourceMetadata(
             rootBasedUrls.protectedResource,
+            { allowLoopback, expectedOrigin },
           );
         }
       }
@@ -273,7 +463,9 @@ export class OAuthUtils {
         // Use the first authorization server
         const authServerUrl = resourceMetadata.authorization_servers[0];
         const authServerMetadata =
-          await this.discoverAuthorizationServerMetadata(authServerUrl);
+          await this.discoverAuthorizationServerMetadata(authServerUrl, {
+            allowLoopback,
+          });
 
         if (authServerMetadata) {
           const config = this.metadataToOAuthConfig(authServerMetadata);
@@ -289,8 +481,12 @@ export class OAuthUtils {
 
       // Fallback: try well-known endpoints at the base URL
       debugLogger.debug(`Trying OAuth discovery fallback at ${serverUrl}`);
-      const authServerMetadata =
-        await this.discoverAuthorizationServerMetadata(serverUrl);
+      const authServerMetadata = await this.discoverAuthorizationServerMetadata(
+        serverUrl,
+        {
+          allowLoopback,
+        },
+      );
 
       if (authServerMetadata) {
         const config = this.metadataToOAuthConfig(authServerMetadata);
@@ -305,7 +501,10 @@ export class OAuthUtils {
 
       return null;
     } catch (error) {
-      if (error instanceof ResourceMismatchError) {
+      if (
+        error instanceof ResourceMismatchError ||
+        error instanceof OAuthSecurityError
+      ) {
         throw error;
       }
       debugLogger.debug(
@@ -322,10 +521,10 @@ export class OAuthUtils {
    * @returns The resource metadata URI if found
    */
   static parseWWWAuthenticateHeader(header: string): string | null {
-    // Parse Bearer realm and resource_metadata
-    const match = header.match(/resource_metadata="([^"]+)"/);
+    // Parse Bearer realm and resource_metadata (quoted or unquoted token)
+    const match = header.match(/resource_metadata=(?:"([^"]+)"|([^\s,]+))/);
     if (match) {
-      return match[1];
+      return match[1] || match[2] || null;
     }
     return null;
   }
@@ -347,8 +546,28 @@ export class OAuthUtils {
       return null;
     }
 
-    const resourceMetadata =
-      await this.fetchProtectedResourceMetadata(resourceMetadataUri);
+    const allowLoopback = mcpServerUrl ? isLoopbackUrl(mcpServerUrl) : false;
+    const expectedOrigin = mcpServerUrl
+      ? new URL(mcpServerUrl).origin
+      : undefined;
+
+    const validatedResourceMetadataUrl = await validateOAuthEndpointUrl(
+      resourceMetadataUri,
+      {
+        allowLoopback,
+        expectedOrigin,
+        allowRelative: true,
+        baseUri: mcpServerUrl,
+      },
+    );
+
+    const resourceMetadata = await this.fetchProtectedResourceMetadata(
+      validatedResourceMetadataUrl,
+      {
+        allowLoopback,
+        expectedOrigin,
+      },
+    );
 
     if (resourceMetadata && mcpServerUrl) {
       // Validate resource parameter per RFC 9728 Section 7.3
@@ -370,8 +589,12 @@ export class OAuthUtils {
     }
 
     const authServerUrl = resourceMetadata.authorization_servers[0];
-    const authServerMetadata =
-      await this.discoverAuthorizationServerMetadata(authServerUrl);
+    const authServerMetadata = await this.discoverAuthorizationServerMetadata(
+      authServerUrl,
+      {
+        allowLoopback,
+      },
+    );
 
     if (authServerMetadata) {
       return this.metadataToOAuthConfig(authServerMetadata);

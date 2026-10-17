@@ -23,14 +23,19 @@ import {
   type ToolResult,
   type PolicyUpdateOptions,
   type ToolConfirmationOutcome,
+  type ExecuteOptions,
 } from './tools.js';
-import { makeRelative, shortenPath } from '../utils/paths.js';
+import {
+  makeRelative,
+  shortenPath,
+  resolveToRealPath,
+} from '../utils/paths.js';
 import { getErrorMessage, isNodeError } from '../utils/errors.js';
-import { isGitRepository } from '../utils/gitUtils.js';
+import { isGitRepository, getSafeGitEnv } from '../utils/gitUtils.js';
 import type { Config } from '../config/config.js';
 import type { FileExclusions } from '../utils/ignorePatterns.js';
 import { ToolErrorType } from './tool-error.js';
-import { GREP_TOOL_NAME } from './tool-names.js';
+import { GREP_TOOL_NAME, GREP_DISPLAY_NAME } from './tool-names.js';
 import { buildPatternArgsPattern } from '../policy/utils.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import { GREP_DEFINITION } from './definitions/coreTools.js';
@@ -138,14 +143,28 @@ class GrepToolInvocation extends BaseToolInvocation<
     return null;
   }
 
-  async execute(signal: AbortSignal): Promise<ToolResult> {
+  async execute({ abortSignal: signal }: ExecuteOptions): Promise<ToolResult> {
     try {
       const workspaceContext = this.config.getWorkspaceContext();
       const pathParam = this.params.dir_path;
 
       let searchDirAbs: string | null = null;
       if (pathParam) {
-        searchDirAbs = path.resolve(this.config.getTargetDir(), pathParam);
+        try {
+          searchDirAbs = resolveToRealPath(
+            path.resolve(this.config.getTargetDir(), pathParam),
+          );
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          return {
+            llmContent: errMsg,
+            returnDisplay: 'Error: Path resolution failed.',
+            error: {
+              message: errMsg,
+              type: ToolErrorType.PATH_NOT_IN_WORKSPACE,
+            },
+          };
+        }
         const validationError = this.config.validatePathAccess(
           searchDirAbs,
           'read',
@@ -215,9 +234,17 @@ class GrepToolInvocation extends BaseToolInvocation<
 
       // Create a timeout controller to prevent indefinitely hanging searches
       const timeoutController = new AbortController();
+      const configTimeout = this.config.getFileFilteringOptions().searchTimeout;
+      // If configTimeout is less than standard default, it might be too short for grep.
+      // We check if it's greater or if we should use DEFAULT_SEARCH_TIMEOUT_MS as a fallback.
+      // Let's assume the user can set it higher if they want. Using it directly if it exists, otherwise fallback.
+      const timeoutMs =
+        configTimeout && configTimeout > DEFAULT_SEARCH_TIMEOUT_MS
+          ? configTimeout
+          : DEFAULT_SEARCH_TIMEOUT_MS;
       const timeoutId = setTimeout(() => {
         timeoutController.abort();
-      }, DEFAULT_SEARCH_TIMEOUT_MS);
+      }, timeoutMs);
 
       // Link the passed signal to our timeout controller
       const onAbort = () => timeoutController.abort();
@@ -252,6 +279,13 @@ class GrepToolInvocation extends BaseToolInvocation<
 
           allMatches = allMatches.concat(matches);
         }
+      } catch (error) {
+        if (timeoutController.signal.aborted) {
+          throw new Error(
+            `Operation timed out after ${timeoutMs}ms. In large repositories, consider narrowing your search scope by specifying a 'dir_path' or an 'include_pattern'.`,
+          );
+        }
+        throw error;
       } finally {
         clearTimeout(timeoutId);
         signal.removeEventListener('abort', onAbort);
@@ -268,12 +302,24 @@ class GrepToolInvocation extends BaseToolInvocation<
         searchLocationDescription = `in path "${searchDirDisplay}"`;
       }
 
-      return await formatGrepResults(
+      const result = await formatGrepResults(
         allMatches,
         this.params,
         searchLocationDescription,
         totalMaxMatches,
       );
+      return {
+        ...result,
+        display: {
+          name: this._toolDisplayName,
+          description: this.getDescription(),
+          resultSummary: result.returnDisplay.summary,
+          result: {
+            type: 'text',
+            text: result.llmContent.split('\n---\n').slice(1).join('\n---\n'),
+          },
+        },
+      };
     } catch (error) {
       debugLogger.warn(`Error during GrepLogic execution: ${error}`);
       const errorMessage = getErrorMessage(error);
@@ -311,6 +357,7 @@ class GrepToolInvocation extends BaseToolInvocation<
       let finalCommand = checkCommand;
       let finalArgs = checkArgs;
       let finalEnv = process.env;
+      let cleanup: (() => void) | undefined;
 
       if (sandboxManager) {
         try {
@@ -323,6 +370,7 @@ class GrepToolInvocation extends BaseToolInvocation<
           finalCommand = prepared.program;
           finalArgs = prepared.args;
           finalEnv = prepared.env;
+          cleanup = prepared.cleanup;
         } catch (err) {
           debugLogger.debug(
             `[GrepTool] Sandbox preparation failed for '${command}':`,
@@ -331,21 +379,27 @@ class GrepToolInvocation extends BaseToolInvocation<
         }
       }
 
-      return await new Promise((resolve) => {
-        const child = spawn(finalCommand, finalArgs, {
-          stdio: 'ignore',
-          shell: true,
-          env: finalEnv,
+      try {
+        return await new Promise((resolve) => {
+          const child = spawn(finalCommand, finalArgs, {
+            stdio: 'ignore',
+            shell: true,
+            env: finalEnv,
+          });
+          child.on('close', (code) => {
+            resolve(code === 0);
+          });
+          child.on('error', (err) => {
+            debugLogger.debug(
+              `[GrepTool] Failed to start process for '${command}':`,
+              err.message,
+            );
+            resolve(false);
+          });
         });
-        child.on('close', (code) => resolve(code === 0));
-        child.on('error', (err) => {
-          debugLogger.debug(
-            `[GrepTool] Failed to start process for '${command}':`,
-            err.message,
-          );
-          resolve(false);
-        });
-      });
+      } finally {
+        cleanup?.();
+      }
     } catch {
       return false;
     }
@@ -408,6 +462,7 @@ class GrepToolInvocation extends BaseToolInvocation<
             signal: options.signal,
             allowedExitCodes: [0, 1],
             sandboxManager: this.config.sandboxManager,
+            env: getSafeGitEnv(),
           });
 
           const results: GrepMatch[] = [];
@@ -441,7 +496,7 @@ class GrepToolInvocation extends BaseToolInvocation<
       const grepAvailable = await this.isCommandAvailable('grep');
       if (grepAvailable) {
         strategyUsed = 'system grep';
-        const grepArgs = ['-r', '-n', '-H', '-E', '-I'];
+        const grepArgs = ['-r', '-n', '-H', '-E', '-I', '-i'];
         // Extract directory names from exclusion patterns for grep --exclude-dir
         const globExcludes = this.fileExclusions.getGlobExcludes();
         const commonExcludes = globExcludes
@@ -638,7 +693,7 @@ export class GrepTool extends BaseDeclarativeTool<GrepToolParams, ToolResult> {
   ) {
     super(
       GrepTool.Name,
-      'SearchText',
+      GREP_DISPLAY_NAME,
       GREP_DEFINITION.base.description!,
       Kind.Search,
       GREP_DEFINITION.base.parametersJsonSchema,
@@ -686,10 +741,14 @@ export class GrepTool extends BaseDeclarativeTool<GrepToolParams, ToolResult> {
 
     // Only validate dir_path if one is provided
     if (params.dir_path) {
-      const resolvedPath = path.resolve(
-        this.config.getTargetDir(),
-        params.dir_path,
-      );
+      let resolvedPath: string;
+      try {
+        resolvedPath = resolveToRealPath(
+          path.resolve(this.config.getTargetDir(), params.dir_path),
+        );
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
       const validationError = this.config.validatePathAccess(
         resolvedPath,
         'read',

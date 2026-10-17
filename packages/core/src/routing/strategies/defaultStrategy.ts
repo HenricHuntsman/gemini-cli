@@ -26,6 +26,11 @@ export class DefaultStrategy implements TerminalStrategy {
     const defaultModel = resolveModel(
       config.getModel(),
       config.getGemini31LaunchedSync?.() ?? false,
+      false,
+      config.getHasAccessToPreviewModel?.() ?? true,
+      config,
+      config.hasLatestFlashGAAccess?.() ?? false,
+      config.hasLatestFlashLiteGAAccess?.() ?? false,
     );
     return {
       model: defaultModel,

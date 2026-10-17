@@ -34,11 +34,18 @@ import {
 import { AtFileProcessor } from './prompt-processors/atFileProcessor.js';
 import { sanitizeForDisplay } from '../ui/utils/textUtils.js';
 
-interface CommandDirectory {
+export interface CommandDirectory {
   path: string;
   kind: CommandKind;
   extensionName?: string;
   extensionId?: string;
+}
+
+export interface CommandFileGroup {
+  displayName: string;
+  path: string;
+  files: string[];
+  error?: string;
 }
 
 /**
@@ -86,10 +93,6 @@ export class FileCommandLoader implements ICommandLoader {
    * @returns A promise that resolves to an array of all loaded SlashCommands.
    */
   async loadCommands(signal: AbortSignal): Promise<SlashCommand[]> {
-    if (this.folderTrustEnabled && !this.isTrustedFolder) {
-      return [];
-    }
-
     const allCommands: SlashCommand[] = [];
     const globOptions = {
       nodir: true,
@@ -142,6 +145,59 @@ export class FileCommandLoader implements ICommandLoader {
   }
 
   /**
+   * Lists available .toml command files from user, project, and extension directories.
+   */
+  async listAvailableFiles(): Promise<CommandFileGroup[]> {
+    const directories = this.getCommandDirectories();
+    const groups: CommandFileGroup[] = [];
+
+    for (const dir of directories) {
+      const displayName = this.getDisplayName(dir);
+
+      try {
+        const files = await glob('**/*.toml', { cwd: dir.path });
+        if (files.length > 0) {
+          groups.push({
+            displayName,
+            path: dir.path,
+            files: [...files].sort(),
+          });
+        }
+      } catch (e) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        if ((e as { code?: string }).code === 'ENOENT') {
+          continue;
+        }
+
+        groups.push({
+          displayName,
+          path: dir.path,
+          files: [],
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
+    return groups;
+  }
+
+  /**
+   * Returns a human-readable display name for the command directory source.
+   */
+  private getDisplayName(dir: CommandDirectory): string {
+    switch (dir.kind) {
+      case CommandKind.USER_FILE:
+        return 'User';
+      case CommandKind.WORKSPACE_FILE:
+        return 'Project';
+      case CommandKind.EXTENSION_FILE:
+        return `Extension: ${dir.extensionName || 'Unknown'}`;
+      default:
+        return 'Custom';
+    }
+  }
+
+  /**
    * Get all command directories in order for loading.
    * User commands → Project commands → Extension commands
    * This order ensures extension commands can detect all conflicts.
@@ -152,19 +208,26 @@ export class FileCommandLoader implements ICommandLoader {
     const storage = this.config?.storage ?? new Storage(this.projectRoot);
 
     // 1. User commands
+    const userCommandsDir = Storage.getUserCommandsDir();
     dirs.push({
-      path: Storage.getUserCommandsDir(),
+      path: userCommandsDir,
       kind: CommandKind.USER_FILE,
     });
 
-    // 2. Project commands
-    dirs.push({
-      path: storage.getProjectCommandsDir(),
-      kind: CommandKind.WORKSPACE_FILE,
-    });
+    // 2. Project commands (skip if same directory as user commands, e.g. when
+    //    cwd is the user's home directory, to avoid false conflict warnings)
+    if (
+      !storage.isWorkspaceHomeDir() &&
+      (!this.folderTrustEnabled || this.isTrustedFolder)
+    ) {
+      dirs.push({
+        path: storage.getProjectCommandsDir(),
+        kind: CommandKind.WORKSPACE_FILE,
+      });
+    }
 
     // 3. Extension commands (processed last to detect all conflicts)
-    if (this.config) {
+    if (this.config && (!this.folderTrustEnabled || this.isTrustedFolder)) {
       const activeExtensions = this.config
         .getExtensions()
         .filter((ext) => ext.isActive)

@@ -41,6 +41,9 @@ import {
   loadSkillsFromDir,
   loadAgentsFromDirectory,
   homedir,
+  ExtensionIntegrityManager,
+  type IExtensionIntegrity,
+  type IntegrityDataStatus,
   type ExtensionEvents,
   type MCPServerConfig,
   type ExtensionInstallMetadata,
@@ -80,15 +83,19 @@ import {
 import type { EventEmitter } from 'node:stream';
 import { themeManager } from '../ui/themes/theme-manager.js';
 import { getFormattedSettingValue } from '../commands/extensions/utils.js';
+import { removeDirectoryWithRetry } from '../utils/retry.js';
 
 interface ExtensionManagerParams {
   enabledExtensionOverrides?: string[];
   settings: MergedSettings;
   requestConsent: (consent: string) => Promise<boolean>;
-  requestSetting: ((setting: ExtensionSetting) => Promise<string>) | null;
+  requestSetting:
+    | ((setting: ExtensionSetting) => Promise<string | undefined>)
+    | null;
   workspaceDir: string;
   eventEmitter?: EventEmitter<ExtensionEvents>;
   clientVersion?: string;
+  integrityManager?: IExtensionIntegrity;
 }
 
 /**
@@ -98,10 +105,11 @@ interface ExtensionManagerParams {
  */
 export class ExtensionManager extends ExtensionLoader {
   private extensionEnablementManager: ExtensionEnablementManager;
+  private integrityManager: IExtensionIntegrity;
   private settings: MergedSettings;
   private requestConsent: (consent: string) => Promise<boolean>;
   private requestSetting:
-    | ((setting: ExtensionSetting) => Promise<string>)
+    | ((setting: ExtensionSetting) => Promise<string | undefined>)
     | undefined;
   private telemetryConfig: Config;
   private workspaceDir: string;
@@ -127,10 +135,26 @@ export class ExtensionManager extends ExtensionLoader {
     });
     this.requestConsent = options.requestConsent;
     this.requestSetting = options.requestSetting ?? undefined;
+    this.integrityManager =
+      options.integrityManager ?? new ExtensionIntegrityManager();
   }
 
   getEnablementManager(): ExtensionEnablementManager {
     return this.extensionEnablementManager;
+  }
+
+  async verifyExtensionIntegrity(
+    extensionName: string,
+    metadata: ExtensionInstallMetadata | undefined,
+  ): Promise<IntegrityDataStatus> {
+    return this.integrityManager.verify(extensionName, metadata);
+  }
+
+  async storeExtensionIntegrity(
+    extensionName: string,
+    metadata: ExtensionInstallMetadata,
+  ): Promise<void> {
+    return this.integrityManager.store(extensionName, metadata);
   }
 
   setRequestConsent(
@@ -140,7 +164,7 @@ export class ExtensionManager extends ExtensionLoader {
   }
 
   setRequestSetting(
-    requestSetting?: (setting: ExtensionSetting) => Promise<string>,
+    requestSetting?: (setting: ExtensionSetting) => Promise<string | undefined>,
   ): void {
     this.requestSetting = requestSetting;
   }
@@ -159,10 +183,7 @@ export class ExtensionManager extends ExtensionLoader {
     previousExtensionConfig?: ExtensionConfig,
     requestConsentOverride?: (consent: string) => Promise<boolean>,
   ): Promise<GeminiCLIExtension> {
-    if (
-      this.settings.security?.allowedExtensions &&
-      this.settings.security?.allowedExtensions.length > 0
-    ) {
+    if ((this.settings.security?.allowedExtensions?.length ?? 0) > 0) {
       const extensionAllowed = this.settings.security?.allowedExtensions.some(
         (pattern) => {
           try {
@@ -421,6 +442,12 @@ Would you like to attempt to install via "git clone" instead?`,
         );
         await fs.promises.writeFile(metadataPath, metadataString);
 
+        // Establish trust at point of installation
+        await this.storeExtensionIntegrity(
+          newExtensionConfig.name,
+          installMetadata,
+        );
+
         // TODO: Gracefully handle this call failing, we should back up the old
         // extension prior to overwriting it and then restore and restart it.
         extension = await this.loadExtension(destinationPath);
@@ -471,7 +498,13 @@ Would you like to attempt to install via "git clone" instead?`,
         }
       } finally {
         if (tempDir) {
-          await fs.promises.rm(tempDir, { recursive: true, force: true });
+          try {
+            await removeDirectoryWithRetry(tempDir);
+          } catch (cleanupError) {
+            debugLogger.warn(
+              `Failed to clean up temp directory ${tempDir}: ${getErrorMessage(cleanupError)}`,
+            );
+          }
         }
       }
       return extension;
@@ -540,10 +573,7 @@ Would you like to attempt to install via "git clone" instead?`,
         : path.basename(extension.path),
     );
 
-    await fs.promises.rm(storage.getExtensionDir(), {
-      recursive: true,
-      force: true,
-    });
+    await removeDirectoryWithRetry(storage.getExtensionDir());
 
     // The rest of the cleanup below here is only for true uninstalls, not
     // uninstalls related to updates.
@@ -590,7 +620,7 @@ Would you like to attempt to install via "git clone" instead?`,
 
     this.loadingPromise = (async () => {
       try {
-        if (this.settings.admin.extensions.enabled === false) {
+        if (this.settings.admin?.extensions?.enabled === false) {
           this.loadedExtensions = [];
           return this.loadedExtensions;
         }
@@ -693,25 +723,31 @@ Would you like to attempt to install via "git clone" instead?`,
 
     const installMetadata = loadInstallMetadata(extensionDir);
     let effectiveExtensionPath = extensionDir;
-    if (
-      this.settings.security?.allowedExtensions &&
-      this.settings.security?.allowedExtensions.length > 0
-    ) {
-      if (!installMetadata?.source) {
-        throw new Error(
+    if ((this.settings.security?.allowedExtensions?.length ?? 0) > 0) {
+      // The metadata is parsed JSON that is not validated, so a source that is
+      // not a string is as unusable as a missing one.
+      if (
+        !installMetadata?.source ||
+        typeof installMetadata.source !== 'string'
+      ) {
+        debugLogger.warn(
           `Failed to load extension ${extensionDir}. The ${INSTALL_METADATA_FILENAME} file is missing or misconfigured.`,
         );
+        return null;
       }
+      const source = getRealPath(installMetadata.source);
       const extensionAllowed = this.settings.security?.allowedExtensions.some(
         (pattern) => {
           try {
-            return new RegExp(pattern).test(
-              getRealPath(installMetadata?.source ?? ''),
-            );
+            return new RegExp(pattern).test(source);
           } catch (e) {
-            throw new Error(
-              `Invalid regex pattern in allowedExtensions setting: "${pattern}. Error: ${getErrorMessage(e)}`,
+            // An invalid pattern cannot match anything. Ignore it, so the
+            // patterns listed after it are still evaluated and one bad entry
+            // does not make every extension unavailable.
+            debugLogger.warn(
+              `Invalid regex pattern in allowedExtensions setting: "${pattern}". Error: ${getErrorMessage(e)}`,
             );
+            return false;
           }
         },
       );
@@ -803,11 +839,11 @@ Would you like to attempt to install via "git clone" instead?`,
       }
 
       if (config.mcpServers) {
-        if (this.settings.admin.mcp.enabled === false) {
+        if (this.settings.admin?.mcp?.enabled === false) {
           config.mcpServers = undefined;
         } else {
           // Apply admin allowlist if configured
-          const adminAllowlist = this.settings.admin.mcp.config;
+          const adminAllowlist = this.settings.admin?.mcp?.config;
           if (adminAllowlist && Object.keys(adminAllowlist).length > 0) {
             const result = applyAdminAllowlist(
               config.mcpServers,
@@ -836,20 +872,10 @@ Would you like to attempt to install via "git clone" instead?`,
         }
       }
 
-      const contextFiles = getContextFileNames(config)
-        .map((contextFileName) => {
-          const contextFilePath = path.join(
-            effectiveExtensionPath,
-            contextFileName,
-          );
-          if (!isSubpath(effectiveExtensionPath, contextFilePath)) {
-            throw new Error(
-              `Invalid context file path: "${contextFileName}". Context files must be within the extension directory.`,
-            );
-          }
-          return contextFilePath;
-        })
-        .filter((contextFilePath) => fs.existsSync(contextFilePath));
+      const contextFiles = resolveContextFilePaths(
+        config,
+        effectiveExtensionPath,
+      );
 
       const hydrationContext: VariableContext = {
         extensionPath: effectiveExtensionPath,
@@ -936,6 +962,21 @@ Would you like to attempt to install via "git clone" instead?`,
         );
       }
 
+      let plan = config.plan;
+      if (plan?.directory) {
+        if (
+          typeof plan.directory !== 'string' ||
+          path.isAbsolute(plan.directory) ||
+          path.win32.isAbsolute(plan.directory) ||
+          plan.directory.includes('..')
+        ) {
+          debugLogger.warn(
+            `[ExtensionManager] Invalid plan.directory in extension "${config.name}": "${plan.directory}". Relative parent navigation and absolute paths are not allowed.`,
+          );
+          plan = undefined;
+        }
+      }
+
       return {
         name: config.name,
         version: config.version,
@@ -958,7 +999,7 @@ Would you like to attempt to install via "git clone" instead?`,
         themes: config.themes,
         rules,
         checkers,
-        plan: config.plan,
+        plan,
       };
     } catch (e) {
       debugLogger.error(
@@ -1220,11 +1261,32 @@ function filterMcpConfig(original: MCPServerConfig): MCPServerConfig {
   return Object.freeze(rest);
 }
 
+/**
+ * Recursively ensures that the owner has write permissions for all files
+ * and directories within the target path.
+ */
+async function makeWritableRecursive(targetPath: string): Promise<void> {
+  const stats = await fs.promises.lstat(targetPath);
+
+  if (stats.isDirectory()) {
+    // Ensure directory is rwx for the owner (0o700)
+    await fs.promises.chmod(targetPath, stats.mode | 0o700);
+    const children = await fs.promises.readdir(targetPath);
+    for (const child of children) {
+      await makeWritableRecursive(path.join(targetPath, child));
+    }
+  } else if (stats.isFile()) {
+    // Ensure file is rw for the owner (0o600)
+    await fs.promises.chmod(targetPath, stats.mode | 0o600);
+  }
+}
+
 export async function copyExtension(
   source: string,
   destination: string,
 ): Promise<void> {
   await fs.promises.cp(source, destination, { recursive: true });
+  await makeWritableRecursive(destination);
 }
 
 function getContextFileNames(config: ExtensionConfig): string[] {
@@ -1234,6 +1296,120 @@ function getContextFileNames(config: ExtensionConfig): string[] {
     return [config.contextFileName];
   }
   return config.contextFileName;
+}
+
+/**
+ * Context file candidate path validation result.
+ */
+export interface ContextPathValidationResult {
+  isValid: boolean;
+  resolvedPath?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Validates a single context file candidate path against the extension root.
+ * Enforces directory boundary and path formatting by:
+ * - Requiring a non-empty string without null bytes.
+ * - Rejecting absolute paths (both POSIX and Windows formats).
+ * - Disallowing relative parent directory references (e.g. '..'), including URL-encoded variations.
+ * - Verifying that the resolved path stays strictly within the extension root directory.
+ */
+export function validateContextFilePath(
+  contextFileName: unknown,
+  effectiveExtensionPath: string,
+): ContextPathValidationResult {
+  if (typeof contextFileName !== 'string' || !contextFileName.trim()) {
+    return {
+      isValid: false,
+      errorMessage: 'expected a non-empty string.',
+    };
+  }
+
+  if (contextFileName.includes('\0')) {
+    return {
+      isValid: false,
+      errorMessage: 'null bytes are not allowed.',
+    };
+  }
+
+  // Reject absolute paths upfront (both POSIX and Windows formats)
+  if (
+    path.isAbsolute(contextFileName) ||
+    path.win32.isAbsolute(contextFileName)
+  ) {
+    return {
+      isValid: false,
+      errorMessage: 'Absolute paths are not allowed.',
+    };
+  }
+
+  // Disallow relative parent directory references (e.g. ..)
+  let decodedFileName = contextFileName;
+  try {
+    decodedFileName = decodeURIComponent(contextFileName);
+  } catch {
+    debugLogger.debug(
+      `[ExtensionManager] Could not decode URI component in contextFileName: "${contextFileName}". Proceeding with undecoded name.`,
+    );
+  }
+
+  if (contextFileName.includes('..') || decodedFileName.includes('..')) {
+    return {
+      isValid: false,
+      errorMessage:
+        'Relative parent directory references ("..") are not allowed.',
+    };
+  }
+
+  const resolvedExtensionRoot = path.resolve(effectiveExtensionPath);
+  const contextFilePath = path.resolve(resolvedExtensionRoot, contextFileName);
+
+  // Verify that contextFilePath is strictly within resolvedExtensionRoot
+  if (!isSubpath(resolvedExtensionRoot, contextFilePath)) {
+    return {
+      isValid: false,
+      errorMessage: `escapes the extension directory boundary ("${resolvedExtensionRoot}").`,
+    };
+  }
+
+  return {
+    isValid: true,
+    resolvedPath: contextFilePath,
+  };
+}
+
+/**
+ * Resolves and validates context file paths defined in an extension configuration.
+ * Hardens path resolution and enforces directory boundaries by:
+ * - Validating each candidate context file path using validateContextFilePath.
+ * - Logging a warning when an invalid path is detected and skipping loading that context file.
+ * - Returning only paths that exist on disk.
+ */
+export function resolveContextFilePaths(
+  config: ExtensionConfig,
+  effectiveExtensionPath: string,
+): string[] {
+  return getContextFileNames(config)
+    .map((contextFileName) => {
+      const validation = validateContextFilePath(
+        contextFileName,
+        effectiveExtensionPath,
+      );
+
+      if (!validation.isValid) {
+        debugLogger.warn(
+          `[ExtensionManager] Invalid contextFileName: "${contextFileName}" in extension "${config.name}". ${validation.errorMessage}`,
+        );
+        return null;
+      }
+
+      return validation.resolvedPath!;
+    })
+    .filter(
+      (contextFilePath): contextFilePath is string =>
+        contextFilePath !== null && fs.existsSync(contextFilePath),
+    );
 }
 
 function validateName(name: string) {
@@ -1256,7 +1432,10 @@ export async function inferInstallMetadata(
     source.startsWith('http://') ||
     source.startsWith('https://') ||
     source.startsWith('git@') ||
-    source.startsWith('sso://')
+    source.startsWith('sso://') ||
+    source.startsWith('github:') ||
+    source.startsWith('gitlab:') ||
+    source.startsWith('ssh://')
   ) {
     return {
       source,

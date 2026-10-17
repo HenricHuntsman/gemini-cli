@@ -12,6 +12,7 @@ import {
   type ToolAskUserConfirmationDetails,
   type ToolConfirmationPayload,
   ToolConfirmationOutcome,
+  type ExecuteOptions,
 } from './tools.js';
 import { ToolErrorType } from './tool-error.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
@@ -92,7 +93,38 @@ export class AskUserTool extends BaseDeclarativeTool<
     toolName: string,
     toolDisplayName: string,
   ): AskUserInvocation {
-    return new AskUserInvocation(params, messageBus, toolName, toolDisplayName);
+    const unescape = (str: string): string =>
+      str.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+
+    const normalizedParams: AskUserParams = {
+      questions: params.questions.map((q) => {
+        const normalizedQ: Question = {
+          ...q,
+          type: q.type,
+          question: unescape(q.question),
+        };
+        if (q.header) normalizedQ.header = unescape(q.header);
+        if (q.placeholder) normalizedQ.placeholder = unescape(q.placeholder);
+
+        if (q.options) {
+          normalizedQ.options = q.options.map((opt) => ({
+            ...opt,
+            label: unescape(opt.label),
+            description: opt.description?.trim()
+              ? unescape(opt.description.trim())
+              : '',
+          }));
+        }
+        return normalizedQ;
+      }),
+    };
+
+    return new AskUserInvocation(
+      normalizedParams,
+      messageBus,
+      toolName,
+      toolDisplayName,
+    );
   }
 
   override async validateBuildAndExecute(
@@ -152,7 +184,7 @@ export class AskUserInvocation extends BaseToolInvocation<
     return `Asking user: ${this.params.questions.map((q) => q.question).join(', ')}`;
   }
 
-  async execute(_signal: AbortSignal): Promise<ToolResult> {
+  async execute({ abortSignal: _signal }: ExecuteOptions): Promise<ToolResult> {
     const questionTypes = this.params.questions.map((q) => q.type);
 
     if (this.confirmationOutcome === ToolConfirmationOutcome.Cancel) {
@@ -180,16 +212,30 @@ export class AskUserInvocation extends BaseToolInvocation<
       },
     };
 
+    // The UI hides the tool description once the dialog closes, so this
+    // display is the only record of the question the user answered. Keep the
+    // full question text (not just the short header chip) for context.
     const returnDisplay = hasAnswers
       ? `**User answered:**\n${answerEntries
           .map(([index, answer]) => {
             const question = this.params.questions[parseInt(index, 10)];
-            const category = question?.header ?? `Q${index}`;
-            const prefix = `  ${category} → `;
-            const indent = ' '.repeat(prefix.length);
+            const header = question?.header?.trim() || `Q${index}`;
+            const questionText = question?.question
+              ? `${header}: ${question.question}`
+              : header;
+            const questionIndent = '  ';
+            const answerPrefix = '    → ';
+            const answerIndent = ' '.repeat(answerPrefix.length);
 
-            const lines = answer.split('\n');
-            return prefix + lines.join('\n' + indent);
+            const questionLines = questionText.split('\n');
+            const answerLines = (answer ?? '').split('\n');
+            return (
+              questionIndent +
+              questionLines.join('\n' + questionIndent) +
+              '\n' +
+              answerPrefix +
+              answerLines.join('\n' + answerIndent)
+            );
           })
           .join('\n')}`
       : 'User submitted without answering questions.';

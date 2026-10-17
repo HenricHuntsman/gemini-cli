@@ -11,6 +11,9 @@ import {
   NEVER_ALLOWED_NAME_PATTERNS,
   NEVER_ALLOWED_VALUE_PATTERNS,
   sanitizeEnvironment,
+  getSecureSanitizationConfig,
+  isDangerousExecutionEnvironmentVariable,
+  BLOCKED_EXECUTION_ENVS,
 } from './environmentSanitization.js';
 
 const EMPTY_OPTIONS = {
@@ -370,5 +373,153 @@ describe('sanitizeEnvironment', () => {
     };
     const sanitized = sanitizeEnvironment(env, options);
     expect(sanitized).toEqual(env);
+  });
+});
+
+describe('getSecureSanitizationConfig', () => {
+  it('should default enableEnvironmentVariableRedaction to false', () => {
+    const config = getSecureSanitizationConfig();
+    expect(config.enableEnvironmentVariableRedaction).toBe(false);
+  });
+
+  it('should merge allowed and blocked variables from base and requested configs', () => {
+    const baseConfig = {
+      allowedEnvironmentVariables: ['SAFE_VAR_1'],
+      blockedEnvironmentVariables: ['BLOCKED_VAR_1'],
+      enableEnvironmentVariableRedaction: true,
+    };
+    const requestedConfig = {
+      allowedEnvironmentVariables: ['SAFE_VAR_2'],
+      blockedEnvironmentVariables: ['BLOCKED_VAR_2'],
+    };
+
+    const config = getSecureSanitizationConfig(requestedConfig, baseConfig);
+
+    expect(config.allowedEnvironmentVariables).toContain('SAFE_VAR_1');
+    expect(config.allowedEnvironmentVariables).toContain('SAFE_VAR_2');
+    expect(config.blockedEnvironmentVariables).toContain('BLOCKED_VAR_1');
+    expect(config.blockedEnvironmentVariables).toContain('BLOCKED_VAR_2');
+  });
+
+  it('should filter out variables from allowed list that match NEVER_ALLOWED_ENVIRONMENT_VARIABLES', () => {
+    const requestedConfig = {
+      allowedEnvironmentVariables: ['SAFE_VAR', 'GOOGLE_CLOUD_PROJECT'],
+    };
+
+    const config = getSecureSanitizationConfig(requestedConfig);
+
+    expect(config.allowedEnvironmentVariables).toContain('SAFE_VAR');
+    expect(config.allowedEnvironmentVariables).not.toContain(
+      'GOOGLE_CLOUD_PROJECT',
+    );
+  });
+
+  it('should filter out variables from allowed list that match NEVER_ALLOWED_NAME_PATTERNS', () => {
+    const requestedConfig = {
+      allowedEnvironmentVariables: ['SAFE_VAR', 'MY_SECRET_TOKEN'],
+    };
+
+    const config = getSecureSanitizationConfig(requestedConfig);
+
+    expect(config.allowedEnvironmentVariables).toContain('SAFE_VAR');
+    expect(config.allowedEnvironmentVariables).not.toContain('MY_SECRET_TOKEN');
+  });
+
+  it('should deduplicate variables in allowed and blocked lists', () => {
+    const baseConfig = {
+      allowedEnvironmentVariables: ['SAFE_VAR'],
+      blockedEnvironmentVariables: ['BLOCKED_VAR'],
+      enableEnvironmentVariableRedaction: true,
+    };
+    const requestedConfig = {
+      allowedEnvironmentVariables: ['SAFE_VAR'],
+      blockedEnvironmentVariables: ['BLOCKED_VAR'],
+    };
+
+    const config = getSecureSanitizationConfig(requestedConfig, baseConfig);
+
+    expect(config.allowedEnvironmentVariables).toEqual(['SAFE_VAR']);
+    expect(config.blockedEnvironmentVariables).toEqual(['BLOCKED_VAR']);
+  });
+
+  it('should respect requested enableEnvironmentVariableRedaction value', () => {
+    const requestedConfig = {
+      enableEnvironmentVariableRedaction: false,
+    };
+
+    const config = getSecureSanitizationConfig(requestedConfig);
+
+    expect(config.enableEnvironmentVariableRedaction).toBe(false);
+  });
+});
+
+describe('isDangerousExecutionEnvironmentVariable', () => {
+  it('should identify dangerous environment variables case-insensitively', () => {
+    expect(isDangerousExecutionEnvironmentVariable('NODE_OPTIONS')).toBe(true);
+    expect(isDangerousExecutionEnvironmentVariable('node_options')).toBe(true);
+    expect(isDangerousExecutionEnvironmentVariable('LD_PRELOAD')).toBe(true);
+    expect(isDangerousExecutionEnvironmentVariable('ld_preload')).toBe(true);
+    expect(isDangerousExecutionEnvironmentVariable('DYLD_LIBRARY_PATH')).toBe(
+      true,
+    );
+    expect(isDangerousExecutionEnvironmentVariable('BASH_ENV')).toBe(true);
+    expect(isDangerousExecutionEnvironmentVariable('PERL5DB')).toBe(true);
+    expect(isDangerousExecutionEnvironmentVariable('JAVA_TOOL_OPTIONS')).toBe(
+      true,
+    );
+    expect(isDangerousExecutionEnvironmentVariable('java_tool_options')).toBe(
+      true,
+    );
+    expect(
+      isDangerousExecutionEnvironmentVariable('DOTNET_STARTUP_HOOKS'),
+    ).toBe(true);
+  });
+
+  it('should identify safe environment variables as not dangerous', () => {
+    expect(isDangerousExecutionEnvironmentVariable('PATH')).toBe(false);
+    expect(isDangerousExecutionEnvironmentVariable('SAFE_VAR')).toBe(false);
+    expect(isDangerousExecutionEnvironmentVariable('GEMINI_CLI_KEY')).toBe(
+      false,
+    );
+  });
+
+  it('should contain all recommended dangerous variables in BLOCKED_EXECUTION_ENVS', () => {
+    const expectedBlocked = [
+      'NODE_OPTIONS',
+      'NODE_CLI_FLAGS',
+      '_FORCE_NODE_OPTIONS',
+      'NODE_PATH',
+      'ELECTRON_RUN_AS_NODE',
+      'PYTHONPATH',
+      'PYTHONSTARTUP',
+      'RUBYOPT',
+      'RUBYLIB',
+      'PERL5OPT',
+      'PERL5LIB',
+      'LD_PRELOAD',
+      'LD_AUDIT',
+      'LD_DEBUG',
+      'LD_PROFILE',
+      'LD_LIBRARY_PATH',
+      'DYLD_INSERT_LIBRARIES',
+      'DYLD_FORCE_FLAT_NAMESPACE',
+      'DYLD_LIBRARY_PATH',
+      'DYLD_FRAMEWORK_PATH',
+      'DYLD_FALLBACK_LIBRARY_PATH',
+      'DYLD_FALLBACK_FRAMEWORK_PATH',
+      'BASH_ENV',
+      'ENV',
+      'PERL5DB',
+      'JAVA_TOOL_OPTIONS',
+      '_JAVA_OPTIONS',
+      'CLASSPATH',
+      'DOTNET_STARTUP_HOOKS',
+      'CORECLR_PROFILER_PATH',
+      'CORECLR_ENABLE_PROFILING',
+    ];
+
+    for (const key of expectedBlocked) {
+      expect(BLOCKED_EXECUTION_ENVS.has(key)).toBe(true);
+    }
   });
 });

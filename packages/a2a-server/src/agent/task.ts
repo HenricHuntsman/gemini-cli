@@ -11,6 +11,7 @@ import {
   GeminiEventType,
   ToolConfirmationOutcome,
   ApprovalMode,
+  CoreToolCallStatus,
   getAllMCPServerStatuses,
   MCPServerStatus,
   isNodeError,
@@ -34,6 +35,7 @@ import {
   type AnsiToken,
   isSubagentProgress,
   EDIT_TOOL_NAMES,
+  isParallelizable,
   processRestorableToolCalls,
   MessageBusType,
   type ToolCallsUpdateMessage,
@@ -51,6 +53,7 @@ import type {
   Artifact,
 } from '@a2a-js/sdk';
 import { v4 as uuidv4 } from 'uuid';
+import { EventEmitter } from 'node:events';
 import { logger } from '../utils/logger.js';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -87,6 +90,12 @@ export class Task {
   currentAgentMessageId = uuidv4();
   promptCount = 0;
   autoExecute: boolean;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+    cachedContentTokenCount?: number;
+  };
   private get isYoloMatch(): boolean {
     return (
       this.autoExecute || this.config.getApprovalMode() === ApprovalMode.YOLO
@@ -95,12 +104,12 @@ export class Task {
 
   // For tool waiting logic
   private pendingToolCalls: Map<string, string> = new Map(); //toolCallId --> status
+  private pendingOutcomes: Map<string, ToolConfirmationOutcome | undefined> =
+    new Map(); // toolCallId --> outcome
   private toolsAlreadyConfirmed: Set<string> = new Set();
-  private toolCompletionPromise?: Promise<void>;
-  private toolCompletionNotifier?: {
-    resolve: () => void;
-    reject: (reason?: Error) => void;
-  };
+  private queuedToolCalls: Set<string> = new Set();
+  private toolUpdateEmitter = new EventEmitter();
+  private cancellationError?: Error;
 
   private constructor(
     id: string,
@@ -121,14 +130,23 @@ export class Task {
     this.taskState = 'submitted';
     this.eventBus = eventBus;
     this.completedToolCalls = [];
-    this._resetToolCompletionPromise();
     this.autoExecute = autoExecute;
     this.config.setFallbackModelHandler(
       // For a2a-server, we want to automatically switch to the fallback model
-      // for future requests without retrying the current one. The 'stop'
-      // intent achieves this.
-      async () => 'stop',
+      // for future requests without retrying the current one.
+      async (failedModel, fallbackModel) => {
+        this.config.activateFallbackMode(fallbackModel, failedModel);
+        return 'stop';
+      },
     );
+  }
+
+  get hasPendingTools(): boolean {
+    return this.pendingToolCalls.size > 0;
+  }
+
+  get pendingToolsCount(): number {
+    return this.pendingToolCalls.size;
   }
 
   static async create(
@@ -176,47 +194,67 @@ export class Task {
     return metadata;
   }
 
-  private _resetToolCompletionPromise(): void {
-    this.toolCompletionPromise = new Promise((resolve, reject) => {
-      this.toolCompletionNotifier = { resolve, reject };
-    });
-    // If there are no pending calls when reset, resolve immediately.
-    if (this.pendingToolCalls.size === 0 && this.toolCompletionNotifier) {
-      this.toolCompletionNotifier.resolve();
-    }
-  }
-
   private _registerToolCall(toolCallId: string, status: string): void {
-    const wasEmpty = this.pendingToolCalls.size === 0;
     this.pendingToolCalls.set(toolCallId, status);
-    if (wasEmpty) {
-      this._resetToolCompletionPromise();
-    }
+    this.toolUpdateEmitter.emit('update');
     logger.info(
       `[Task] Registered tool call: ${toolCallId}. Pending: ${this.pendingToolCalls.size}`,
     );
   }
 
   private _resolveToolCall(toolCallId: string): void {
+    this.queuedToolCalls.delete(toolCallId);
     if (this.pendingToolCalls.has(toolCallId)) {
       this.pendingToolCalls.delete(toolCallId);
+      this.toolUpdateEmitter.emit('update');
       logger.info(
         `[Task] Resolved tool call: ${toolCallId}. Pending: ${this.pendingToolCalls.size}`,
       );
-      if (this.pendingToolCalls.size === 0 && this.toolCompletionNotifier) {
-        this.toolCompletionNotifier.resolve();
-      }
     }
   }
 
-  async waitForPendingTools(): Promise<void> {
+  private isAwaitingApprovalOnly(): boolean {
     if (this.pendingToolCalls.size === 0) {
-      return Promise.resolve();
+      return false;
     }
-    logger.info(
-      `[Task] Waiting for ${this.pendingToolCalls.size} pending tool(s)...`,
-    );
-    await this.toolCompletionPromise;
+    let hasAwaitingApproval = false;
+    for (const [callId, status] of this.pendingToolCalls.entries()) {
+      if (this.toolsAlreadyConfirmed.has(callId)) {
+        return false;
+      }
+      if (status === CoreToolCallStatus.AwaitingApproval) {
+        hasAwaitingApproval = true;
+      } else if (
+        status === CoreToolCallStatus.Executing ||
+        ((status === CoreToolCallStatus.Scheduled ||
+          status === CoreToolCallStatus.Validating) &&
+          !this.queuedToolCalls.has(callId))
+      ) {
+        return false;
+      }
+    }
+    return hasAwaitingApproval;
+  }
+
+  async waitForPendingTools(): Promise<void> {
+    while (this.pendingToolCalls.size > 0 && !this.isAwaitingApprovalOnly()) {
+      if (this.cancellationError) {
+        const error = this.cancellationError;
+        this.cancellationError = undefined;
+        throw error;
+      }
+      logger.info(
+        `[Task] Waiting for ${this.pendingToolCalls.size} pending tool(s)...`,
+      );
+      await new Promise((resolve) =>
+        this.toolUpdateEmitter.once('update', resolve),
+      );
+    }
+    if (this.cancellationError) {
+      const error = this.cancellationError;
+      this.cancellationError = undefined;
+      throw error;
+    }
   }
 
   cancelPendingTools(reason: string): void {
@@ -225,15 +263,14 @@ export class Task {
         `[Task] Cancelling all ${this.pendingToolCalls.size} pending tool calls. Reason: ${reason}`,
       );
     }
-    if (this.toolCompletionNotifier) {
-      this.toolCompletionNotifier.reject(new Error(reason));
-    }
+    this.cancellationError = new Error(reason);
     this.pendingToolCalls.clear();
     this.pendingCorrelationIds.clear();
+    this.toolsAlreadyConfirmed.clear();
+    this.queuedToolCalls.clear();
 
     this.scheduler.cancelAll();
-    // Reset the promise for any future operations, ensuring it's in a clean state.
-    this._resetToolCompletionPromise();
+    this.toolUpdateEmitter.emit('update');
   }
 
   private _createTextMessage(
@@ -265,6 +302,7 @@ export class Task {
       userTier?: UserTierId;
       error?: string;
       traceId?: string;
+      usageMetadata?: Task['usageMetadata'];
     } = {
       coderAgent: coderAgentMessage,
       model: this.modelInfo || this.config.getModel(),
@@ -277,6 +315,10 @@ export class Task {
 
     if (traceId) {
       metadata.traceId = traceId;
+    }
+
+    if (final && this.usageMetadata) {
+      metadata.usageMetadata = this.usageMetadata;
     }
 
     return {
@@ -386,6 +428,7 @@ export class Task {
       context: this.config,
       messageBus,
       getPreferredEditor: () => DEFAULT_GUI_EDITOR,
+      cancelAllQueuedOnCancel: false,
     });
 
     this.messageBusListener = this.handleEventDrivenToolCallsUpdate.bind(this);
@@ -413,11 +456,34 @@ export class Task {
   private handleEventDrivenToolCallsUpdate(
     event: ToolCallsUpdateMessage,
   ): void {
-    if (event.type !== MessageBusType.TOOL_CALLS_UPDATE) {
+    if (
+      event.type !== MessageBusType.TOOL_CALLS_UPDATE ||
+      event.schedulerId !== this.id
+    ) {
       return;
     }
 
     const toolCalls = event.toolCalls;
+
+    const nonTerminalCalls = toolCalls.filter(
+      (tc) =>
+        tc.status !== CoreToolCallStatus.Success &&
+        tc.status !== CoreToolCallStatus.Error &&
+        tc.status !== CoreToolCallStatus.Cancelled,
+    );
+    let activeWaveOpen = true;
+    nonTerminalCalls.forEach((tc, index) => {
+      const callId = tc.request.callId;
+      if (index === 0) {
+        this.queuedToolCalls.delete(callId);
+        activeWaveOpen = isParallelizable(tc.request);
+      } else if (activeWaveOpen && isParallelizable(tc.request)) {
+        this.queuedToolCalls.delete(callId);
+      } else {
+        activeWaveOpen = false;
+        this.queuedToolCalls.add(callId);
+      }
+    });
 
     toolCalls.forEach((tc) => {
       this.handleEventDrivenToolCall(tc);
@@ -426,7 +492,7 @@ export class Task {
     this.checkInputRequiredState();
   }
 
-  private handleEventDrivenToolCall(tc: ToolCall): void {
+  private handleEventDrivenToolCall(tc: ToolCall): boolean {
     const callId = tc.request.callId;
 
     // Do not process events for tools that have already been finalized.
@@ -436,11 +502,16 @@ export class Task {
       this.processedToolCallIds.has(callId) ||
       this.completedToolCalls.some((c) => c.request.callId === callId)
     ) {
-      return;
+      return false;
     }
 
     const previousStatus = this.pendingToolCalls.get(callId);
-    const hasChanged = previousStatus !== tc.status;
+    const previousOutcome = this.pendingOutcomes.get(callId);
+    const hasChanged =
+      previousStatus !== tc.status || previousOutcome !== tc.outcome;
+
+    // Update outcome tracking
+    this.pendingOutcomes.set(callId, tc.outcome);
 
     // 1. Handle Output
     if (tc.status === 'executing' && tc.liveOutput) {
@@ -454,6 +525,7 @@ export class Task {
       tc.status === 'cancelled'
     ) {
       this.toolsAlreadyConfirmed.delete(callId);
+      this.pendingOutcomes.delete(callId);
       if (hasChanged) {
         logger.info(
           `[Task] Tool call ${callId} completed with status: ${tc.status}`,
@@ -496,6 +568,8 @@ export class Task {
       );
       this.eventBus?.publish(statusUpdate);
     }
+
+    return hasChanged;
   }
 
   private checkInputRequiredState(): void {
@@ -508,12 +582,15 @@ export class Task {
     let isExecuting = false;
 
     for (const [callId, status] of this.pendingToolCalls.entries()) {
-      if (status === 'executing' || status === 'scheduled') {
-        isExecuting = true;
-      } else if (
-        status === 'awaiting_approval' &&
-        !this.toolsAlreadyConfirmed.has(callId)
+      if (
+        status === CoreToolCallStatus.Executing ||
+        this.toolsAlreadyConfirmed.has(callId) ||
+        ((status === CoreToolCallStatus.Scheduled ||
+          status === CoreToolCallStatus.Validating) &&
+          !this.queuedToolCalls.has(callId))
       ) {
+        isExecuting = true;
+      } else if (status === CoreToolCallStatus.AwaitingApproval) {
         isAwaitingApproval = true;
       }
     }
@@ -536,8 +613,8 @@ export class Task {
 
       // Unblock waitForPendingTools to correctly end the executor loop and release the HTTP response stream.
       // The IDE client will open a new stream with the confirmation reply.
-      if (!wasAlreadyInputRequired && this.toolCompletionNotifier) {
-        this.toolCompletionNotifier.resolve();
+      if (!wasAlreadyInputRequired) {
+        this.toolUpdateEmitter.emit('update');
       }
     }
   }
@@ -574,7 +651,13 @@ export class Task {
       'confirmationDetails',
       'liveOutput',
       'response',
+      'outcome',
     );
+
+    // Map internal 'validating' status to 'scheduled' for the client
+    if (serializableToolCall.status === CoreToolCallStatus.Validating) {
+      serializableToolCall.status = CoreToolCallStatus.Scheduled;
+    }
 
     if (tc.tool) {
       const toolFields = this._pickFields(
@@ -619,13 +702,18 @@ export class Task {
     }
 
     try {
-      const currentContent = await fs.readFile(resolvedPath, 'utf8');
-      return this._applyReplacement(
+      const rawContent = await fs.readFile(resolvedPath, 'utf8');
+      const hasCrlf = rawContent.includes('\r\n');
+      const currentContent = rawContent.replace(/\r\n/g, '\n');
+      const normalizedOldString = old_string.replace(/\r\n/g, '\n');
+      const normalizedNewString = new_string.replace(/\r\n/g, '\n');
+      const proposedContent = this._applyReplacement(
         currentContent,
-        old_string,
-        new_string,
-        old_string === '' && currentContent === '',
+        normalizedOldString,
+        normalizedNewString,
+        normalizedOldString === '' && currentContent === '',
       );
+      return hasCrlf ? proposedContent.replace(/\n/g, '\r\n') : proposedContent;
     } catch (err) {
       if (!isNodeError(err) || err.code !== 'ENOENT') throw err;
       return '';
@@ -829,8 +917,18 @@ export class Task {
         break;
       case GeminiEventType.Finished:
         logger.info(`[Task ${this.id}] Agent finished its turn.`);
+        // Capture the usage metadata when the stream finishes
+        if (
+          event.value &&
+          typeof event.value === 'object' &&
+          'usageMetadata' in event.value
+        ) {
+          this.usageMetadata = event.value
+            .usageMetadata as typeof this.usageMetadata;
+        }
         break;
       case GeminiEventType.ModelInfo:
+        this.usageMetadata = undefined;
         this.modelInfo = event.value;
         break;
       case GeminiEventType.Retry:
@@ -895,6 +993,7 @@ export class Task {
     const outcomeString = part.data['outcome'];
 
     this.toolsAlreadyConfirmed.add(callId);
+    this.toolUpdateEmitter.emit('update');
 
     let confirmationOutcome: ToolConfirmationOutcome | undefined;
 
@@ -932,6 +1031,11 @@ export class Task {
     logger.info(
       `[Task] Handling tool confirmation for callId: ${callId} with outcome: ${outcomeString}`,
     );
+    if (this.taskState === 'input-required') {
+      this.setTaskStateAndPublishUpdate('working', {
+        kind: CoderAgentEvent.StateChangeEvent,
+      });
+    }
     try {
       // Temporarily unset GCP environment variables so they do not leak into
       // tool calls.
@@ -1034,19 +1138,21 @@ export class Task {
     logger.info(
       `[Task] Adding ${completedTools.length} tool responses to history without generating a new response.`,
     );
-    const responsesToAdd = completedTools.flatMap(
-      (toolCall) => toolCall.response.responseParts,
-    );
-
-    for (const response of responsesToAdd) {
-      let parts: genAiPart[];
-      if (Array.isArray(response)) {
-        parts = response;
-      } else if (typeof response === 'string') {
-        parts = [{ text: response }];
-      } else {
-        parts = [response];
+    const parts: genAiPart[] = [];
+    for (const toolCall of completedTools) {
+      const response = toolCall.response?.responseParts;
+      if (!response) {
+        continue;
       }
+      if (Array.isArray(response)) {
+        parts.push(...response);
+      } else if (typeof response === 'string') {
+        parts.push({ text: response });
+      } else {
+        parts.push(response);
+      }
+    }
+    if (parts.length > 0) {
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
       this.geminiClient.addHistory({
         role: 'user',
@@ -1098,6 +1204,9 @@ export class Task {
     requestContext: RequestContext,
     aborted: AbortSignal,
   ): AsyncGenerator<ServerGeminiStreamEvent> {
+    // Clear any stale cancellation error from a previous aborted execution loop
+    this.cancellationError = undefined;
+
     const userMessage = requestContext.userMessage;
     const llmParts: PartUnion[] = [];
     let anyConfirmationHandled = false;
@@ -1108,10 +1217,6 @@ export class Task {
       if (confirmationHandled) {
         anyConfirmationHandled = true;
         // If a confirmation was handled, the scheduler will now run the tool (or cancel it).
-        // We resolve the toolCompletionPromise manually in checkInputRequiredState
-        // to break the original execution loop, so we must reset it here so the
-        // new loop correctly awaits the tool's final execution.
-        this._resetToolCompletionPromise();
         // We don't send anything to the LLM for this part.
         // The subsequent tool execution will eventually lead to resolveToolCall.
         continue;
@@ -1149,7 +1254,8 @@ export class Task {
       // If not, and no new text, we are just waiting.
       if (
         this.pendingToolCalls.size > 0 &&
-        this.taskState !== 'input-required'
+        this.taskState !== 'input-required' &&
+        this.taskState !== 'working'
       ) {
         const stateChange: StateChange = {
           kind: CoderAgentEvent.StateChangeEvent,

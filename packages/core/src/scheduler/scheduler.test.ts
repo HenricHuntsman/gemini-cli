@@ -25,7 +25,6 @@ const runInDevTraceSpan = vi.hoisted(() =>
     const metadata = { attributes: opts.attributes || {} };
     return fn({
       metadata,
-      endSpan: vi.fn(),
     });
   }),
 );
@@ -50,6 +49,7 @@ import { resolveConfirmation } from './confirmation.js';
 import { checkPolicy, updatePolicy } from './policy.js';
 import { ToolExecutor } from './tool-executor.js';
 import { ToolModificationHandler } from './tool-modifier.js';
+import { MessageBusType, type Message } from '../confirmation-bus/types.js';
 
 vi.mock('./state-manager.js');
 vi.mock('./confirmation.js');
@@ -72,9 +72,11 @@ import type { ToolRegistry } from '../tools/tool-registry.js';
 import { PolicyDecision, ApprovalMode } from '../policy/types.js';
 import {
   ToolConfirmationOutcome,
+  Kind,
   type AnyDeclarativeTool,
   type AnyToolInvocation,
 } from '../tools/tools.js';
+import { UPDATE_TOPIC_TOOL_NAME } from '../tools/tool-names.js';
 import {
   CoreToolCallStatus,
   ROOT_SCHEDULER_ID,
@@ -170,10 +172,15 @@ describe('Scheduler (Orchestrator)', () => {
     mockConfig = {
       getPolicyEngine: vi.fn().mockReturnValue(mockPolicyEngine),
       toolRegistry: mockToolRegistry,
+      getToolRegistry: vi.fn().mockReturnValue(mockToolRegistry),
+      getHookSystem: vi.fn().mockReturnValue(undefined),
       isInteractive: vi.fn().mockReturnValue(true),
       getEnableHooks: vi.fn().mockReturnValue(true),
       setApprovalMode: vi.fn(),
       getApprovalMode: vi.fn().mockReturnValue(ApprovalMode.DEFAULT),
+      getTelemetryLogPromptsEnabled: vi.fn().mockReturnValue(false),
+      getTelemetryTracesEnabled: vi.fn().mockReturnValue(false),
+      getSessionId: vi.fn().mockReturnValue('test-session-id'),
     } as unknown as Mocked<Config>;
 
     (mockConfig as unknown as { config: Config }).config = mockConfig as Config;
@@ -401,7 +408,7 @@ describe('Scheduler (Orchestrator)', () => {
         expect.arrayContaining([
           expect.objectContaining({
             status: CoreToolCallStatus.Validating,
-            request: req1,
+            request: expect.objectContaining(req1),
             tool: mockTool,
             invocation: mockInvocation,
             schedulerId: ROOT_SCHEDULER_ID,
@@ -420,7 +427,7 @@ describe('Scheduler (Orchestrator)', () => {
       const spanArgs = vi.mocked(runInDevTraceSpan).mock.calls[0];
       const fn = spanArgs[1];
       const metadata = { attributes: {} };
-      await fn({ metadata, endSpan: vi.fn() });
+      await fn({ metadata });
       expect(metadata).toMatchObject({
         input: [req1],
       });
@@ -438,6 +445,44 @@ describe('Scheduler (Orchestrator)', () => {
           }),
         ]),
       );
+    });
+
+    it('should sort UPDATE_TOPIC_TOOL_NAME to the front of the batch', async () => {
+      const topicReq: ToolCallRequestInfo = {
+        callId: 'call-topic',
+        name: UPDATE_TOPIC_TOOL_NAME,
+        args: { title: 'New Chapter' },
+        prompt_id: 'p1',
+        isClientInitiated: false,
+      };
+      const otherReq: ToolCallRequestInfo = {
+        callId: 'call-other',
+        name: 'test-tool',
+        args: {},
+        prompt_id: 'p1',
+        isClientInitiated: false,
+      };
+
+      // Mock tool registry to return a tool for update_topic
+      vi.mocked(mockToolRegistry.getTool).mockImplementation((name) => {
+        if (name === UPDATE_TOPIC_TOOL_NAME) {
+          return {
+            name: UPDATE_TOPIC_TOOL_NAME,
+            build: vi.fn().mockReturnValue({}),
+          } as unknown as AnyDeclarativeTool;
+        }
+        return mockTool;
+      });
+
+      // Schedule in reverse order (other first, topic second)
+      await scheduler.schedule([otherReq, topicReq], signal);
+
+      // Verify they were enqueued in the correct sorted order (topic first)
+      const enqueueCalls = vi.mocked(mockStateManager.enqueue).mock.calls;
+      const lastCall = enqueueCalls[enqueueCalls.length - 1][0];
+
+      expect(lastCall[0].request.callId).toBe('call-topic');
+      expect(lastCall[1].request.callId).toBe('call-other');
     });
   });
 
@@ -586,8 +631,8 @@ describe('Scheduler (Orchestrator)', () => {
         CoreToolCallStatus.Cancelled,
         'Operation cancelled by user',
       );
-      // finalizeCall is handled by the processing loop, not synchronously by cancelAll
-      // expect(mockStateManager.finalizeCall).toHaveBeenCalledWith('call-1');
+      // finalizeCall is called synchronously by cancelAll to ensure completedBatch is populated and isActive is updated immediately
+      expect(mockStateManager.finalizeCall).toHaveBeenCalledWith('call-1');
       expect(mockStateManager.cancelAllQueued).toHaveBeenCalledWith(
         'Operation cancelled by user',
       );
@@ -640,6 +685,7 @@ describe('Scheduler (Orchestrator)', () => {
       vi.mocked(checkPolicy).mockResolvedValue({
         decision: PolicyDecision.DENY,
         rule: {
+          toolName: '*',
           decision: PolicyDecision.DENY,
           denyMessage: 'Custom denial reason',
         },
@@ -659,6 +705,30 @@ describe('Scheduler (Orchestrator)', () => {
                   error:
                     'Tool execution denied by policy. Custom denial reason',
                 },
+              }),
+            }),
+          ]),
+        }),
+      );
+    });
+
+    it('should use originalRequestName when generating an error response', async () => {
+      const error = new Error('Some error');
+      vi.mocked(checkPolicy).mockRejectedValue(error);
+
+      const tailReq = { ...req1, originalRequestName: 'original-tool-name' };
+      await scheduler.schedule(tailReq, signal);
+
+      expect(mockStateManager.updateStatus).toHaveBeenCalledWith(
+        'call-1',
+        CoreToolCallStatus.Error,
+        expect.objectContaining({
+          errorType: ToolErrorType.UNHANDLED_EXCEPTION,
+          responseParts: expect.arrayContaining([
+            expect.objectContaining({
+              functionResponse: expect.objectContaining({
+                name: 'original-tool-name',
+                response: { error: 'Some error' },
               }),
             }),
           ]),
@@ -691,7 +761,7 @@ describe('Scheduler (Orchestrator)', () => {
     it('should return POLICY_VIOLATION error type when denied in Plan Mode', async () => {
       vi.mocked(checkPolicy).mockResolvedValue({
         decision: PolicyDecision.DENY,
-        rule: { decision: PolicyDecision.DENY },
+        rule: { toolName: '*', decision: PolicyDecision.DENY },
       });
 
       mockConfig.getApprovalMode.mockReturnValue(ApprovalMode.PLAN);
@@ -720,7 +790,11 @@ describe('Scheduler (Orchestrator)', () => {
       const customMessage = 'Custom Plan Mode Deny';
       vi.mocked(checkPolicy).mockResolvedValue({
         decision: PolicyDecision.DENY,
-        rule: { decision: PolicyDecision.DENY, denyMessage: customMessage },
+        rule: {
+          toolName: '*',
+          decision: PolicyDecision.DENY,
+          denyMessage: customMessage,
+        },
       });
 
       mockConfig.getApprovalMode.mockReturnValue(ApprovalMode.PLAN);
@@ -773,6 +847,72 @@ describe('Scheduler (Orchestrator)', () => {
         CoreToolCallStatus.Executing,
       );
       expect(mockExecutor.execute).toHaveBeenCalled();
+    });
+
+    it('should escalate ALLOW to ASK_USER when invocation detects taint risk in interactive mode', async () => {
+      vi.mocked(checkPolicy).mockResolvedValue({
+        decision: PolicyDecision.ALLOW,
+        rule: undefined,
+      });
+
+      mockConfig.isInteractive = vi.fn().mockReturnValue(true);
+
+      const taintInvocation = {
+        ...mockInvocation,
+        hasTaintedOrBuildFileRisk: vi.fn().mockReturnValue(true),
+      };
+      mockTool.build = vi.fn().mockReturnValue(taintInvocation);
+
+      vi.mocked(resolveConfirmation).mockResolvedValue({
+        outcome: ToolConfirmationOutcome.ProceedOnce,
+        lastDetails: undefined,
+      });
+
+      mockExecutor.execute.mockResolvedValue({
+        status: CoreToolCallStatus.Success,
+      } as unknown as SuccessfulToolCall);
+
+      await scheduler.schedule(req1, signal);
+
+      expect(resolveConfirmation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({
+          forcedDecision: 'ask_user',
+        }),
+      );
+      expect(mockExecutor.execute).toHaveBeenCalled();
+    });
+
+    it('should escalate ALLOW to DENY when invocation detects taint risk in non-interactive mode', async () => {
+      vi.mocked(checkPolicy).mockResolvedValue({
+        decision: PolicyDecision.ALLOW,
+        rule: undefined,
+      });
+
+      mockConfig.isInteractive = vi.fn().mockReturnValue(false);
+
+      const taintInvocation = {
+        ...mockInvocation,
+        hasTaintedOrBuildFileRisk: vi.fn().mockReturnValue(true),
+      };
+      mockTool.build = vi.fn().mockReturnValue(taintInvocation);
+
+      mockExecutor.execute.mockResolvedValue({
+        status: CoreToolCallStatus.Success,
+      } as unknown as SuccessfulToolCall);
+
+      await scheduler.schedule(req1, signal);
+
+      expect(resolveConfirmation).not.toHaveBeenCalled();
+      expect(mockExecutor.execute).not.toHaveBeenCalled();
+      expect(mockStateManager.updateStatus).toHaveBeenCalledWith(
+        'call-1',
+        CoreToolCallStatus.Error,
+        expect.objectContaining({
+          errorType: ToolErrorType.POLICY_VIOLATION,
+        }),
+      );
     });
 
     it('should auto-approve remaining identical tools in batch after ProceedAlways', async () => {
@@ -836,6 +976,7 @@ describe('Scheduler (Orchestrator)', () => {
           messageBus: expect.anything(),
           state: mockStateManager,
           schedulerId: ROOT_SCHEDULER_ID,
+          forcedDecision: undefined,
         }),
       );
 
@@ -848,6 +989,44 @@ describe('Scheduler (Orchestrator)', () => {
         expect.anything(),
       );
 
+      expect(mockExecutor.execute).toHaveBeenCalled();
+    });
+
+    it('should pass forcedDecision: "ask_user" when hookDecision is ask', async () => {
+      vi.mocked(checkPolicy).mockResolvedValue({
+        decision: PolicyDecision.ALLOW,
+        rule: undefined,
+      });
+
+      const mockHookSystem = {
+        fireBeforeToolEvent: vi.fn().mockResolvedValue({
+          shouldStopExecution: () => false,
+          getBlockingError: () => undefined,
+          isAskDecision: () => true,
+          systemMessage: 'Hook prompt',
+        }),
+      };
+      mockConfig.getHookSystem = vi.fn().mockReturnValue(mockHookSystem);
+
+      vi.mocked(resolveConfirmation).mockResolvedValue({
+        outcome: ToolConfirmationOutcome.ProceedOnce,
+        lastDetails: undefined,
+      });
+
+      mockExecutor.execute.mockResolvedValue({
+        status: CoreToolCallStatus.Success,
+      } as unknown as SuccessfulToolCall);
+
+      await scheduler.schedule(req1, signal);
+
+      expect(resolveConfirmation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({
+          forcedDecision: 'ask_user',
+          systemMessage: 'Hook prompt',
+        }),
+      );
       expect(mockExecutor.execute).toHaveBeenCalled();
     });
 
@@ -878,6 +1057,51 @@ describe('Scheduler (Orchestrator)', () => {
         'User cancelled operation',
       );
       expect(mockExecutor.execute).not.toHaveBeenCalled();
+    });
+
+    it('should not cancel queued tools when cancelAllQueuedOnCancel is false and resolveConfirmation returns Cancel', async () => {
+      const nonCascadingScheduler = new Scheduler({
+        context: mockConfig,
+        messageBus: mockMessageBus,
+        getPreferredEditor,
+        schedulerId: 'root',
+        cancelAllQueuedOnCancel: false,
+      });
+
+      vi.mocked(checkPolicy).mockResolvedValue({
+        decision: PolicyDecision.ASK_USER,
+        rule: undefined,
+      });
+
+      vi.mocked(resolveConfirmation)
+        .mockResolvedValueOnce({
+          outcome: ToolConfirmationOutcome.Cancel,
+          lastDetails: undefined,
+        })
+        .mockResolvedValueOnce({
+          outcome: ToolConfirmationOutcome.ProceedOnce,
+          lastDetails: undefined,
+        });
+
+      await nonCascadingScheduler.schedule([req1, req2], signal);
+
+      expect(mockStateManager.updateStatus).toHaveBeenCalledWith(
+        'call-1',
+        CoreToolCallStatus.Cancelled,
+        'User denied execution.',
+      );
+      expect(mockStateManager.setOutcome).toHaveBeenCalledWith(
+        'call-1',
+        ToolConfirmationOutcome.Cancel,
+      );
+      expect(mockStateManager.cancelAllQueued).not.toHaveBeenCalled();
+      expect(mockStateManager.updateStatus).toHaveBeenCalledWith(
+        'call-2',
+        CoreToolCallStatus.Executing,
+      );
+      expect(mockExecutor.execute).toHaveBeenCalledTimes(1);
+
+      nonCascadingScheduler.dispose();
     });
 
     it('should mark as cancelled (not errored) when abort happens during confirmation error', async () => {
@@ -1124,6 +1348,7 @@ describe('Scheduler (Orchestrator)', () => {
               name: 'tool-b',
               args: { key: 'value' },
               originalRequestName: 'test-tool', // Preserves original name
+              originalRequestArgs: req1.args, // Preserves original args
             }),
             tool: mockToolB,
           }),
@@ -1180,6 +1405,53 @@ describe('Scheduler (Orchestrator)', () => {
           }),
         );
       });
+
+      it('should keep the group of the call it replaces', async () => {
+        const agentTool = {
+          name: 'agent-tool',
+          kind: Kind.Agent,
+          build: vi.fn().mockReturnValue({}),
+        } as unknown as AnyDeclarativeTool;
+        const mockToolB = {
+          name: 'tool-b',
+          build: vi.fn().mockReturnValue({}),
+        } as unknown as AnyDeclarativeTool;
+
+        vi.mocked(mockToolRegistry.getTool).mockImplementation((name) =>
+          name === 'tool-b' ? mockToolB : agentTool,
+        );
+
+        mockExecutor.execute.mockImplementation(async ({ call }) => {
+          const { callId, name } = call.request;
+          return {
+            status: 'success',
+            response: { callId, responseParts: [] },
+            request: call.request,
+            // Only the first agent call asks for a tail call.
+            ...(callId === 'call-1' && name === 'agent-tool'
+              ? { tailToolCallRequest: { name: 'tool-b', args: {} } }
+              : {}),
+          } as unknown as SuccessfulToolCall;
+        });
+
+        const agentReq1 = { ...req1, name: 'agent-tool' };
+        const agentReq2 = { ...req2, name: 'agent-tool', args: {} };
+
+        await scheduler.schedule([agentReq1, agentReq2], signal);
+
+        expect(
+          mockStateManager.replaceActiveCallWithTailCall,
+        ).toHaveBeenCalledWith(
+          'call-1',
+          expect.objectContaining({
+            request: expect.objectContaining({
+              callId: 'call-1',
+              name: 'tool-b',
+              groupId: 'call-1',
+            }),
+          }),
+        );
+      });
     });
   });
 
@@ -1227,6 +1499,64 @@ describe('Scheduler (Orchestrator)', () => {
     });
   });
 
+  describe('Fallback Handlers', () => {
+    it('should respond to TOOL_CONFIRMATION_REQUEST with requiresUserConfirmation: true', async () => {
+      const listeners: Record<
+        string,
+        Array<(message: Message) => void | Promise<void>>
+      > = {};
+
+      const mockBus = {
+        subscribe: vi.fn(
+          (
+            type: string,
+            handler: (message: Message) => void | Promise<void>,
+          ) => {
+            listeners[type] = listeners[type] || [];
+            listeners[type].push(handler);
+          },
+        ),
+        publish: vi.fn(async (message: Message) => {
+          const type = message.type as string;
+          if (listeners[type]) {
+            for (const handler of listeners[type]) {
+              await handler(message);
+            }
+          }
+        }),
+      } as unknown as MessageBus;
+
+      const scheduler = new Scheduler({
+        context: mockConfig,
+        messageBus: mockBus,
+        getPreferredEditor,
+        schedulerId: 'fallback-test',
+      });
+
+      const handler = vi.fn();
+      mockBus.subscribe(MessageBusType.TOOL_CONFIRMATION_RESPONSE, handler);
+
+      await mockBus.publish({
+        type: MessageBusType.TOOL_CONFIRMATION_REQUEST,
+        correlationId: 'test-correlation-id',
+        toolCall: { name: 'test-tool' },
+      });
+
+      // Wait for async handler to fire
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          correlationId: 'test-correlation-id',
+          confirmed: false,
+          requiresUserConfirmation: true,
+        }),
+      );
+
+      scheduler.dispose();
+    });
+  });
+
   describe('Cleanup', () => {
     it('should unregister McpProgress listener on dispose()', () => {
       const onSpy = vi.spyOn(coreEvents, 'on');
@@ -1250,6 +1580,40 @@ describe('Scheduler (Orchestrator)', () => {
         CoreEvent.McpProgress,
         expect.any(Function),
       );
+    });
+
+    it('should abort disposeController signal on dispose()', () => {
+      const mockSubscribe =
+        vi.fn<
+          (
+            type: unknown,
+            listener: unknown,
+            options?: { signal?: AbortSignal },
+          ) => void
+        >();
+      const mockBus = {
+        subscribe: mockSubscribe,
+        publish: vi.fn(),
+      } as unknown as MessageBus;
+
+      let capturedSignal: AbortSignal | undefined;
+      mockSubscribe.mockImplementation((type, listener, options) => {
+        capturedSignal = options?.signal;
+      });
+
+      const s = new Scheduler({
+        context: mockConfig,
+        messageBus: mockBus,
+        getPreferredEditor,
+        schedulerId: 'cleanup-test-2',
+      });
+
+      expect(capturedSignal).toBeDefined();
+      expect(capturedSignal?.aborted).toBe(false);
+
+      s.dispose();
+
+      expect(capturedSignal?.aborted).toBe(true);
     });
   });
 });
@@ -1346,10 +1710,14 @@ describe('Scheduler MCP Progress', () => {
     mockConfig = {
       getPolicyEngine: vi.fn().mockReturnValue(mockPolicyEngine),
       getToolRegistry: vi.fn().mockReturnValue(mockToolRegistry),
+      getHookSystem: vi.fn().mockReturnValue(undefined),
       isInteractive: vi.fn().mockReturnValue(true),
       getEnableHooks: vi.fn().mockReturnValue(true),
       setApprovalMode: vi.fn(),
       getApprovalMode: vi.fn().mockReturnValue(ApprovalMode.DEFAULT),
+      getTelemetryLogPromptsEnabled: vi.fn().mockReturnValue(false),
+      getTelemetryTracesEnabled: vi.fn().mockReturnValue(false),
+      getSessionId: vi.fn().mockReturnValue('test-session-id'),
     } as unknown as Mocked<Config>;
 
     (mockConfig as unknown as { config: Config }).config = mockConfig as Config;

@@ -15,10 +15,11 @@ import {
   debugLogger,
   getErrorMessage,
   type GeminiCLIExtension,
+  IntegrityDataStatus,
 } from '@google/gemini-cli-core';
-import * as fs from 'node:fs';
 import { copyExtension, type ExtensionManager } from '../extension-manager.js';
 import { ExtensionStorage } from './storage.js';
+import { removeDirectoryWithRetry } from '../../utils/retry.js';
 
 export interface ExtensionUpdateInfo {
   name: string;
@@ -51,6 +52,26 @@ export async function updateExtension(
       `Extension ${extension.name} cannot be updated, type is unknown.`,
     );
   }
+
+  try {
+    const status = await extensionManager.verifyExtensionIntegrity(
+      extension.name,
+      installMetadata,
+    );
+
+    if (status === IntegrityDataStatus.INVALID) {
+      throw new Error('Extension integrity cannot be verified');
+    }
+  } catch (e) {
+    dispatchExtensionStateUpdate({
+      type: 'SET_STATE',
+      payload: { name: extension.name, state: ExtensionUpdateState.ERROR },
+    });
+    throw new Error(
+      `Extension ${extension.name} cannot be updated. ${getErrorMessage(e)}. To fix this, reinstall the extension.`,
+    );
+  }
+
   if (installMetadata?.type === 'link') {
     dispatchExtensionStateUpdate({
       type: 'SET_STATE',
@@ -124,7 +145,13 @@ export async function updateExtension(
     await copyExtension(tempDir, extension.path);
     throw e;
   } finally {
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
+    try {
+      await removeDirectoryWithRetry(tempDir);
+    } catch (cleanupError) {
+      debugLogger.warn(
+        `Failed to clean up temp directory ${tempDir}: ${getErrorMessage(cleanupError)}`,
+      );
+    }
   }
 }
 
@@ -135,25 +162,26 @@ export async function updateAllUpdatableExtensions(
   dispatch: (action: ExtensionUpdateAction) => void,
   enableExtensionReloading?: boolean,
 ): Promise<ExtensionUpdateInfo[]> {
-  return (
-    await Promise.all(
-      extensions
-        .filter(
-          (extension) =>
-            extensionsState.get(extension.name)?.status ===
-            ExtensionUpdateState.UPDATE_AVAILABLE,
-        )
-        .map((extension) =>
-          updateExtension(
-            extension,
-            extensionManager,
-            extensionsState.get(extension.name)!.status,
-            dispatch,
-            enableExtensionReloading,
-          ),
+  const results = await Promise.all(
+    extensions
+      .filter(
+        (extension) =>
+          extensionsState.get(extension.name)?.status ===
+          ExtensionUpdateState.UPDATE_AVAILABLE,
+      )
+      .map((extension) =>
+        updateExtension(
+          extension,
+          extensionManager,
+          extensionsState.get(extension.name)!.status,
+          dispatch,
+          enableExtensionReloading,
         ),
-    )
-  ).filter((updateInfo) => !!updateInfo);
+      ),
+  );
+  return results.filter(
+    (updateInfo): updateInfo is ExtensionUpdateInfo => !!updateInfo,
+  );
 }
 
 export interface ExtensionUpdateCheckResult {

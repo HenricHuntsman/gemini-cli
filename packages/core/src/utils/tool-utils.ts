@@ -10,17 +10,35 @@ import {
   type AnyToolInvocation,
 } from '../index.js';
 import { SHELL_TOOL_NAMES } from './shell-utils.js';
-import levenshtein from 'fast-levenshtein';
-import { ApprovalMode } from '../policy/types.js';
 import {
-  CoreToolCallStatus,
-  type ToolCallResponseInfo,
-} from '../scheduler/types.js';
-import {
-  ASK_USER_DISPLAY_NAME,
-  WRITE_FILE_DISPLAY_NAME,
-  EDIT_DISPLAY_NAME,
+  UPDATE_TOPIC_TOOL_NAME,
+  EDIT_TOOL_NAMES,
 } from '../tools/tool-names.js';
+import levenshtein from 'fast-levenshtein';
+import type {
+  ToolCallRequestInfo,
+  ToolCallResponseInfo,
+} from '../scheduler/types.js';
+import type { Part } from '@google/genai';
+import { MAX_STORED_TOOL_OUTPUT_BYTES } from './constants.js';
+
+/**
+ * Determines whether a tool call request can be executed in parallel with
+ * other parallelizable tool calls in the same scheduler wave.
+ */
+export function isParallelizable(request: ToolCallRequestInfo): boolean {
+  if (
+    request.name === UPDATE_TOPIC_TOOL_NAME ||
+    EDIT_TOOL_NAMES.has(request.name)
+  ) {
+    return false;
+  }
+  const wait = request.args?.['wait_for_previous'];
+  if (typeof wait === 'boolean') {
+    return !wait;
+  }
+  return true;
+}
 
 /**
  * Validates if an object is a ToolCallResponseInfo.
@@ -34,62 +52,6 @@ export function isToolCallResponseInfo(
     'callId' in data &&
     'responseParts' in data
   );
-}
-
-/**
- * Options for determining if a tool call should be hidden in the CLI history.
- */
-export interface ShouldHideToolCallParams {
-  /** The display name of the tool. */
-  displayName: string;
-  /** The current status of the tool call. */
-  status: CoreToolCallStatus;
-  /** The approval mode active when the tool was called. */
-  approvalMode?: ApprovalMode;
-  /** Whether the tool has produced a result for display. */
-  hasResultDisplay: boolean;
-  /** The ID of the parent tool call, if any. */
-  parentCallId?: string;
-}
-
-/**
- * Determines if a tool call should be hidden from the standard tool history UI.
- *
- * We hide tools in several cases:
- * 1. Tool calls that have a parent, as they are "internal" to another tool (e.g. subagent).
- * 2. Ask User tools that are in progress, displayed via specialized UI.
- * 3. Ask User tools that errored without result display, typically param
- *    validation errors that the agent automatically recovers from.
- * 4. WriteFile and Edit tools when in Plan Mode, redundant because the
- *    resulting plans are displayed separately upon exiting plan mode.
- */
-export function shouldHideToolCall(params: ShouldHideToolCallParams): boolean {
-  const { displayName, status, approvalMode, hasResultDisplay, parentCallId } =
-    params;
-
-  if (parentCallId) {
-    return true;
-  }
-
-  switch (displayName) {
-    case ASK_USER_DISPLAY_NAME:
-      switch (status) {
-        case CoreToolCallStatus.Scheduled:
-        case CoreToolCallStatus.Validating:
-        case CoreToolCallStatus.Executing:
-        case CoreToolCallStatus.AwaitingApproval:
-          return true;
-        case CoreToolCallStatus.Error:
-          return !hasResultDisplay;
-        default:
-          return false;
-      }
-    case WRITE_FILE_DISPLAY_NAME:
-    case EDIT_DISPLAY_NAME:
-      return approvalMode === ApprovalMode.PLAN;
-    default:
-      return false;
-  }
 }
 
 /**
@@ -199,4 +161,144 @@ export function doesToolInvocationMatch(
   }
 
   return false;
+}
+
+const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/**
+ * Truncates large tool execution output to stay within a maximum byte cap using
+ * grapheme-cluster-aware segmentation (Intl.Segmenter). This prevents cutting in
+ * the middle of surrogate pairs or multi-byte Unicode characters / emojis.
+ *
+ * @param text The raw tool output string.
+ * @param maxBytes Maximum allowed bytes (defaults to MAX_STORED_TOOL_OUTPUT_BYTES = 64 KB).
+ * @param savedFilePath Optional file path where the complete raw output was saved.
+ * @returns The output truncated to at most maxBytes.
+ */
+export function truncateToolOutput(
+  text: string,
+  maxBytes: number = MAX_STORED_TOOL_OUTPUT_BYTES,
+  savedFilePath?: string,
+): string {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) {
+    return text;
+  }
+
+  const suffix = savedFilePath
+    ? `\n... [Tool output truncated to conserve memory. For full output see: ${savedFilePath}]`
+    : '\n... [Tool output truncated to conserve memory]';
+  const targetBytes = Math.max(0, maxBytes - Buffer.byteLength(suffix, 'utf8'));
+
+  let accumulatedBytes = 0;
+  let truncatedText = '';
+
+  for (const { segment } of segmenter.segment(text)) {
+    const segmentBytes = Buffer.byteLength(segment, 'utf8');
+    if (accumulatedBytes + segmentBytes > targetBytes) {
+      break;
+    }
+    accumulatedBytes += segmentBytes;
+    truncatedText += segment;
+  }
+
+  return truncatedText + suffix;
+}
+
+/**
+ * Truncates large tool response fields in a Gemini Part to keep stored chat history bounded.
+ */
+export function truncateFunctionResponsePart(
+  part: Part,
+  maxBytes: number = MAX_STORED_TOOL_OUTPUT_BYTES,
+  savedFilePath?: string,
+): Part {
+  if (part.text && Buffer.byteLength(part.text, 'utf8') > maxBytes) {
+    return {
+      ...part,
+      text: truncateToolOutput(part.text, maxBytes, savedFilePath),
+    };
+  }
+
+  if (!part.functionResponse?.response) {
+    return part;
+  }
+
+  const resp: unknown = part.functionResponse.response;
+  if (typeof resp === 'string') {
+    if (Buffer.byteLength(resp, 'utf8') > maxBytes) {
+      return {
+        ...part,
+        functionResponse: {
+          // eslint-disable-next-line @typescript-eslint/no-misused-spread
+          ...part.functionResponse,
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+          response: truncateToolOutput(
+            resp,
+            maxBytes,
+            savedFilePath,
+          ) as unknown as Record<string, unknown>,
+        },
+      };
+    }
+    return part;
+  }
+
+  if (typeof resp === 'object' && resp !== null) {
+    const truncateValue = (val: unknown): unknown => {
+      if (typeof val === 'string') {
+        if (Buffer.byteLength(val, 'utf8') > maxBytes) {
+          return truncateToolOutput(val, maxBytes, savedFilePath);
+        }
+        return val;
+      }
+
+      if (Array.isArray(val)) {
+        let arrayModified = false;
+        const newVal = val.map((item) => {
+          const truncated = truncateValue(item);
+          if (truncated !== item) {
+            arrayModified = true;
+          }
+          return truncated;
+        });
+        return arrayModified ? newVal : val;
+      }
+
+      if (typeof val === 'object' && val !== null) {
+        // Safeguard: do not recursively traverse non-plain objects like Buffer, TypedArray, Date, etc.
+        const proto: unknown = Object.getPrototypeOf(val);
+        if (proto !== Object.prototype && proto !== null) {
+          return val;
+        }
+
+        let objModified = false;
+        const copy: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(val)) {
+          const truncated = truncateValue(v);
+          if (truncated !== v) {
+            objModified = true;
+          }
+          copy[k] = truncated;
+        }
+        return objModified ? copy : val;
+      }
+
+      return val;
+    };
+
+    const newResp = truncateValue(resp);
+    if (newResp !== resp) {
+      return {
+        ...part,
+        functionResponse: {
+          // eslint-disable-next-line @typescript-eslint/no-misused-spread
+          ...part.functionResponse,
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+          response: newResp as Record<string, unknown>,
+        },
+      };
+    }
+  }
+
+  return part;
 }

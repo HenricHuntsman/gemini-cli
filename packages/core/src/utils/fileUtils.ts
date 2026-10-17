@@ -8,12 +8,15 @@ import fs from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import type { PartUnion } from '@google/genai';
+import { isBinaryFile as isBinaryFileCheck } from 'isbinaryfile';
 import mime from 'mime/lite';
 import type { FileSystemService } from '../services/fileSystemService.js';
 import { ToolErrorType } from '../tools/tool-error.js';
 import { BINARY_EXTENSIONS } from './ignorePatterns.js';
 import { createRequire as createModuleRequire } from 'node:module';
 import { debugLogger } from './debugLogger.js';
+import { resolveToRealPath } from './paths.js';
+
 import {
   DEFAULT_MAX_LINES_TEXT_FILE,
   MAX_LINE_LENGTH_TEXT_FILE,
@@ -121,8 +124,12 @@ export function detectBOM(buf: Buffer): BOMInfo | null {
  * (Node has 'utf16le' but not 'utf16be'.)
  */
 function decodeUTF16BE(buf: Buffer): string {
-  if (buf.length === 0) return '';
-  const swapped = Buffer.from(buf); // swap16 mutates in place, so copy
+  // Ignore a partial trailing code unit (swap16 throws on an odd length),
+  // matching how Node's utf16le decoder and decodeUTF32 treat partial units.
+  const usable = buf.length - (buf.length % 2);
+  if (usable === 0) return '';
+  // swap16 mutates in place, so copy
+  const swapped = Buffer.from(buf.subarray(0, usable));
   swapped.swap16();
   return swapped.toString('utf16le');
 }
@@ -158,22 +165,11 @@ function decodeUTF32(buf: Buffer, littleEndian: boolean): string {
 }
 
 /**
- * Read a file as text, honoring BOM encodings (UTF‑8/16/32) and stripping the BOM.
- * Falls back to utf8 when no BOM is present.
+ * Decode a buffer that starts with a detected BOM: skips the BOM and decodes
+ * the remaining bytes according to the BOM's encoding.
  */
-export async function readFileWithEncoding(filePath: string): Promise<string> {
-  // Read the file once; detect BOM and decode from the single buffer.
-  const full = await fs.promises.readFile(filePath);
-  if (full.length === 0) return '';
-
-  const bom = detectBOM(full);
-  if (!bom) {
-    // No BOM → treat as UTF‑8
-    return full.toString('utf8');
-  }
-
-  // Strip BOM and decode per encoding
-  const content = full.subarray(bom.bomLength);
+function decodeBOMContent(buffer: Buffer, bom: BOMInfo): string {
+  const content = buffer.subarray(bom.bomLength);
   switch (bom.encoding) {
     case 'utf8':
       return content.toString('utf8');
@@ -192,6 +188,95 @@ export async function readFileWithEncoding(filePath: string): Promise<string> {
 }
 
 /**
+ * Reads a file as a Buffer while verifying device and inode (dev + ino) before,
+ * during (via fstat on the opened file descriptor), and after reading to ensure
+ * file consistency.
+ */
+export async function readSecureFileBuffer(
+  filePath: string,
+  expectedStats?: fs.Stats,
+): Promise<Buffer> {
+  const initialStats = expectedStats ?? (await fs.promises.stat(filePath));
+  let fileHandle: fs.promises.FileHandle | undefined;
+
+  try {
+    if (typeof fs.promises.open === 'function') {
+      try {
+        fileHandle = await fs.promises.open(filePath, 'r');
+      } catch {
+        // If opening file descriptor failed or is mocked without stat, continue to readFile
+      }
+      if (fileHandle && typeof fileHandle.stat === 'function') {
+        const handleStats = await fileHandle.stat();
+        if (
+          initialStats.dev !== undefined &&
+          initialStats.ino !== undefined &&
+          handleStats &&
+          handleStats.dev !== undefined &&
+          handleStats.ino !== undefined &&
+          (initialStats.dev !== handleStats.dev ||
+            initialStats.ino !== handleStats.ino)
+        ) {
+          throw new Error(
+            `File device or inode changed during read: ${filePath}`,
+          );
+        }
+      }
+    }
+
+    const contentBuffer = fileHandle
+      ? await fileHandle.readFile()
+      : await fs.promises.readFile(filePath);
+
+    // Verify post-read stats to ensure file consistency during or right after reading
+    let postStats: fs.Stats | undefined;
+    try {
+      postStats = await fs.promises.stat(filePath);
+    } catch {
+      // If post-stat failed due to file removal, ignore here
+    }
+    if (
+      postStats &&
+      initialStats.dev !== undefined &&
+      initialStats.ino !== undefined &&
+      postStats.dev !== undefined &&
+      postStats.ino !== undefined &&
+      (initialStats.dev !== postStats.dev || initialStats.ino !== postStats.ino)
+    ) {
+      throw new Error(`File device or inode changed during read: ${filePath}`);
+    }
+
+    return contentBuffer;
+  } finally {
+    if (fileHandle) {
+      await fileHandle.close().catch(() => {});
+    }
+  }
+}
+
+/**
+ * Read a file as text, honoring BOM encodings (UTF‑8/16/32) and stripping the BOM.
+ * Falls back to utf8 when no BOM is present.
+ */
+export async function readFileWithEncoding(
+  filePath: string,
+  expectedStats?: fs.Stats,
+): Promise<string> {
+  // Read the file once securely; detect BOM and decode from the single buffer.
+  const full = await readSecureFileBuffer(filePath, expectedStats);
+  if (full.length === 0) return '';
+
+  const bom = detectBOM(full);
+  if (!bom) {
+    // No BOM → treat as UTF‑8
+    return full.toString('utf8');
+  }
+
+  // Strip BOM and decode per encoding
+  return decodeBOMContent(full, bom);
+}
+
+/**
  * Looks up the specific MIME type for a file path.
  * @param filePath Path to the file.
  * @returns The specific MIME type string (e.g., 'text/python', 'application/javascript') or undefined if not found or ambiguous.
@@ -199,6 +284,87 @@ export async function readFileWithEncoding(filePath: string): Promise<string> {
 export function getSpecificMimeType(filePath: string): string | undefined {
   const lookedUpMime = mime.getType(filePath);
   return typeof lookedUpMime === 'string' ? lookedUpMime : undefined;
+}
+
+const SUPPORTED_AUDIO_MIME_TYPES_BY_EXTENSION = new Map<string, string>([
+  ['.mp3', 'audio/mpeg'],
+  ['.wav', 'audio/wav'],
+  ['.aiff', 'audio/aiff'],
+  ['.aif', 'audio/aiff'],
+  ['.aac', 'audio/aac'],
+  ['.ogg', 'audio/ogg'],
+  ['.flac', 'audio/flac'],
+]);
+
+const AUDIO_MIME_TYPE_NORMALIZATION: Record<string, string> = {
+  'audio/mp3': 'audio/mpeg',
+  'audio/x-mp3': 'audio/mpeg',
+  'audio/wave': 'audio/wav',
+  'audio/x-wav': 'audio/wav',
+  'audio/vnd.wave': 'audio/wav',
+  'audio/x-pn-wav': 'audio/wav',
+  'audio/x-aiff': 'audio/aiff',
+  'audio/aif': 'audio/aiff',
+  'audio/x-aac': 'audio/aac',
+};
+
+function formatSupportedAudioFormats(): string {
+  const displayNames = Array.from(
+    new Set(
+      Array.from(SUPPORTED_AUDIO_MIME_TYPES_BY_EXTENSION.keys()).map((ext) => {
+        if (ext === '.aif' || ext === '.aiff') {
+          return 'AIFF';
+        }
+        return ext.slice(1).toUpperCase();
+      }),
+    ),
+  );
+
+  if (displayNames.length <= 1) {
+    return displayNames[0] ?? '';
+  }
+
+  return `${displayNames.slice(0, -1).join(', ')}, and ${displayNames.at(-1)}`;
+}
+
+const SUPPORTED_AUDIO_FORMATS_DISPLAY = formatSupportedAudioFormats();
+
+function getSupportedAudioMimeTypeForFile(
+  filePath: string,
+): string | undefined {
+  const extension = path.extname(filePath).toLowerCase();
+  const extensionMimeType =
+    SUPPORTED_AUDIO_MIME_TYPES_BY_EXTENSION.get(extension);
+  const lookedUpMimeType = getSpecificMimeType(filePath)?.toLowerCase();
+  const normalizedMimeType = lookedUpMimeType
+    ? (AUDIO_MIME_TYPE_NORMALIZATION[lookedUpMimeType] ?? lookedUpMimeType)
+    : undefined;
+
+  if (
+    normalizedMimeType &&
+    [...SUPPORTED_AUDIO_MIME_TYPES_BY_EXTENSION.values()].includes(
+      normalizedMimeType,
+    )
+  ) {
+    return normalizedMimeType;
+  }
+
+  return extensionMimeType;
+}
+
+export function canonicalizeMacosPath(p: string): string {
+  if (process.platform === 'darwin') {
+    if (p === '/var' || p.startsWith('/var/')) {
+      return '/private' + p;
+    }
+    if (p === '/tmp' || p.startsWith('/tmp/')) {
+      return '/private' + p;
+    }
+    if (p === '/etc' || p.startsWith('/etc/')) {
+      return '/private' + p;
+    }
+  }
+  return p;
 }
 
 /**
@@ -211,8 +377,12 @@ export function isWithinRoot(
   pathToCheck: string,
   rootDirectory: string,
 ): boolean {
-  const normalizedPathToCheck = path.resolve(pathToCheck);
-  const normalizedRootDirectory = path.resolve(rootDirectory);
+  const normalizedPathToCheck = canonicalizeMacosPath(
+    path.resolve(pathToCheck),
+  );
+  const normalizedRootDirectory = canonicalizeMacosPath(
+    path.resolve(rootDirectory),
+  );
 
   // Ensure the rootDirectory path ends with a separator for correct startsWith comparison,
   // unless it's the root path itself (e.g., '/' or 'C:\').
@@ -222,10 +392,33 @@ export function isWithinRoot(
       ? normalizedRootDirectory
       : normalizedRootDirectory + path.sep;
 
-  return (
+  if (
     normalizedPathToCheck === normalizedRootDirectory ||
     normalizedPathToCheck.startsWith(rootWithSeparator)
-  );
+  ) {
+    return true;
+  }
+
+  // Cross-platform check for macOS /private symlink aliases
+  if (process.platform === 'darwin') {
+    try {
+      const realPathToCheck = resolveToRealPath(normalizedPathToCheck);
+      const realRootDirectory = resolveToRealPath(normalizedRootDirectory);
+      const realRootWithSeparator =
+        realRootDirectory === path.sep || realRootDirectory.endsWith(path.sep)
+          ? realRootDirectory
+          : realRootDirectory + path.sep;
+
+      return (
+        realPathToCheck === realRootDirectory ||
+        realPathToCheck.startsWith(realRootWithSeparator)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -264,7 +457,7 @@ export async function isEmpty(filePath: string): Promise<boolean> {
 
       const bom = detectBOM(buffer);
       const content = bom
-        ? buffer.subarray(bom.bomLength).toString('utf8')
+        ? decodeBOMContent(buffer, bom)
         : buffer.toString('utf8');
 
       return content.trim().length === 0;
@@ -279,53 +472,19 @@ export async function isEmpty(filePath: string): Promise<boolean> {
 
 /**
  * Heuristic: determine if a file is likely binary.
- * Now BOM-aware: if a Unicode BOM is detected, we treat it as text.
- * For non-BOM files, retain the existing null-byte and non-printable ratio checks.
+ * Delegates to the `isbinaryfile` package for UTF-8-aware detection.
  */
 export async function isBinaryFile(filePath: string): Promise<boolean> {
-  let fh: fs.promises.FileHandle | null = null;
   try {
-    fh = await fs.promises.open(filePath, 'r');
-    const stats = await fh.stat();
-    const fileSize = stats.size;
-    if (fileSize === 0) return false; // empty is not binary
-
-    // Sample up to 4KB from the head (previous behavior)
-    const sampleSize = Math.min(4096, fileSize);
-    const buf = Buffer.alloc(sampleSize);
-    const { bytesRead } = await fh.read(buf, 0, sampleSize, 0);
-    if (bytesRead === 0) return false;
-
-    // BOM → text (avoid false positives for UTF‑16/32 with nulls)
-    const bom = detectBOM(buf.subarray(0, Math.min(4, bytesRead)));
-    if (bom) return false;
-
-    let nonPrintableCount = 0;
-    for (let i = 0; i < bytesRead; i++) {
-      if (buf[i] === 0) return true; // strong indicator of binary when no BOM
-      if (buf[i] < 9 || (buf[i] > 13 && buf[i] < 32)) {
-        nonPrintableCount++;
-      }
-    }
-    // If >30% non-printable characters, consider it binary
-    return nonPrintableCount / bytesRead > 0.3;
+    const stats = await fsPromises.stat(filePath);
+    if (!stats.isFile()) return false;
+    return await isBinaryFileCheck(filePath, stats.size);
   } catch (error) {
     debugLogger.warn(
       `Failed to check if file is binary: ${filePath}`,
       error instanceof Error ? error.message : String(error),
     );
     return false;
-  } finally {
-    if (fh) {
-      try {
-        await fh.close();
-      } catch (closeError) {
-        debugLogger.warn(
-          `Failed to close file handle for: ${filePath}`,
-          closeError instanceof Error ? closeError.message : String(closeError),
-        );
-      }
-    }
   }
 }
 
@@ -368,6 +527,14 @@ export async function detectFileType(
     if (lookedUpMimeType === 'application/pdf') {
       return 'pdf';
     }
+  }
+
+  const supportedAudioMimeType = getSupportedAudioMimeTypeForFile(filePath);
+  if (supportedAudioMimeType) {
+    if (!(await isBinaryFile(filePath))) {
+      return 'text';
+    }
+    return 'audio';
   }
 
   // Stricter binary check for common non-text extensions before content check
@@ -463,7 +630,7 @@ export async function processSingleFileContent(
             returnDisplay: `Skipped large SVG file (>1MB): ${relativePathForDisplay}`,
           };
         }
-        const content = await readFileWithEncoding(filePath);
+        const content = await readFileWithEncoding(filePath, stats);
         return {
           llmContent: content,
           returnDisplay: `Read SVG as text: ${relativePathForDisplay}`,
@@ -471,7 +638,7 @@ export async function processSingleFileContent(
       }
       case 'text': {
         // Use BOM-aware reader to avoid leaving a BOM character in content and to support UTF-16/32 transparently
-        const content = await readFileWithEncoding(filePath);
+        const content = await readFileWithEncoding(filePath, stats);
         const lines = content.split(/\r?\n/);
         const originalLineCount = lines.length;
 
@@ -532,17 +699,40 @@ export async function processSingleFileContent(
           linesShown: [actualStart + 1, sliceEnd],
         };
       }
-      case 'image':
-      case 'pdf':
-      case 'audio':
-      case 'video': {
-        const contentBuffer = await fs.promises.readFile(filePath);
+      case 'audio': {
+        const mimeType = getSupportedAudioMimeTypeForFile(filePath);
+        if (!mimeType) {
+          return {
+            llmContent: `Could not read audio file because its format is not supported. Supported audio formats are ${SUPPORTED_AUDIO_FORMATS_DISPLAY}.`,
+            returnDisplay: `Unsupported audio file format: ${relativePathForDisplay}`,
+            error: `Unsupported audio file format for ${filePath}. Supported audio formats are ${SUPPORTED_AUDIO_FORMATS_DISPLAY}.`,
+            errorType: ToolErrorType.READ_CONTENT_FAILURE,
+          };
+        }
+        const contentBuffer = await readSecureFileBuffer(filePath, stats);
         const base64Data = contentBuffer.toString('base64');
         return {
           llmContent: {
             inlineData: {
               data: base64Data,
-              mimeType: mime.getType(filePath) || 'application/octet-stream',
+              mimeType,
+            },
+          },
+          returnDisplay: `Read audio file: ${relativePathForDisplay}`,
+        };
+      }
+      case 'image':
+      case 'pdf':
+      case 'video': {
+        const mimeType =
+          getSpecificMimeType(filePath) ?? 'application/octet-stream';
+        const contentBuffer = await readSecureFileBuffer(filePath, stats);
+        const base64Data = contentBuffer.toString('base64');
+        return {
+          llmContent: {
+            inlineData: {
+              data: base64Data,
+              mimeType,
             },
           },
           returnDisplay: `Read ${fileType} file: ${relativePathForDisplay}`,
@@ -576,7 +766,7 @@ export async function fileExists(filePath: string): Promise<boolean> {
   try {
     await fsPromises.access(filePath, fs.constants.F_OK);
     return true;
-  } catch (_: unknown) {
+  } catch {
     return false;
   }
 }
@@ -598,7 +788,7 @@ export function formatTruncatedToolOutput(
   outputFile: string,
   maxChars: number,
 ): string {
-  if (contentStr.length <= maxChars) return contentStr;
+  if (maxChars <= 0 || contentStr.length <= maxChars) return contentStr;
 
   const headChars = Math.floor(maxChars * 0.2);
   const tailChars = maxChars - headChars;

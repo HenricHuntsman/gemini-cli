@@ -6,14 +6,22 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import ignore from 'ignore';
+import ignorePkg, { type Ignore } from 'ignore';
+// eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+const ignore = ((ignorePkg as unknown as { default?: () => Ignore }).default ??
+  ignorePkg) as () => Ignore;
 import { debugLogger } from './debugLogger.js';
+import {
+  getNormalizedRelativePath,
+  expandWildcardDirectoryPatterns,
+} from './ignorePathUtils.js';
 
 export interface IgnoreFileFilter {
-  isIgnored(filePath: string): boolean;
+  isIgnored(filePath: string, isDirectory: boolean): boolean;
   getPatterns(): string[];
   getIgnoreFilePaths(): string[];
   hasPatterns(): boolean;
+  clearCache?(): void;
 }
 
 /**
@@ -37,7 +45,7 @@ export class IgnoreFileParser implements IgnoreFileFilter {
       this.fileNames = [];
       const patterns = Array.isArray(input) ? input : [input];
       this.patterns.push(...patterns);
-      this.ig.add(patterns);
+      this.ig.add(expandWildcardDirectoryPatterns(patterns));
     } else {
       this.fileNames = Array.isArray(input) ? input : [input];
       this.loadPatternsFromFiles();
@@ -50,8 +58,8 @@ export class IgnoreFileParser implements IgnoreFileFilter {
     for (const fileName of [...this.fileNames].reverse()) {
       const patterns = this.parseIgnoreFile(fileName);
       this.patterns.push(...patterns);
-      this.ig.add(patterns);
     }
+    this.ig.add(expandWildcardDirectoryPatterns(this.patterns));
   }
 
   private parseIgnoreFile(fileName: string): string[] {
@@ -59,7 +67,7 @@ export class IgnoreFileParser implements IgnoreFileFilter {
     let content: string;
     try {
       content = fs.readFileSync(patternsFilePath, 'utf-8');
-    } catch (_error) {
+    } catch {
       debugLogger.debug(
         `Ignore file not found: ${patternsFilePath}, continue without it.`,
       );
@@ -69,39 +77,26 @@ export class IgnoreFileParser implements IgnoreFileFilter {
     debugLogger.debug(`Loading ignore patterns from: ${patternsFilePath}`);
 
     return (content ?? '')
-      .split('\n')
+      .split(/\r\n|\n|\r/)
       .map((p) => p.trim())
       .filter((p) => p !== '' && !p.startsWith('#'));
   }
 
-  isIgnored(filePath: string): boolean {
+  isIgnored(filePath: string, isDirectory: boolean): boolean {
     if (this.patterns.length === 0) {
       return false;
     }
 
-    if (!filePath || typeof filePath !== 'string') {
-      return false;
-    }
-
+    const normalizedPath = getNormalizedRelativePath(
+      this.projectRoot,
+      filePath,
+      isDirectory,
+    );
     if (
-      filePath.startsWith('\\') ||
-      filePath === '/' ||
-      filePath.includes('\0')
+      normalizedPath === null ||
+      normalizedPath === '' ||
+      normalizedPath === '/'
     ) {
-      return false;
-    }
-
-    const resolved = path.resolve(this.projectRoot, filePath);
-    const relativePath = path.relative(this.projectRoot, resolved);
-
-    if (relativePath === '' || relativePath.startsWith('..')) {
-      return false;
-    }
-
-    // Even in windows, Ignore expects forward slashes.
-    const normalizedPath = relativePath.replace(/\\/g, '/');
-
-    if (normalizedPath.startsWith('/') || normalizedPath === '') {
       return false;
     }
 
@@ -117,7 +112,10 @@ export class IgnoreFileParser implements IgnoreFileFilter {
       .slice()
       .reverse()
       .map((fileName) => path.join(this.projectRoot, fileName))
-      .filter((filePath) => fs.existsSync(filePath));
+      .filter(
+        (filePath) =>
+          fs.statSync(filePath, { throwIfNoEntry: false })?.isFile() ?? false,
+      );
   }
 
   /**

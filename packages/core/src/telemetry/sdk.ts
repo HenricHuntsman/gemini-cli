@@ -19,6 +19,7 @@ import { OTLPTraceExporter as OTLPTraceExporterHttp } from '@opentelemetry/expor
 import { OTLPLogExporter as OTLPLogExporterHttp } from '@opentelemetry/exporter-logs-otlp-http';
 import { OTLPMetricExporter as OTLPMetricExporterHttp } from '@opentelemetry/exporter-metrics-otlp-http';
 import { CompressionAlgorithm } from '@opentelemetry/otlp-exporter-base';
+import { Metadata } from '@grpc/grpc-js';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
 import { resourceFromAttributes } from '@opentelemetry/resources';
@@ -52,6 +53,11 @@ import {
 } from './gcp-exporters.js';
 import { TelemetryTarget } from './index.js';
 import { debugLogger } from '../utils/debugLogger.js';
+import {
+  startGlobalMemoryMonitoring,
+  getMemoryMonitor,
+} from './memory-monitor.js';
+import { startGlobalEventLoopMonitoring } from './event-loop-monitor.js';
 import { authEvents } from '../code_assist/oauth2.js';
 import { coreEvents, CoreEvent } from '../utils/events.js';
 import {
@@ -91,6 +97,7 @@ diag.setLogger(new DiagLoggerAdapter(), DiagLogLevel.INFO);
 let sdk: NodeSDK | undefined;
 let spanProcessor: BatchSpanProcessor | undefined;
 let logRecordProcessor: BatchLogRecordProcessor | undefined;
+let metricReader: PeriodicExportingMetricReader | undefined;
 let telemetryInitialized = false;
 let callbackRegistered = false;
 let authListener: ((newCredentials: JWTInput) => Promise<void>) | undefined =
@@ -258,7 +265,6 @@ export async function initializeTelemetry(
     | GcpLogExporter
     | FileLogExporter
     | ConsoleLogRecordExporter;
-  let metricReader: PeriodicExportingMetricReader;
 
   if (useDirectGcpExport) {
     debugLogger.log(
@@ -274,6 +280,9 @@ export async function initializeTelemetry(
       exportIntervalMillis: 30000,
     });
   } else if (useOtlp) {
+    const otlpHeaders = config.getTelemetryOtlpHeaders?.() ?? {};
+    const hasHeaders = Object.keys(otlpHeaders).length > 0;
+
     if (otlpProtocol === 'http') {
       const buildUrl = (path: string) => {
         const url = new URL(parsedEndpoint);
@@ -283,30 +292,55 @@ export async function initializeTelemetry(
       };
       spanExporter = new OTLPTraceExporterHttp({
         url: buildUrl('v1/traces'),
+        headers: hasHeaders ? otlpHeaders : undefined,
       });
       logExporter = new OTLPLogExporterHttp({
         url: buildUrl('v1/logs'),
+        headers: hasHeaders ? otlpHeaders : undefined,
       });
       metricReader = new PeriodicExportingMetricReader({
         exporter: new OTLPMetricExporterHttp({
           url: buildUrl('v1/metrics'),
+          headers: hasHeaders ? otlpHeaders : undefined,
         }),
         exportIntervalMillis: 10000,
       });
     } else {
       // grpc
+      let metadata: Metadata | undefined;
+      if (hasHeaders) {
+        const candidateMetadata = new Metadata();
+        let validCount = 0;
+        for (const [key, value] of Object.entries(otlpHeaders)) {
+          try {
+            candidateMetadata.set(key, value);
+            validCount++;
+          } catch (error) {
+            debugLogger.warn(
+              `[Telemetry] Skipping invalid gRPC metadata key "${key}":`,
+              error,
+            );
+          }
+        }
+        if (validCount > 0) {
+          metadata = candidateMetadata;
+        }
+      }
       spanExporter = new OTLPTraceExporter({
         url: parsedEndpoint,
         compression: CompressionAlgorithm.GZIP,
+        ...(metadata && { metadata }),
       });
       logExporter = new OTLPLogExporter({
         url: parsedEndpoint,
         compression: CompressionAlgorithm.GZIP,
+        ...(metadata && { metadata }),
       });
       metricReader = new PeriodicExportingMetricReader({
         exporter: new OTLPMetricExporter({
           url: parsedEndpoint,
           compression: CompressionAlgorithm.GZIP,
+          ...(metadata && { metadata }),
         }),
         exportIntervalMillis: 10000,
       });
@@ -344,9 +378,29 @@ export async function initializeTelemetry(
     if (config.getDebugMode()) {
       debugLogger.log('OpenTelemetry SDK started successfully.');
     }
-    telemetryInitialized = true;
     activeTelemetryEmail = credentials?.client_email;
     initializeMetrics(config);
+
+    // Start memory monitoring if interval is specified via environment variable
+    const monitorInterval = process.env['GEMINI_MEMORY_MONITOR_INTERVAL'];
+    debugLogger.log(
+      `[TELEMETRY] GEMINI_MEMORY_MONITOR_INTERVAL: ${monitorInterval}`,
+    );
+    if (monitorInterval) {
+      const intervalMs = parseInt(monitorInterval, 10);
+      if (!isNaN(intervalMs) && intervalMs > 0) {
+        startGlobalMemoryMonitoring(config, intervalMs);
+        startGlobalEventLoopMonitoring(config, intervalMs);
+        // Disable enhanced monitoring (rate limiting/high water mark) in tests
+        // to ensure we get regular snapshots regardless of growth.
+        const monitor = getMemoryMonitor();
+        if (monitor) {
+          monitor.setEnhancedMonitoring(false);
+        }
+      }
+    }
+
+    telemetryInitialized = true;
     void flushTelemetryBuffer();
   } catch (error) {
     debugLogger.error('Error starting OpenTelemetry SDK:', error);
@@ -378,6 +432,7 @@ export async function flushTelemetry(config: Config): Promise<void> {
     await Promise.all([
       spanProcessor.forceFlush(),
       logRecordProcessor.forceFlush(),
+      metricReader ? metricReader.forceFlush() : Promise.resolve(),
     ]);
     if (config.getDebugMode()) {
       debugLogger.log('OpenTelemetry SDK flushed successfully.');
