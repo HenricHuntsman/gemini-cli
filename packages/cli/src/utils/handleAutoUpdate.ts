@@ -11,7 +11,15 @@ import { updateEventEmitter } from './updateEventEmitter.js';
 import { MessageType, type HistoryItem } from '../ui/types.js';
 import { spawnWrapper } from './spawnWrapper.js';
 import type { spawn } from 'node:child_process';
-import { debugLogger } from '@google/gemini-cli-core';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import semver from 'semver';
+import {
+  debugLogger,
+  getChannelFromVersion,
+  getPackageJson,
+  RELEASE_CHANNEL_STABILITY,
+} from '@google/gemini-cli-core';
 
 let _updateInProgress = false;
 
@@ -64,13 +72,37 @@ export function handleAutoUpdate(
   info: UpdateObject | null,
   settings: LoadedSettings,
   projectRoot: string,
+  isSandboxEnabled: boolean,
   spawnFn: typeof spawn = spawnWrapper,
+  getPackageJsonFn: (
+    cwd: string,
+  ) => Promise<
+    { name?: string; version?: string } | undefined
+  > = getPackageJson,
 ) {
   if (!info) {
     return;
   }
 
-  if (settings.merged.tools.sandbox || process.env['GEMINI_SANDBOX']) {
+  const rawCliPath = process.argv[1];
+  let resolvedCliPath: string | undefined;
+  if (rawCliPath) {
+    try {
+      resolvedCliPath = fs.realpathSync(rawCliPath);
+    } catch {
+      resolvedCliPath = path.resolve(rawCliPath);
+    }
+  }
+
+  const latestVersion = info.update?.latest ?? '';
+  if (!latestVersion || !semver.valid(latestVersion)) {
+    debugLogger.warn(
+      'Update check: latest version is missing or invalid. Skipping automatic update for safety.',
+    );
+    return;
+  }
+
+  if (isSandboxEnabled) {
     updateEventEmitter.emit('update-info', {
       message: `${info.message}\nAutomatic update is not available in sandbox mode.`,
     });
@@ -87,9 +119,12 @@ export function handleAutoUpdate(
   );
 
   if (
-    [PackageManager.NPX, PackageManager.PNPX, PackageManager.BUNX].includes(
-      installationInfo.packageManager,
-    )
+    [
+      PackageManager.NPX,
+      PackageManager.PNPX,
+      PackageManager.BUNX,
+      PackageManager.BINARY,
+    ].includes(installationInfo.packageManager)
   ) {
     return;
   }
@@ -99,18 +134,42 @@ export function handleAutoUpdate(
     combinedMessage += `\n${installationInfo.updateMessage}`;
   }
 
-  updateEventEmitter.emit('update-received', {
-    message: combinedMessage,
-  });
-
   if (
     !installationInfo.updateCommand ||
     !settings.merged.general.enableAutoUpdate
   ) {
+    updateEventEmitter.emit('update-received', {
+      ...info,
+      message: combinedMessage,
+      isUpdating: false,
+    });
+    return;
+  }
+  updateEventEmitter.emit('update-received', {
+    ...info,
+    message: combinedMessage,
+    isUpdating: true,
+  });
+  if (_updateInProgress) {
     return;
   }
 
-  if (_updateInProgress) {
+  const currentVersion = info.update.current;
+  if (!currentVersion) {
+    debugLogger.warn(
+      'Update check: current version is missing. Skipping automatic update for safety.',
+    );
+    return;
+  }
+
+  const currentChannel = getChannelFromVersion(currentVersion);
+  const targetChannel = getChannelFromVersion(info.update.latest);
+
+  // Defense-in-depth: prevent updates to a less stable channel
+  if (
+    RELEASE_CHANNEL_STABILITY[targetChannel] <
+    RELEASE_CHANNEL_STABILITY[currentChannel]
+  ) {
     return;
   }
 
@@ -131,16 +190,43 @@ export function handleAutoUpdate(
   // Un-reference the child process to allow the parent to exit independently.
   updateProcess.unref();
 
-  updateProcess.on('close', (code) => {
+  updateProcess.on('close', async (code) => {
     _updateInProgress = false;
     if (code === 0) {
+      let isVerified = true;
+      try {
+        if (resolvedCliPath && info.update.latest) {
+          const checkDir = path.dirname(resolvedCliPath);
+          const updatedPkg = await getPackageJsonFn(checkDir);
+          if (
+            updatedPkg?.version &&
+            info.update.name &&
+            updatedPkg.name === info.update.name &&
+            semver.valid(updatedPkg.version) &&
+            semver.valid(info.update.latest) &&
+            semver.lt(updatedPkg.version, info.update.latest)
+          ) {
+            isVerified = false;
+          }
+        }
+      } catch (err) {
+        debugLogger.log('Failed to verify binary update version:', err);
+      }
+
+      if (!isVerified) {
+        updateEventEmitter.emit('update-failed', {
+          message: `Automatic update completed, but the active binary (${resolvedCliPath ?? process.argv[1] ?? 'unknown path'}) was not updated. It may be shadowed by another installation in your PATH. Please try updating manually:\n\n${updateCommand}`,
+        });
+        return;
+      }
+
       updateEventEmitter.emit('update-success', {
         message:
           'Update successful! The new version will be used on your next run.',
       });
     } else {
       updateEventEmitter.emit('update-failed', {
-        message: `Automatic update failed. Please try updating manually. (command: ${updateCommand})`,
+        message: `Automatic update failed. Please try updating manually:\n\n${updateCommand}`,
       });
     }
   });
@@ -148,7 +234,7 @@ export function handleAutoUpdate(
   updateProcess.on('error', (err) => {
     _updateInProgress = false;
     updateEventEmitter.emit('update-failed', {
-      message: `Automatic update failed. Please try updating manually. (error: ${err.message})`,
+      message: `Automatic update failed. Please try updating manually. (error: ${err.message})\n\n${updateCommand}`,
     });
   });
   return updateProcess;
@@ -176,12 +262,14 @@ export function setUpdateHandler(
     }, 60000);
   };
 
-  const handleUpdateFailed = () => {
+  const handleUpdateFailed = (data?: { message: string }) => {
     setUpdateInfo(null);
     addItem(
       {
         type: MessageType.ERROR,
-        text: `Automatic update failed. Please try updating manually`,
+        text:
+          data?.message ||
+          `Automatic update failed. Please try updating manually`,
       },
       Date.now(),
     );

@@ -7,14 +7,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   coreEvents,
-  type Config,
-  type ResumedSessionData,
   convertSessionToClientHistory,
 } from '@google/gemini-cli-core';
-import type { Part } from '@google/genai';
+import type {
+  HistoryTurn,
+  Config,
+  ResumedSessionData,
+} from '@google/gemini-cli-core';
 import type { HistoryItemWithoutId } from '../types.js';
 import type { UseHistoryManagerReturn } from './useHistoryManager.js';
 import { convertSessionToHistoryFormats } from './useSessionBrowser.js';
+import type { Part } from '@google/genai';
 
 interface UseSessionResumeParams {
   config: Config;
@@ -54,7 +57,9 @@ export function useSessionResume({
   const loadHistoryForResume = useCallback(
     async (
       uiHistory: HistoryItemWithoutId[],
-      clientHistory: Array<{ role: 'user' | 'model'; parts: Part[] }>,
+      clientHistory: Array<
+        { role: 'user' | 'model'; parts: Part[] } | HistoryTurn
+      >,
       resumedData: ResumedSessionData,
     ) => {
       // Wait for the client.
@@ -64,7 +69,14 @@ export function useSessionResume({
 
       setIsResuming(true);
       try {
-        // Now that we have the client, load the history into the UI and the client.
+        // Give the history to the Gemini client first.
+        const client = config.getGeminiClient();
+        if (!client) {
+          throw new Error('Gemini client is not initialized');
+        }
+        await client.resumeChat(clientHistory, resumedData);
+
+        // Now that we have successfully resumed, load the history into the UI.
         setQuittingMessages(null);
         historyManagerRef.current.clearItems();
         uiHistory.forEach((item, index) => {
@@ -82,9 +94,6 @@ export function useSessionResume({
           // but filter out ones that no longer exist
           workspaceContext.addDirectories(resumedData.conversation.directories);
         }
-
-        // Give the history to the Gemini client.
-        await config.getGeminiClient()?.resumeChat(clientHistory, resumedData);
       } catch (error) {
         coreEvents.emitFeedback(
           'error',

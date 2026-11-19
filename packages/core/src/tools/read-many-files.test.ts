@@ -14,10 +14,14 @@ import {
   type Mock,
 } from 'vitest';
 import { mockControl } from '../__mocks__/fs/promises.js';
-import { ReadManyFilesTool } from './read-many-files.js';
+import {
+  ReadManyFilesTool,
+  isAssetExplicitlyRequested,
+} from './read-many-files.js';
+import { LRUCache } from 'mnemonist';
 import { FileDiscoveryService } from '../services/fileDiscoveryService.js';
 import path from 'node:path';
-import { isSubpath } from '../utils/paths.js';
+import { isSubpath, resolveToRealPath } from '../utils/paths.js';
 import fs from 'node:fs'; // Actual fs for setup
 import os from 'node:os';
 import type { Config } from '../config/config.js';
@@ -31,6 +35,7 @@ import {
 import * as glob from 'glob';
 import { createMockMessageBus } from '../test-utils/mock-message-bus.js';
 import { GEMINI_IGNORE_FILE_NAME } from '../config/constants.js';
+import type { ReadManyFilesResult } from './tools.js';
 
 vi.mock('glob', { spy: true });
 
@@ -82,10 +87,10 @@ describe('ReadManyFilesTool', () => {
   let mockReadFileFn: Mock;
 
   beforeEach(async () => {
-    tempRootDir = fs.realpathSync(
+    tempRootDir = resolveToRealPath(
       fs.mkdtempSync(path.join(os.tmpdir(), 'read-many-files-root-')),
     );
-    tempDirOutsideRoot = fs.realpathSync(
+    tempDirOutsideRoot = resolveToRealPath(
       fs.mkdtempSync(path.join(os.tmpdir(), 'read-many-files-external-')),
     );
     fs.writeFileSync(path.join(tempRootDir, GEMINI_IGNORE_FILE_NAME), 'foo.*');
@@ -271,13 +276,15 @@ describe('ReadManyFilesTool', () => {
       createFile('file1.txt', 'Content of file1');
       const params = { include: ['file1.txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const expectedPath = path.join(tempRootDir, 'file1.txt');
       expect(result.llmContent).toEqual([
         `--- ${expectedPath} ---\n\nContent of file1\n\n`,
         `\n--- End of content ---`,
       ]);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **1 file(s)**',
       );
     });
@@ -287,7 +294,9 @@ describe('ReadManyFilesTool', () => {
       createFile('subdir/file2.js', 'Content2');
       const params = { include: ['file1.txt', 'subdir/file2.js'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
       const expectedPath1 = path.join(tempRootDir, 'file1.txt');
       const expectedPath2 = path.join(tempRootDir, 'subdir/file2.js');
@@ -301,7 +310,7 @@ describe('ReadManyFilesTool', () => {
           c.includes(`--- ${expectedPath2} ---\n\nContent2\n\n`),
         ),
       ).toBe(true);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **2 file(s)**',
       );
     });
@@ -312,7 +321,9 @@ describe('ReadManyFilesTool', () => {
       createFile('sub/data.json', '{}');
       const params = { include: ['*.txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
       const expectedPath1 = path.join(tempRootDir, 'file.txt');
       const expectedPath2 = path.join(tempRootDir, 'another.txt');
@@ -327,7 +338,7 @@ describe('ReadManyFilesTool', () => {
         ),
       ).toBe(true);
       expect(content.find((c) => c.includes('sub/data.json'))).toBeUndefined();
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **2 file(s)**',
       );
     });
@@ -337,7 +348,9 @@ describe('ReadManyFilesTool', () => {
       createFile('src/main.test.ts', 'Test content');
       const params = { include: ['src/**/*.ts'], exclude: ['**/*.test.ts'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
       const expectedPath = path.join(tempRootDir, 'src/main.ts');
       expect(content).toEqual([
@@ -347,7 +360,7 @@ describe('ReadManyFilesTool', () => {
       expect(
         content.find((c) => c.includes('src/main.test.ts')),
       ).toBeUndefined();
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **1 file(s)**',
       );
     });
@@ -355,11 +368,13 @@ describe('ReadManyFilesTool', () => {
     it('should handle nonexistent specific files gracefully', async () => {
       const params = { include: ['nonexistent-file.txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       expect(result.llmContent).toEqual([
         'No files matching the criteria were found or all were skipped.',
       ]);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'No files were read and concatenated based on the criteria.',
       );
     });
@@ -369,7 +384,9 @@ describe('ReadManyFilesTool', () => {
       createFile('src/app.js', 'app code');
       const params = { include: ['**/*.js'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
       const expectedPath = path.join(tempRootDir, 'src/app.js');
       expect(content).toEqual([
@@ -379,22 +396,21 @@ describe('ReadManyFilesTool', () => {
       expect(
         content.find((c) => c.includes('node_modules/some-lib/index.js')),
       ).toBeUndefined();
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **1 file(s)**',
       );
     });
 
     it('should NOT use default excludes if useDefaultExcludes is false', async () => {
-      createFile('node_modules/some-lib/index.js', 'lib code');
+      createFile('dist/some-lib/index.js', 'lib code');
       createFile('src/app.js', 'app code');
       const params = { include: ['**/*.js'], useDefaultExcludes: false };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
-      const expectedPath1 = path.join(
-        tempRootDir,
-        'node_modules/some-lib/index.js',
-      );
+      const expectedPath1 = path.join(tempRootDir, 'dist/some-lib/index.js');
       const expectedPath2 = path.join(tempRootDir, 'src/app.js');
       expect(
         content.some((c) =>
@@ -406,7 +422,7 @@ describe('ReadManyFilesTool', () => {
           c.includes(`--- ${expectedPath2} ---\n\napp code\n\n`),
         ),
       ).toBe(true);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **2 file(s)**',
       );
     });
@@ -418,7 +434,9 @@ describe('ReadManyFilesTool', () => {
       );
       const params = { include: ['*.png'] }; // Explicitly requesting .png
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       expect(result.llmContent).toEqual([
         {
           inlineData: {
@@ -430,7 +448,7 @@ describe('ReadManyFilesTool', () => {
         },
         '\n--- End of content ---',
       ]);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **1 file(s)**',
       );
     });
@@ -442,7 +460,9 @@ describe('ReadManyFilesTool', () => {
       );
       const params = { include: ['myExactImage.png'] }; // Explicitly requesting by full name
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       expect(result.llmContent).toEqual([
         {
           inlineData: {
@@ -461,7 +481,9 @@ describe('ReadManyFilesTool', () => {
       createFile('notes.txt', 'text notes');
       const params = { include: ['*'] }; // Generic glob, not specific to .pdf
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
       const expectedPath = path.join(tempRootDir, 'notes.txt');
       expect(
@@ -471,8 +493,10 @@ describe('ReadManyFilesTool', () => {
             c.includes(`--- ${expectedPath} ---\n\ntext notes\n\n`),
         ),
       ).toBe(true);
-      expect(result.returnDisplay).toContain('**Skipped 1 item(s):**');
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
+        '**Skipped 1 item(s):**',
+      );
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         '- `document.pdf` (Reason: asset file (image/pdf/audio) was not explicitly requested by name or extension)',
       );
     });
@@ -481,7 +505,9 @@ describe('ReadManyFilesTool', () => {
       createBinaryFile('important.pdf', Buffer.from('%PDF-1.4...'));
       const params = { include: ['*.pdf'] }; // Explicitly requesting .pdf files
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       expect(result.llmContent).toEqual([
         {
           inlineData: {
@@ -497,7 +523,9 @@ describe('ReadManyFilesTool', () => {
       createBinaryFile('report-final.pdf', Buffer.from('%PDF-1.4...'));
       const params = { include: ['report-final.pdf'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       expect(result.llmContent).toEqual([
         {
           inlineData: {
@@ -509,23 +537,104 @@ describe('ReadManyFilesTool', () => {
       ]);
     });
 
+    it('should skip binary asset if matched only by directory substring overlap (issue #29045)', async () => {
+      createBinaryFile(
+        'reports/report.png',
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+      createFile('reports/summary.txt', 'report summary');
+      const params = { include: ['reports/**'], useDefaultExcludes: false };
+      const invocation = tool.build(params);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+
+      // reports/report.png should NOT be treated as explicitly requested just because directory name contains "report"
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
+        '- `reports/report.png` (Reason: asset file (image/pdf/audio) was not explicitly requested by name or extension)',
+      );
+      const inlinedParts = Array.isArray(result.llmContent)
+        ? result.llmContent.filter(
+            (c) => typeof c !== 'string' && 'inlineData' in c,
+          )
+        : [];
+      expect(inlinedParts).toHaveLength(0);
+    });
+
+    it('should not inline unrequested images in another glob when an image is explicitly requested elsewhere in include (issue #29045)', async () => {
+      createBinaryFile(
+        'assets/logo.png',
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+      createBinaryFile(
+        'src/diagram.png',
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+      createFile('src/index.ts', 'console.log("hello");');
+      const params = {
+        include: ['assets/logo.png', 'src/**'],
+        useDefaultExcludes: false,
+      };
+      const invocation = tool.build(params);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+
+      // assets/logo.png was explicitly requested, but src/diagram.png was NOT
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
+        '- `src/diagram.png` (Reason: asset file (image/pdf/audio) was not explicitly requested by name or extension)',
+      );
+      const inlinedParts = Array.isArray(result.llmContent)
+        ? result.llmContent.filter(
+            (c) => typeof c !== 'string' && 'inlineData' in c,
+          )
+        : [];
+      expect(inlinedParts).toHaveLength(1);
+    });
+
+    it('should include image when explicitly requested with wildcard extension matching case-insensitively (issue #29045)', async () => {
+      createBinaryFile(
+        'assets/Logo.PNG',
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+      const params = { include: ['assets/Logo.*'] };
+      const invocation = tool.build(params);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+      const inlinedParts = Array.isArray(result.llmContent)
+        ? result.llmContent.filter(
+            (c) => typeof c !== 'string' && 'inlineData' in c,
+          )
+        : [];
+      expect(inlinedParts).toHaveLength(1);
+    });
+
     it('should return error if path is ignored by a .geminiignore pattern', async () => {
       createFile('foo.bar', '');
       createFile('bar.ts', '');
       createFile('foo.quux', '');
       const params = { include: ['foo.bar', 'bar.ts', 'foo.quux'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
-      expect(result.returnDisplay).not.toContain('foo.bar');
-      expect(result.returnDisplay).not.toContain('foo.quux');
-      expect(result.returnDisplay).toContain('bar.ts');
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+      expect((result.returnDisplay as ReadManyFilesResult).files).not.toContain(
+        'foo.bar',
+      );
+      expect((result.returnDisplay as ReadManyFilesResult).files).not.toContain(
+        'foo.quux',
+      );
+      expect((result.returnDisplay as ReadManyFilesResult).files).toContain(
+        'bar.ts',
+      );
     });
 
     it('should read files from multiple workspace directories', async () => {
-      const tempDir1 = fs.realpathSync(
+      const tempDir1 = resolveToRealPath(
         fs.mkdtempSync(path.join(os.tmpdir(), 'multi-dir-1-')),
       );
-      const tempDir2 = fs.realpathSync(
+      const tempDir2 = resolveToRealPath(
         fs.mkdtempSync(path.join(os.tmpdir(), 'multi-dir-2-')),
       );
       const fileService = new FileDiscoveryService(tempDir1);
@@ -576,7 +685,9 @@ describe('ReadManyFilesTool', () => {
 
       const params = { include: ['*.txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
       if (!Array.isArray(content)) {
         throw new Error(`llmContent is not an array: ${content}`);
@@ -594,7 +705,7 @@ describe('ReadManyFilesTool', () => {
           c.includes(`--- ${expectedPath2} ---\n\nContent2\n\n`),
         ),
       ).toBe(true);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **2 file(s)**',
       );
 
@@ -612,7 +723,9 @@ describe('ReadManyFilesTool', () => {
 
       const params = { include: ['*.txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
 
       const normalFileContent = content.find((c) => c.includes('file1.txt'));
@@ -636,7 +749,9 @@ describe('ReadManyFilesTool', () => {
       createFile(filePath, 'Content of receive-detail');
       const params = { include: [filePath] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const expectedPath = path.join(tempRootDir, filePath);
       expect(result.llmContent).toEqual([
         `--- ${expectedPath} ---
@@ -646,7 +761,7 @@ Content of receive-detail
 `,
         `\n--- End of content ---`,
       ]);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **1 file(s)**',
       );
     });
@@ -655,7 +770,9 @@ Content of receive-detail
       createFile('file[1].txt', 'Content of file[1]');
       const params = { include: ['file[1].txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const expectedPath = path.join(tempRootDir, 'file[1].txt');
       expect(result.llmContent).toEqual([
         `--- ${expectedPath} ---
@@ -665,7 +782,7 @@ Content of file[1]
 `,
         `\n--- End of content ---`,
       ]);
-      expect(result.returnDisplay).toContain(
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
         'Successfully read and concatenated content from **1 file(s)**',
       );
     });
@@ -683,7 +800,9 @@ Content of file[1]
       vi.mocked(glob.glob).mockRejectedValue(new Error('Glob failed'));
       const params = { include: ['*.txt'] };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       expect(result.error?.type).toBe(
         ToolErrorType.READ_MANY_FILES_SEARCH_ERROR,
       );
@@ -729,7 +848,9 @@ Content of file[1]
 
       const params = { include: files };
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       // Verify all files were processed. The content should have fileCount
       // entries + 1 for the output terminator.
@@ -759,12 +880,16 @@ Content of file[1]
       };
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
       const content = result.llmContent as string[];
 
       // Should successfully process valid files despite one failure
       expect(content.length).toBeGreaterThanOrEqual(3);
-      expect(result.returnDisplay).toContain('Successfully read');
+      expect((result.returnDisplay as ReadManyFilesResult).summary).toContain(
+        'Successfully read',
+      );
 
       // Verify valid files were processed
       const expectedPath1 = path.join(tempRootDir, 'valid1.txt');
@@ -797,7 +922,7 @@ Content of file[1]
       });
 
       const invocation = tool.build({ include: files });
-      await invocation.execute(new AbortController().signal);
+      await invocation.execute({ abortSignal: new AbortController().signal });
 
       // Verify concurrent execution pattern
       // In parallel execution: all "start:" events should come before all "end:" events
@@ -832,7 +957,9 @@ Content of file[1]
       );
 
       const invocation = tool.build({ include: ['jit-test.ts'] });
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       expect(discoverJitContext).toHaveBeenCalled();
       const llmContent = Array.isArray(result.llmContent)
@@ -853,12 +980,355 @@ Content of file[1]
       );
 
       const invocation = tool.build({ include: ['jit-disabled-test.ts'] });
-      const result = await invocation.execute(new AbortController().signal);
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
 
       const llmContent = Array.isArray(result.llmContent)
         ? result.llmContent.join('')
         : String(result.llmContent);
       expect(llmContent).not.toContain('Newly Discovered Project Context');
+    });
+
+    it('should discover JIT context sequentially to avoid duplicate shared parent context', async () => {
+      const { discoverJitContext } = await import('./jit-context.js');
+
+      // Simulate two subdirectories sharing a parent GEMINI.md.
+      // Sequential execution means the second call sees the parent already
+      // loaded, so it only returns its own leaf context.
+      const callOrder: string[] = [];
+      let firstCallDone = false;
+      vi.mocked(discoverJitContext).mockImplementation(async (_config, dir) => {
+        callOrder.push(dir);
+        if (!firstCallDone) {
+          // First call (whichever dir) loads the shared parent + its own leaf
+          firstCallDone = true;
+          return 'Parent context\nFirst leaf context';
+        }
+        // Second call only returns its own leaf (parent already loaded)
+        return 'Second leaf context';
+      });
+
+      // Create files in two sibling subdirectories
+      fs.mkdirSync(path.join(tempRootDir, 'subA'), { recursive: true });
+      fs.mkdirSync(path.join(tempRootDir, 'subB'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempRootDir, 'subA', 'a.ts'),
+        'const a = 1;',
+        'utf8',
+      );
+      fs.writeFileSync(
+        path.join(tempRootDir, 'subB', 'b.ts'),
+        'const b = 2;',
+        'utf8',
+      );
+
+      const invocation = tool.build({ include: ['subA/a.ts', 'subB/b.ts'] });
+      const result = await invocation.execute({
+        abortSignal: new AbortController().signal,
+      });
+
+      // Verify both directories were discovered (order depends on Set iteration)
+      expect(callOrder).toHaveLength(2);
+      expect(callOrder).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining('subA'),
+          expect.stringContaining('subB'),
+        ]),
+      );
+
+      const llmContent = Array.isArray(result.llmContent)
+        ? result.llmContent.join('')
+        : String(result.llmContent);
+      expect(llmContent).toContain('Parent context');
+      expect(llmContent).toContain('First leaf context');
+      expect(llmContent).toContain('Second leaf context');
+
+      // Parent context should appear only once (from the first call), not duplicated
+      const parentMatches = llmContent.match(/Parent context/g);
+      expect(parentMatches).toHaveLength(1);
+    });
+  });
+
+  describe('isAssetExplicitlyRequested', () => {
+    it('should reject generic directory globs and wildcards', () => {
+      expect(
+        isAssetExplicitlyRequested(
+          ['reports/**'],
+          'reports/report.png',
+          '/root/reports/report.png',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          ['reports/*'],
+          'reports/report.png',
+          '/root/reports/report.png',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          ['**/*report*/**'],
+          'reports/report.png',
+          '/root/reports/report.png',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(['src/**'], 'src/s.png', '/root/src/s.png'),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(['*'], 'document.pdf', '/root/document.pdf'),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          ['**/*'],
+          'nested/document.pdf',
+          '/root/nested/document.pdf',
+        ),
+      ).toBe(false);
+    });
+
+    it('should reject directory paths containing an extension-like segment', () => {
+      expect(
+        isAssetExplicitlyRequested(
+          ['backup.png/**'],
+          'backup.png/image.png',
+          '/root/backup.png/image.png',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          ['docs.pdf/*'],
+          'docs.pdf/notes.pdf',
+          '/root/docs.pdf/notes.pdf',
+        ),
+      ).toBe(false);
+    });
+
+    it('should isolate pattern evaluation across multiple include patterns', () => {
+      const include = ['assets/logo.png', 'src/**'];
+      expect(
+        isAssetExplicitlyRequested(
+          include,
+          'assets/logo.png',
+          '/root/assets/logo.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          include,
+          'src/diagram.png',
+          '/root/src/diagram.png',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          include,
+          'src/screenshot.png',
+          '/root/src/screenshot.png',
+        ),
+      ).toBe(false);
+    });
+
+    it('should accept explicit extension globs', () => {
+      expect(
+        isAssetExplicitlyRequested(['*.png'], 'image.png', '/root/image.png'),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['**/*.png'],
+          'sub/nested/image.png',
+          '/root/sub/nested/image.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/*.pdf'],
+          'assets/manual.pdf',
+          '/root/assets/manual.pdf',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/*.pdf'],
+          'other/manual.pdf',
+          '/root/other/manual.pdf',
+        ),
+      ).toBe(false);
+    });
+
+    it('should support brace-expanded extensions', () => {
+      const include = ['**/*.{png,jpg,jpeg}'];
+      expect(
+        isAssetExplicitlyRequested(
+          include,
+          'assets/photo.jpg',
+          '/root/assets/photo.jpg',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          include,
+          'assets/photo.png',
+          '/root/assets/photo.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          include,
+          'assets/doc.pdf',
+          '/root/assets/doc.pdf',
+        ),
+      ).toBe(false);
+    });
+
+    it('should accept explicit filename and stem requests case-insensitively', () => {
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/Logo.*'],
+          'assets/Logo.PNG',
+          '/root/assets/Logo.PNG',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/logo.*'],
+          'assets/Logo.PNG',
+          '/root/assets/Logo.PNG',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['report-final.pdf'],
+          'report-final.pdf',
+          '/root/report-final.pdf',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['./assets/logo.png'],
+          'assets/logo.png',
+          '/root/assets/logo.png',
+        ),
+      ).toBe(true);
+    });
+
+    it('should handle filenames with multiple dots', () => {
+      expect(
+        isAssetExplicitlyRequested(
+          ['quarterly.report.final.pdf'],
+          'quarterly.report.final.pdf',
+          '/root/quarterly.report.final.pdf',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['quarterly.report.final.*'],
+          'quarterly.report.final.pdf',
+          '/root/quarterly.report.final.pdf',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['reports/**'],
+          'reports/quarterly.report.final.pdf',
+          '/root/reports/quarterly.report.final.pdf',
+        ),
+      ).toBe(false);
+    });
+
+    it('should correctly handle Windows path backslashes and drive letters', () => {
+      expect(
+        isAssetExplicitlyRequested(
+          ['reports\\**'],
+          'reports\\report.png',
+          'C:\\workspace\\reports\\report.png',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets\\logo.png'],
+          'assets\\logo.png',
+          'C:\\workspace\\assets\\logo.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets\\Logo.*'],
+          'assets\\Logo.PNG',
+          'D:\\repos\\project\\assets\\Logo.PNG',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/logo.png'],
+          'assets\\logo.png',
+          'C:\\workspace\\assets\\logo.png',
+        ),
+      ).toBe(true);
+    });
+
+    it('should support explicit wildcard patterns like logo-* or image-*.png and reject generic *.*', () => {
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/logo-*'],
+          'assets/logo-header.png',
+          '/root/assets/logo-header.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['assets/logo-*.*'],
+          'assets/logo-header.png',
+          '/root/assets/logo-header.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['image-*.png'],
+          'image-01.png',
+          '/root/image-01.png',
+        ),
+      ).toBe(true);
+      expect(
+        isAssetExplicitlyRequested(
+          ['*.*'],
+          'document.pdf',
+          '/root/document.pdf',
+        ),
+      ).toBe(false);
+      expect(
+        isAssetExplicitlyRequested(
+          ['reports/*.*'],
+          'reports/summary.pdf',
+          '/root/reports/summary.pdf',
+        ),
+      ).toBe(false);
+    });
+
+    it('should use and populate matcherCache when provided', () => {
+      const cache = new LRUCache<string, (target: string) => boolean>(10);
+      expect(cache.size).toBe(0);
+
+      const res1 = isAssetExplicitlyRequested(
+        ['assets/*.png'],
+        'assets/logo.png',
+        '/root/assets/logo.png',
+        cache,
+      );
+      expect(res1).toBe(true);
+      expect(cache.size).toBe(1);
+      expect(cache.has('assets/*.png')).toBe(true);
+
+      const res2 = isAssetExplicitlyRequested(
+        ['assets/*.png'],
+        'other/doc.png',
+        '/root/other/doc.png',
+        cache,
+      );
+      expect(res2).toBe(false);
+      // Size remains 1 because pattern was already compiled and cached
+      expect(cache.size).toBe(1);
     });
   });
 });

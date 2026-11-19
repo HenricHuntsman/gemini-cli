@@ -30,7 +30,7 @@ import type { Config } from '../config/config.js';
 import { ApprovalMode } from '../policy/types.js';
 import type { ToolRegistry } from './tool-registry.js';
 import path from 'node:path';
-import { isSubpath } from '../utils/paths.js';
+import { isSubpath, resolveToRealPath } from '../utils/paths.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import { GeminiClient } from '../core/client.js';
@@ -38,14 +38,15 @@ import type { BaseLlmClient } from '../core/baseLlmClient.js';
 import { ensureCorrectFileContent } from '../utils/editCorrector.js';
 import { StandardFileSystemService } from '../services/fileSystemService.js';
 import { IdeClient, type DiffUpdateResult } from '../ide/ide-client.js';
+import { ideContextStore } from '../ide/ideContext.js';
 import { WorkspaceContext } from '../utils/workspaceContext.js';
 import {
   createMockMessageBus,
   getMockMessageBusInstance,
 } from '../test-utils/mock-message-bus.js';
 
-const rootDir = path.resolve(os.tmpdir(), 'gemini-cli-test-root');
-const plansDir = path.resolve(os.tmpdir(), 'gemini-cli-test-plans');
+let rootDir: string;
+let plansDir: string;
 
 // --- MOCKS ---
 vi.mock('../core/client.js');
@@ -76,6 +77,7 @@ vi.mocked(IdeClient.getInstance).mockResolvedValue(
 const fsService = new StandardFileSystemService();
 const mockConfigInternal = {
   getTargetDir: () => rootDir,
+  getProjectRoot: () => rootDir,
   getApprovalMode: vi.fn(() => ApprovalMode.DEFAULT),
   setApprovalMode: vi.fn(),
   getGeminiClient: vi.fn(), // Initialize as a plain mock function
@@ -84,7 +86,7 @@ const mockConfigInternal = {
   getIdeMode: vi.fn(() => false),
   getWorkspaceContext: () => new WorkspaceContext(rootDir, [plansDir]),
   getApiKey: () => 'test-key',
-  getModel: () => 'test-model',
+  getModel: () => 'gemini-1.5-flash',
   getSandbox: () => false,
   getDebugMode: () => false,
   getQuestion: () => undefined,
@@ -105,7 +107,8 @@ const mockConfigInternal = {
     }) as unknown as ToolRegistry,
   isInteractive: () => false,
   getDisableLLMCorrection: vi.fn(() => true),
-  getActiveModel: () => 'test-model',
+  isPlanMode: vi.fn(() => false),
+  getActiveModel: () => 'gemini-1.5-flash',
   storage: {
     getProjectTempDir: vi.fn().mockReturnValue('/tmp/project'),
   },
@@ -131,17 +134,22 @@ describe('WriteFileTool', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(mockConfigInternal.isPlanMode).mockReturnValue(false);
     // Create a unique temporary directory for files created outside the root
-    tempDir = fs.mkdtempSync(
+    const rawTempDir = fs.mkdtempSync(
       path.join(os.tmpdir(), 'write-file-test-external-'),
     );
-    // Ensure the rootDir and plansDir for the tool exists
-    if (!fs.existsSync(rootDir)) {
-      fs.mkdirSync(rootDir, { recursive: true });
-    }
-    if (!fs.existsSync(plansDir)) {
-      fs.mkdirSync(plansDir, { recursive: true });
-    }
+    tempDir = resolveToRealPath(rawTempDir);
+
+    const rawRootDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'gemini-cli-test-root-'),
+    );
+    rootDir = resolveToRealPath(rawRootDir);
+
+    const rawPlansDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'gemini-cli-test-plans-'),
+    );
+    plansDir = resolveToRealPath(rawPlansDir);
 
     const workspaceContext = new WorkspaceContext(rootDir, [plansDir]);
     const mockStorage = {
@@ -270,8 +278,9 @@ describe('WriteFileTool', () => {
         file_path: dirAsFilePath,
         content: 'hello',
       };
+      const realDirAsFilePath = resolveToRealPath(dirAsFilePath);
       expect(() => tool.build(params)).toThrow(
-        `Path is a directory, not a file: ${dirAsFilePath}`,
+        `Path is a directory, not a file: ${realDirAsFilePath}`,
       );
     });
 
@@ -367,6 +376,7 @@ describe('WriteFileTool', () => {
       const abortSignal = new AbortController().signal;
 
       const mockGemini3Config = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...mockConfig,
         getActiveModel: () => 'gemini-3.0-pro',
       } as unknown as Config;
@@ -375,6 +385,40 @@ describe('WriteFileTool', () => {
 
       await getCorrectedFileContent(
         mockGemini3Config,
+        filePath,
+        proposedContent,
+        abortSignal,
+      );
+
+      expect(mockEnsureCorrectFileContent).toHaveBeenCalledWith(
+        proposedContent,
+        mockBaseLlmClientInstance,
+        abortSignal,
+        true,
+        false, // aggressiveUnescape
+      );
+    });
+
+    it('should set aggressiveUnescape to false for gemini-3-flash when dynamic model config is enabled', async () => {
+      const filePath = path.join(rootDir, 'gemini3_flash_file.txt');
+      const proposedContent = 'const str = "line1\\nline2";';
+      const abortSignal = new AbortController().signal;
+
+      const mockGemini3FlashConfig = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
+        ...mockConfig,
+        getActiveModel: () => 'gemini-3-flash',
+        getExperimentalDynamicModelConfiguration: () => true,
+        modelConfigService: {
+          resolveModelId: (m: string) => m,
+          getModelDefinition: () => undefined,
+        },
+      } as unknown as Config;
+
+      mockEnsureCorrectFileContent.mockResolvedValue(proposedContent);
+
+      await getCorrectedFileContent(
+        mockGemini3FlashConfig,
         filePath,
         proposedContent,
         abortSignal,
@@ -420,6 +464,39 @@ describe('WriteFileTool', () => {
       expect(result.error).toBeUndefined();
     });
 
+    it('should not call ensureCorrectFileContent for .json files', async () => {
+      const filePath = path.join(rootDir, 'config.json');
+      const proposedContent = '{"key": "value\\nwith\\nescapes"}';
+      const abortSignal = new AbortController().signal;
+
+      const result = await getCorrectedFileContent(
+        mockConfig,
+        filePath,
+        proposedContent,
+        abortSignal,
+      );
+
+      expect(mockEnsureCorrectFileContent).not.toHaveBeenCalled();
+      expect(result.correctedContent).toBe(proposedContent);
+    });
+
+    it('should not call ensureCorrectFileContent for .ipynb files', async () => {
+      const filePath = path.join(rootDir, 'notebook.ipynb');
+      const proposedContent =
+        '{"cells": [{"source": ["print(\\"hello\\\\n\\")"]}]}';
+      const abortSignal = new AbortController().signal;
+
+      const result = await getCorrectedFileContent(
+        mockConfig,
+        filePath,
+        proposedContent,
+        abortSignal,
+      );
+
+      expect(mockEnsureCorrectFileContent).not.toHaveBeenCalled();
+      expect(result.correctedContent).toBe(proposedContent);
+    });
+
     it('should return error if reading an existing file fails (e.g. permissions)', async () => {
       const filePath = path.join(rootDir, 'unreadable_file.txt');
       const proposedContent = 'some content';
@@ -438,7 +515,8 @@ describe('WriteFileTool', () => {
         abortSignal,
       );
 
-      expect(fsService.readTextFile).toHaveBeenCalledWith(filePath);
+      const realFilePath = resolveToRealPath(filePath);
+      expect(fsService.readTextFile).toHaveBeenCalledWith(realFilePath);
       expect(mockEnsureCorrectFileContent).not.toHaveBeenCalled();
       expect(result.correctedContent).toBe(proposedContent);
       expect(result.originalContent).toBe('');
@@ -670,10 +748,20 @@ describe('WriteFileTool', () => {
       const params = { file_path: relativePath, content };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toMatch(
         /Successfully created and wrote to new file/,
+      );
+      expect(result.display).toEqual(
+        expect.objectContaining({
+          name: 'WriteFile',
+          resultSummary: expect.stringContaining('added'),
+          result: expect.objectContaining({
+            type: 'diff',
+            afterText: content,
+          }),
+        }),
       );
       expect(fs.existsSync(filePath)).toBe(true);
       const writtenContent = await fsService.readTextFile(filePath);
@@ -691,7 +779,7 @@ describe('WriteFileTool', () => {
       });
 
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Error checking existing file');
       expect(result.returnDisplay).toMatch(
         /Error checking existing file: Simulated read error for execute/,
@@ -716,7 +804,7 @@ describe('WriteFileTool', () => {
 
       await confirmExecution(invocation);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(mockEnsureCorrectFileContent).toHaveBeenCalledWith(
         proposedContent,
@@ -761,7 +849,7 @@ describe('WriteFileTool', () => {
 
       await confirmExecution(invocation);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(mockEnsureCorrectFileContent).toHaveBeenCalledWith(
         proposedContent,
@@ -783,6 +871,40 @@ describe('WriteFileTool', () => {
       );
     });
 
+    // Root bypasses mode bits, so it never reaches the PERMISSION_DENIED branch.
+    it.skipIf(process.getuid?.() === 0)(
+      'should return PERMISSION_DENIED without modifying a read-only file',
+      async () => {
+        const filePath = path.join(rootDir, 'execute_read_only_file.txt');
+        const initialContent = 'Guarded content.';
+        fs.writeFileSync(filePath, initialContent, 'utf8');
+        fs.chmodSync(filePath, 0o444);
+        mockEnsureCorrectFileContent.mockResolvedValue('Attempted overwrite.');
+
+        try {
+          const params = {
+            file_path: filePath,
+            content: 'Attempted overwrite.',
+          };
+          const invocation = tool.build(params);
+
+          await confirmExecution(invocation);
+
+          const result = await invocation.execute({ abortSignal });
+
+          expect(result.error?.type).toBe(ToolErrorType.PERMISSION_DENIED);
+          expect(result.llmContent).toMatch(
+            /Permission denied writing to file/,
+          );
+          expect(fs.readFileSync(filePath, 'utf8')).toBe(initialContent);
+        } finally {
+          // Leave the file writable so afterEach can remove rootDir even if
+          // an assertion above failed.
+          fs.chmodSync(filePath, 0o600);
+        }
+      },
+    );
+
     it('should create directory if it does not exist', async () => {
       const dirPath = path.join(rootDir, 'new_dir_for_write');
       const filePath = path.join(dirPath, 'file_in_new_dir.txt');
@@ -794,7 +916,7 @@ describe('WriteFileTool', () => {
 
       await confirmExecution(invocation);
 
-      await invocation.execute(abortSignal);
+      await invocation.execute({ abortSignal });
 
       expect(fs.existsSync(dirPath)).toBe(true);
       expect(fs.statSync(dirPath).isDirectory()).toBe(true);
@@ -831,7 +953,7 @@ describe('WriteFileTool', () => {
           ...(modified_by_user !== undefined && { modified_by_user }),
         };
         const invocation = tool.build(params);
-        const result = await invocation.execute(abortSignal);
+        const result = await invocation.execute({ abortSignal });
 
         if (shouldIncludeMessage) {
           expect(result.llmContent).toMatch(/User modified the `content`/);
@@ -849,7 +971,7 @@ describe('WriteFileTool', () => {
       const params = { file_path: filePath, content };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('Here is the updated code:');
       expect(result.llmContent).toContain(content);
@@ -876,7 +998,7 @@ describe('WriteFileTool', () => {
         await confirmDetails.onConfirm(ToolConfirmationOutcome.ProceedOnce);
       }
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('Here is the updated code:');
       // Should contain the modified line
@@ -997,12 +1119,13 @@ describe('WriteFileTool', () => {
 
           const params = { file_path: filePath, content };
           const invocation = tool.build(params);
-          const result = await invocation.execute(abortSignal);
+          const result = await invocation.execute({ abortSignal });
 
           expect(result.error?.type).toBe(errorType);
           const errorSuffix = errorCode ? ` (${errorCode})` : '';
+          const realFilePath = resolveToRealPath(filePath);
           const expectedMessage = errorCode
-            ? `${expectedMessagePrefix}: ${filePath}${errorSuffix}`
+            ? `${expectedMessagePrefix}: ${realFilePath}${errorSuffix}`
             : `${expectedMessagePrefix}: ${errorMessage}`;
           expect(result.llmContent).toContain(expectedMessage);
           expect(result.returnDisplay).toContain(expectedMessage);
@@ -1087,7 +1210,7 @@ describe('WriteFileTool', () => {
 
       const params = { file_path: filePath, content };
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(discoverJitContext).toHaveBeenCalled();
       expect(result.llmContent).toContain('Newly Discovered Project Context');
@@ -1104,11 +1227,226 @@ describe('WriteFileTool', () => {
 
       const params = { file_path: filePath, content };
       const invocation = tool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).not.toContain(
         'Newly Discovered Project Context',
       );
+    });
+  });
+
+  describe('plan mode path handling', () => {
+    const abortSignal = new AbortController().signal;
+
+    it('should correctly resolve nested paths in plan mode', async () => {
+      vi.mocked(mockConfig.isPlanMode).mockReturnValue(true);
+      // Extend storage mock with getPlansDir
+      mockConfig.storage.getPlansDir = vi.fn().mockReturnValue(plansDir);
+
+      const nestedFilePath = 'conductor/tracks/test.md';
+      const invocation = tool.build({
+        file_path: nestedFilePath,
+        content: 'nested content',
+      });
+
+      await invocation.execute({ abortSignal });
+
+      const expectedWritePath = path.join(plansDir, 'conductor/tracks/test.md');
+      expect(fs.existsSync(expectedWritePath)).toBe(true);
+      expect(fs.readFileSync(expectedWritePath, 'utf8')).toBe('nested content');
+    });
+  });
+
+  describe('concurrent writes to the same file', () => {
+    it('does not report two creations of the same new file', async () => {
+      const abortSignal = new AbortController().signal;
+      const filePath = path.join(rootDir, 'concurrent_new_file.txt');
+      mockEnsureCorrectFileContent.mockImplementation(
+        async (content: string) => content,
+      );
+
+      const first = tool.build({ file_path: filePath, content: 'first' });
+      const second = tool.build({ file_path: filePath, content: 'second' });
+
+      const results = await Promise.all([
+        first.execute({ abortSignal }),
+        second.execute({ abortSignal }),
+      ]);
+
+      // Whichever call lands second must observe the file the other created,
+      // otherwise both report a creation and the second one's diff claims the
+      // file was empty beforehand.
+      const messages = results.map((r) =>
+        typeof r.llmContent === 'string' ? r.llmContent : '',
+      );
+      expect(
+        messages.filter((m) =>
+          m.startsWith('Successfully created and wrote to new file'),
+        ),
+      ).toHaveLength(1);
+      expect(
+        messages.filter((m) => m.startsWith('Successfully overwrote file')),
+      ).toHaveLength(1);
+    });
+
+    it('aborts immediately if signal is aborted while waiting for path lock', async () => {
+      const filePath = path.join(rootDir, 'abort_test.txt');
+      const first = tool.build({ file_path: filePath, content: 'first' });
+      const second = tool.build({ file_path: filePath, content: 'second' });
+
+      const controller = new AbortController();
+
+      const p1 = first.execute({ abortSignal: new AbortController().signal });
+      controller.abort();
+      const p2 = second.execute({ abortSignal: controller.signal });
+
+      await expect(p2).rejects.toThrow('Write aborted');
+      await p1;
+    });
+  });
+
+  describe('multi-root IDE workspace relative path resolution (b/503364786 / #25527)', () => {
+    const abortSignal = new AbortController().signal;
+
+    afterEach(() => {
+      ideContextStore.clear();
+    });
+
+    it('should resolve a relative file_path against the active IDE workspace project (mmm-tools/FLUX) instead of the fallback targetDir (data-model-core/mmm)', async () => {
+      // Simulate the multi-repo layout from GitHub issue #25527:
+      //   <repogit>/data-model-core/mmm  (initial CLI targetDir)
+      //   <repogit>/mmm-tools/FLUX       (active project in VS Code IDE workspace)
+      const mmmRepoDir = path.join(
+        tempDir,
+        'repogit',
+        'data-model-core',
+        'mmm',
+      );
+      const fluxRepoDir = path.join(tempDir, 'repogit', 'mmm-tools', 'FLUX');
+      fs.mkdirSync(mmmRepoDir, { recursive: true });
+      fs.mkdirSync(path.join(fluxRepoDir, 'src'), { recursive: true });
+
+      // Both workspace folders are registered in WorkspaceContext (via GEMINI_CLI_IDE_WORKSPACE_PATH),
+      // while getTargetDir() remains anchored to the initial startup directory (data-model-core/mmm).
+      const multiRootWorkspace = new WorkspaceContext(mmmRepoDir, [
+        fluxRepoDir,
+      ]);
+      vi.spyOn(mockConfig, 'getTargetDir').mockReturnValue(mmmRepoDir);
+      vi.spyOn(mockConfig, 'getWorkspaceContext').mockReturnValue(
+        multiRootWorkspace,
+      );
+      mockConfigInternal.isPlanMode.mockReturnValue(false);
+      mockConfigInternal.getIdeMode.mockReturnValue(true);
+
+      // The user is actively working inside mmm-tools/FLUX in VS Code
+      const activeFluxFile = path.join(fluxRepoDir, 'src', 'index.ts');
+      fs.writeFileSync(activeFluxFile, '// active file in FLUX\n', 'utf8');
+      ideContextStore.set({
+        workspaceState: {
+          openFiles: [
+            {
+              path: activeFluxFile,
+              timestamp: Date.now(),
+              isActive: true,
+            },
+          ],
+        },
+      });
+
+      const relativeFilePath = 'tests/gemini_test_repo_parent.txt';
+      const content = 'Verification test for issue #25527';
+      mockEnsureCorrectFileContent.mockResolvedValue(content);
+
+      const invocation = tool.build({
+        file_path: relativeFilePath,
+        content,
+      });
+
+      // The UI description displays only the relative path ("Writing to tests/gemini_test_repo_parent.txt"),
+      // hiding that it resolved against data-model-core/mmm instead of mmm-tools/FLUX
+      expect(invocation.getDescription()).toBe(
+        `Writing to ${path.join('tests', 'gemini_test_repo_parent.txt')}`,
+      );
+
+      await invocation.execute({ abortSignal });
+
+      const expectedFluxFilePath = path.join(fluxRepoDir, relativeFilePath);
+      const wrongMmmFilePath = path.join(mmmRepoDir, relativeFilePath);
+      const actualWrittenPath = [expectedFluxFilePath, wrongMmmFilePath].find(
+        (filePath) => fs.existsSync(filePath),
+      );
+
+      // Expected: file is written to the active IDE project (mmm-tools/FLUX) and NOT to data-model-core/mmm
+      expect(actualWrittenPath).toBe(expectedFluxFilePath);
+      expect(fs.existsSync(wrongMmmFilePath)).toBe(false);
+      expect(fs.existsSync(expectedFluxFilePath)).toBe(true);
+    });
+
+    it('should resolve a relative file_path against a nested Git repository (mmm-tools/FLUX) when a parent folder (repogit) is opened as the workspace root', async () => {
+      const repogitDir = path.join(tempDir, 'repogit');
+      const mmmRepoDir = path.join(repogitDir, 'data-model-core', 'mmm');
+      const fluxRepoDir = path.join(repogitDir, 'mmm-tools', 'FLUX');
+      fs.mkdirSync(path.join(mmmRepoDir, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(fluxRepoDir, '.git'), { recursive: true });
+      fs.mkdirSync(path.join(fluxRepoDir, 'src'), { recursive: true });
+
+      const parentWorkspace = new WorkspaceContext(repogitDir);
+      vi.spyOn(mockConfig, 'getTargetDir').mockReturnValue(repogitDir);
+      vi.spyOn(mockConfig, 'getWorkspaceContext').mockReturnValue(
+        parentWorkspace,
+      );
+      mockConfigInternal.isPlanMode.mockReturnValue(false);
+      mockConfigInternal.getIdeMode.mockReturnValue(true);
+
+      const activeFluxFile = path.join(fluxRepoDir, 'src', 'index.ts');
+      fs.writeFileSync(activeFluxFile, '// active file in FLUX\n', 'utf8');
+      ideContextStore.set({
+        workspaceState: {
+          openFiles: [
+            {
+              path: activeFluxFile,
+              timestamp: Date.now(),
+              isActive: true,
+            },
+          ],
+        },
+      });
+
+      const relativeFilePath = 'tests/gemini_test_repo_parent.txt';
+      const content = 'Nested repo content';
+      mockEnsureCorrectFileContent.mockResolvedValue(content);
+
+      const invocation = tool.build({
+        file_path: relativeFilePath,
+        content,
+      });
+
+      await invocation.execute({ abortSignal });
+
+      const expectedFluxFilePath = path.join(fluxRepoDir, relativeFilePath);
+      expect(fs.existsSync(expectedFluxFilePath)).toBe(true);
+      expect(fs.readFileSync(expectedFluxFilePath, 'utf8')).toBe(content);
+
+      // Also verify that if the relative path already starts with "mmm-tools/FLUX/", it is not duplicated
+      const prefixedInvocation = tool.build({
+        file_path: 'mmm-tools/FLUX/tests/prefixed_file.txt',
+        content,
+      });
+      await prefixedInvocation.execute({ abortSignal });
+      expect(
+        fs.existsSync(path.join(fluxRepoDir, 'tests', 'prefixed_file.txt')),
+      ).toBe(true);
+      expect(
+        fs.existsSync(
+          path.join(
+            fluxRepoDir,
+            'mmm-tools',
+            'FLUX',
+            'tests',
+            'prefixed_file.txt',
+          ),
+        ),
+      ).toBe(false);
     });
   });
 });

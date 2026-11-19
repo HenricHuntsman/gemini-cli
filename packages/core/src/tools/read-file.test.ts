@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { ReadFileTool, type ReadFileToolParams } from './read-file.js';
 import { ToolErrorType } from './tool-error.js';
 import path from 'node:path';
-import { isSubpath } from '../utils/paths.js';
+import { isSubpath, resolveToRealPath } from '../utils/paths.js';
 import os from 'node:os';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -19,6 +19,7 @@ import { createMockWorkspaceContext } from '../test-utils/mockWorkspaceContext.j
 import { WorkspaceContext } from '../utils/workspaceContext.js';
 import { createMockMessageBus } from '../test-utils/mock-message-bus.js';
 import { GEMINI_IGNORE_FILE_NAME } from '../config/constants.js';
+import { ideContextStore } from '../ide/ideContext.js';
 
 vi.mock('../telemetry/loggers.js', () => ({
   logFileOperation: vi.fn(),
@@ -30,6 +31,15 @@ vi.mock('./jit-context.js', () => ({
     if (!context) return content;
     return `${content}\n\n--- Newly Discovered Project Context ---\n${context}\n--- End Project Context ---`;
   }),
+  appendJitContextToParts: vi.fn().mockImplementation((content, context) => {
+    const jitPart = {
+      text: `\n\n--- Newly Discovered Project Context ---\n${context}\n--- End Project Context ---`,
+    };
+    const existing = Array.isArray(content) ? content : [content];
+    return [...existing, jitPart];
+  }),
+  JIT_CONTEXT_PREFIX: '\n\n--- Newly Discovered Project Context ---\n',
+  JIT_CONTEXT_SUFFIX: '\n--- End Project Context ---',
 }));
 
 describe('ReadFileTool', () => {
@@ -78,6 +88,7 @@ describe('ReadFileTool', () => {
   });
 
   afterEach(async () => {
+    ideContextStore.clear();
     // Clean up the temporary root directory
     if (fs.existsSync(tempRootDir)) {
       await fsp.rm(tempRootDir, { recursive: true, force: true });
@@ -139,18 +150,20 @@ describe('ReadFileTool', () => {
 
     it('should throw error if start_line is less than 1', () => {
       const params: ReadFileToolParams = {
-        file_path: path.join(tempRootDir, 'test.txt'),
+        file_path: 'test.txt',
         start_line: 0,
       };
-      expect(() => tool.build(params)).toThrow('start_line must be at least 1');
+      expect(() => tool.build(params)).toThrow(
+        'params/start_line must be >= 1',
+      );
     });
 
     it('should throw error if end_line is less than 1', () => {
       const params: ReadFileToolParams = {
-        file_path: path.join(tempRootDir, 'test.txt'),
+        file_path: 'test.txt',
         end_line: 0,
       };
-      expect(() => tool.build(params)).toThrow('end_line must be at least 1');
+      expect(() => tool.build(params)).toThrow('params/end_line must be >= 1');
     });
 
     it('should throw error if start_line is greater than end_line', () => {
@@ -228,10 +241,18 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: 'textfile.txt' };
       const invocation = tool.build(params);
 
-      expect(await invocation.execute(abortSignal)).toEqual({
-        llmContent: fileContent,
-        returnDisplay: '',
-      });
+      const result = await invocation.execute({ abortSignal });
+      expect(result).toEqual(
+        expect.objectContaining({
+          llmContent: fileContent,
+          returnDisplay: '',
+          display: expect.objectContaining({
+            name: 'ReadFile',
+            description: expect.stringContaining('textfile.txt'),
+            resultSummary: '1 lines',
+          }),
+        }),
+      );
     });
 
     it('should return error if file does not exist', async () => {
@@ -239,7 +260,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: filePath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result).toEqual({
         llmContent:
           'Could not read file because no file was found at the specified path.',
@@ -258,10 +279,18 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: filePath };
       const invocation = tool.build(params);
 
-      expect(await invocation.execute(abortSignal)).toEqual({
-        llmContent: fileContent,
-        returnDisplay: '',
-      });
+      const result = await invocation.execute({ abortSignal });
+      expect(result).toEqual(
+        expect.objectContaining({
+          llmContent: fileContent,
+          returnDisplay: '',
+          display: expect.objectContaining({
+            name: 'ReadFile',
+            description: expect.stringContaining('textfile.txt'),
+            resultSummary: '1 lines',
+          }),
+        }),
+      );
     });
 
     it('should return error if path is a directory', async () => {
@@ -270,7 +299,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: dirPath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result).toEqual({
         llmContent:
           'Could not read file because the provided path is a directory, not a file.',
@@ -290,7 +319,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: filePath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result).toHaveProperty('error');
       expect(result.error?.type).toBe(ToolErrorType.FILE_TOO_LARGE);
       expect(result.error?.message).toContain(
@@ -306,7 +335,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: filePath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain(
         'IMPORTANT: The file content has been truncated',
       );
@@ -324,7 +353,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: imagePath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toEqual({
         inlineData: {
           data: pngHeader.toString('base64'),
@@ -342,7 +371,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: pdfPath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toEqual({
         inlineData: {
           data: pdfHeader.toString('base64'),
@@ -360,7 +389,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: binPath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toBe(
         'Cannot display content of binary file: binary.bin',
       );
@@ -374,7 +403,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: svgPath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toBe(svgContent);
       expect(result.returnDisplay).toBe('Read SVG as text: image.svg');
     });
@@ -387,7 +416,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: svgPath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toBe(
         'Cannot display content of SVG file larger than 1MB: large.svg',
       );
@@ -402,7 +431,7 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: emptyPath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toBe('');
       expect(result.returnDisplay).toBe('');
     });
@@ -420,7 +449,7 @@ describe('ReadFileTool', () => {
       };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain(
         'IMPORTANT: The file content has been truncated',
       );
@@ -445,9 +474,50 @@ describe('ReadFileTool', () => {
       const params: ReadFileToolParams = { file_path: tempFilePath };
       const invocation = tool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toBe(tempFileContent);
       expect(result.returnDisplay).toBe('');
+    });
+
+    it('should use targetPathToRead consistently for file extension telemetry and JIT context discovery', async () => {
+      const { logFileOperation } = await import('../telemetry/loggers.js');
+      const { discoverJitContext } = await import('./jit-context.js');
+
+      const target1 = path.join(tempRootDir, 'initial.txt');
+      const target2 = path.join(tempRootDir, 'updated.py');
+      await fsp.writeFile(target1, 'text content', 'utf-8');
+      await fsp.writeFile(target2, 'print("hello")', 'utf-8');
+
+      const symlinkPath = path.join(tempRootDir, 'dynamic-symlink');
+      await fsp.symlink(target1, symlinkPath);
+
+      // Build invocation when symlink points to target1 (.txt)
+      const invocation = tool.build({ file_path: symlinkPath });
+
+      // Update symlink to point to target2 (.py) before execute()
+      await fsp.unlink(symlinkPath);
+      await fsp.symlink(target2, symlinkPath);
+
+      vi.mocked(logFileOperation).mockClear();
+      vi.mocked(discoverJitContext).mockClear();
+
+      const result = await invocation.execute({ abortSignal });
+      expect(result.llmContent).toBe('print("hello")');
+
+      // Telemetry must record extension for target2 (.py), not the stale target1 (.txt)
+      expect(logFileOperation).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          extension: '.py',
+          programming_language: 'python',
+        }),
+      );
+
+      // JIT context discovery must query the actual targetPathToRead (updated.py)
+      expect(discoverJitContext).toHaveBeenCalledWith(
+        expect.anything(),
+        target2,
+      );
     });
 
     describe('with .geminiignore', () => {
@@ -615,7 +685,7 @@ describe('ReadFileTool', () => {
       await fsp.writeFile(filePath, fileContent, 'utf-8');
 
       const invocation = tool.build({ file_path: filePath });
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(discoverJitContext).toHaveBeenCalled();
       expect(result.llmContent).toContain('Newly Discovered Project Context');
@@ -631,11 +701,127 @@ describe('ReadFileTool', () => {
       await fsp.writeFile(filePath, fileContent, 'utf-8');
 
       const invocation = tool.build({ file_path: filePath });
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).not.toContain(
         'Newly Discovered Project Context',
       );
+    });
+
+    it('should append JIT context as Part array for non-string llmContent (binary files)', async () => {
+      const { discoverJitContext } = await import('./jit-context.js');
+      vi.mocked(discoverJitContext).mockResolvedValue(
+        'Auth rules: use httpOnly cookies.',
+      );
+
+      // Create a minimal valid PNG file (1x1 pixel)
+      const pngHeader = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00,
+        0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, 0x33, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+      ]);
+      const filePath = path.join(tempRootDir, 'test-image.png');
+      await fsp.writeFile(filePath, pngHeader);
+
+      const invocation = tool.build({ file_path: filePath });
+      const result = await invocation.execute({ abortSignal });
+
+      expect(discoverJitContext).toHaveBeenCalled();
+      // Result should be an array containing both the image part and JIT context
+      expect(Array.isArray(result.llmContent)).toBe(true);
+      const parts = result.llmContent as Array<Record<string, unknown>>;
+      const jitTextPart = parts.find(
+        (p) =>
+          // eslint-disable-next-line no-restricted-syntax
+          typeof p['text'] === 'string' && p['text'].includes('Auth rules'),
+      );
+      expect(jitTextPart).toBeDefined();
+      expect(jitTextPart!['text']).toContain(
+        'Newly Discovered Project Context',
+      );
+      expect(jitTextPart!['text']).toContain(
+        'Auth rules: use httpOnly cookies.',
+      );
+    });
+  });
+
+  describe('IDE multi-root workspace resolution', () => {
+    it('should resolve and read relative file paths against the active IDE workspace directory', async () => {
+      const rawSecondWorkspaceDir = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'read-file-tool-second-'),
+      );
+      const secondWorkspaceDir = resolveToRealPath(rawSecondWorkspaceDir);
+
+      try {
+        const activeOpenFile = path.join(secondWorkspaceDir, 'index.ts');
+        const targetReadFile = path.join(secondWorkspaceDir, 'README.md');
+        await fsp.writeFile(activeOpenFile, 'export const x = 1;', 'utf-8');
+        await fsp.writeFile(
+          targetReadFile,
+          '# Second Workspace Readme',
+          'utf-8',
+        );
+        await fsp.writeFile(
+          path.join(tempRootDir, 'README.md'),
+          '# First Workspace Readme',
+          'utf-8',
+        );
+
+        ideContextStore.set({
+          workspaceState: {
+            openFiles: [
+              {
+                path: activeOpenFile,
+                timestamp: Date.now(),
+                isActive: true,
+              },
+            ],
+          },
+        });
+
+        const ideConfig = {
+          getFileService: () => new FileDiscoveryService(tempRootDir),
+          getFileSystemService: () => new StandardFileSystemService(),
+          getTargetDir: () => tempRootDir,
+          getIdeMode: () => true,
+          getWorkspaceContext: () =>
+            createMockWorkspaceContext(tempRootDir, [secondWorkspaceDir]),
+          getFileFilteringOptions: () => ({
+            respectGitIgnore: true,
+            respectGeminiIgnore: true,
+          }),
+          storage: {
+            getProjectTempDir: () => path.join(tempRootDir, '.temp'),
+          },
+          isInteractive: () => false,
+          isPathAllowed(this: Config, absolutePath: string): boolean {
+            return this.getWorkspaceContext().isPathWithinWorkspace(
+              absolutePath,
+            );
+          },
+          validatePathAccess(
+            this: Config,
+            absolutePath: string,
+          ): string | null {
+            return this.isPathAllowed(absolutePath)
+              ? null
+              : 'Path not in workspace';
+          },
+        } as unknown as Config;
+
+        const ideReadTool = new ReadFileTool(ideConfig, createMockMessageBus());
+        const invocation = ideReadTool.build({ file_path: 'README.md' });
+        expect(invocation.toolLocations()[0].path).toBe(targetReadFile);
+
+        const result = await invocation.execute({ abortSignal });
+        expect(result.error).toBeUndefined();
+        expect(result.llmContent).toContain('# Second Workspace Readme');
+      } finally {
+        await fsp.rm(secondWorkspaceDir, { recursive: true, force: true });
+      }
     });
   });
 });

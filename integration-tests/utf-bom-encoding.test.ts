@@ -5,8 +5,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { writeFileSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { TestRig } from './test-helper.js';
 
 // BOM encoders
@@ -50,11 +50,8 @@ const utf32BE = (s: string) => {
 describe('BOM end-to-end integraion', () => {
   let rig: TestRig;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     rig = new TestRig();
-    await rig.setup('bom-integration', {
-      settings: { tools: { core: ['read_file'] } },
-    });
   });
 
   afterEach(async () => await rig.cleanup());
@@ -64,6 +61,13 @@ describe('BOM end-to-end integraion', () => {
     content: Buffer,
     expectedText: string | null,
   ) {
+    // Every test gets its own directory. When KEEP_OUTPUT is set, cleanup()
+    // leaves the directory in place, so reusing one name made the next test's
+    // setup() delete the previous test's directory, which can fail with EBUSY
+    // on Windows.
+    await rig.setup(`bom-integration-${filename}`, {
+      settings: { tools: { core: ['read_file'] } },
+    });
     writeFileSync(join(rig.testDir!, filename), content);
     const prompt = `read the file ${filename} and output its exact contents`;
     const output = await rig.run({ args: prompt });
@@ -115,22 +119,5 @@ describe('BOM end-to-end integraion', () => {
       utf32BE('BOM_OK UTF-32BE'),
       'BOM_OK UTF-32BE',
     );
-  });
-
-  it('Can describe a PNG file', async () => {
-    const imagePath = resolve(
-      process.cwd(),
-      'docs/assets/gemini-screenshot.png',
-    );
-    const imageContent = readFileSync(imagePath);
-    const filename = 'gemini-screenshot.png';
-    writeFileSync(join(rig.testDir!, filename), imageContent);
-    const prompt = `What is shown in the image ${filename}?`;
-    const output = await rig.run({ args: prompt });
-    await rig.waitForToolCall('read_file');
-    const lower = output.toLowerCase();
-    // The response is non-deterministic, so we just check for some
-    // keywords that are very likely to be in the response.
-    expect(lower.includes('gemini')).toBeTruthy();
   });
 });

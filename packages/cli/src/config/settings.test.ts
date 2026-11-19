@@ -82,8 +82,10 @@ import {
   FatalConfigError,
   GEMINI_DIR,
   Storage,
+  AuthType,
   type MCPServerConfig,
 } from '@google/gemini-cli-core';
+import * as core from '@google/gemini-cli-core';
 import { updateSettingsFilePreservingFormat } from '../utils/commentJson.js';
 import {
   getSettingsSchema,
@@ -202,6 +204,7 @@ describe('Settings Loading and Merging', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   describe('loadSettings', () => {
@@ -257,6 +260,43 @@ describe('Settings Loading and Merging', () => {
         expect(settings.merged).toMatchObject(content);
       },
     );
+
+    it('should unconditionally override selectedType when GEMINI_CLI_AUTH_OVERRIDE is present and delete it from process.env', () => {
+      (mockFsExistsSync as Mock).mockImplementation(
+        (pathLike: fs.PathLike) =>
+          path.normalize(pathLike.toString()) ===
+          path.normalize(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (pathDesc: fs.PathOrFileDescriptor) => {
+          if (
+            path.normalize(pathDesc.toString()) ===
+            path.normalize(USER_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              security: {
+                auth: {
+                  selectedType: AuthType.USE_GEMINI,
+                },
+              },
+            });
+          }
+          return '{}';
+        },
+      );
+
+      vi.stubEnv('GEMINI_CLI_AUTH_OVERRIDE', AuthType.LOGIN_WITH_GOOGLE);
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.user.settings.security?.auth?.selectedType).toBe(
+        AuthType.LOGIN_WITH_GOOGLE,
+      );
+      expect(settings.merged.security.auth.selectedType).toBe(
+        AuthType.LOGIN_WITH_GOOGLE,
+      );
+      expect(process.env['GEMINI_CLI_AUTH_OVERRIDE']).toBeUndefined();
+    });
 
     it('should merge system, user and workspace settings, with system taking precedence over workspace, and workspace over user', () => {
       (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) => {
@@ -477,6 +517,163 @@ describe('Settings Loading and Merging', () => {
 
       const settings = loadSettings(MOCK_WORKSPACE_DIR);
       expect(settings.merged.security?.folderTrust?.enabled).toBe(false); // Workspace setting should be used
+    });
+
+    it('should resolve environment variables and cast them to correct types before validation', () => {
+      vi.stubEnv('TEST_AUTO_THEME', 'false');
+      vi.stubEnv('TEST_MAX_TURNS', '15');
+
+      (mockFsExistsSync as Mock).mockImplementation(
+        (p: fs.PathLike) =>
+          path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (
+            path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              ui: { autoThemeSwitching: '$TEST_AUTO_THEME' },
+              model: { maxSessionTurns: '$TEST_MAX_TURNS' },
+            });
+          }
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.merged.ui.autoThemeSwitching).toBe(false);
+      expect(settings.merged.model.maxSessionTurns).toBe(15);
+      expect(settings.errors).toHaveLength(0);
+    });
+
+    it('should use default values from environment variable placeholders', () => {
+      vi.stubEnv('TEST_AUTO_THEME', ''); // Should trigger default
+      delete process.env['TEST_AUTO_THEME'];
+
+      (mockFsExistsSync as Mock).mockImplementation(
+        (p: fs.PathLike) =>
+          path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (
+            path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              ui: { autoThemeSwitching: '${TEST_AUTO_THEME:-true}' },
+            });
+          }
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.merged.ui.autoThemeSwitching).toBe(true);
+      expect(settings.errors).toHaveLength(0);
+    });
+
+    it('should use default values from environment variable placeholders when variable is set but empty', () => {
+      vi.stubEnv('TEST_AUTO_THEME', '');
+
+      (mockFsExistsSync as Mock).mockImplementation(
+        (p: fs.PathLike) =>
+          path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (
+            path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              ui: { autoThemeSwitching: '${TEST_AUTO_THEME:-true}' },
+            });
+          }
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.merged.ui.autoThemeSwitching).toBe(true);
+      expect(settings.errors).toHaveLength(0);
+    });
+
+    it('should record validation errors if expansion result is invalid', () => {
+      vi.stubEnv('TEST_MAX_TURNS', 'not-a-number');
+
+      (mockFsExistsSync as Mock).mockImplementation(
+        (p: fs.PathLike) =>
+          path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (
+            path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              model: { maxSessionTurns: '$TEST_MAX_TURNS' },
+            });
+          }
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors.length).toBeGreaterThan(0);
+      expect(settings.errors[0].message).toContain(
+        'Expected number, received string',
+      );
+      // Should fall back to the expanded string value
+      expect(settings.merged.model.maxSessionTurns).toBe('not-a-number');
+    });
+
+    it('should preserve environment variable placeholders on save', () => {
+      vi.stubEnv('TEST_AUTO_THEME', 'true');
+      const placeholder = '${TEST_AUTO_THEME:-false}';
+
+      (mockFsExistsSync as Mock).mockImplementation(
+        (p: fs.PathLike) =>
+          path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (
+            path.normalize(p.toString()) === path.normalize(USER_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              ui: { autoThemeSwitching: placeholder },
+            });
+          }
+          return '{}';
+        },
+      );
+
+      // Load settings - this will expand the placeholder for runtime use
+      const loaded = loadSettings(MOCK_WORKSPACE_DIR);
+      expect(loaded.merged.ui.autoThemeSwitching).toBe(true);
+
+      // Verify that the original settings for the user scope still have the placeholder
+      const userFile = loaded.forScope(SettingScope.User);
+      expect(userFile.originalSettings.ui?.autoThemeSwitching).toBe(
+        placeholder,
+      );
+
+      // Save settings - this should use the originalSettings (with placeholders)
+      const mockUpdate = vi.mocked(updateSettingsFilePreservingFormat);
+      saveSettings(userFile);
+
+      expect(mockUpdate).toHaveBeenCalledWith(
+        USER_SETTINGS_PATH,
+        expect.objectContaining({
+          ui: expect.objectContaining({
+            autoThemeSwitching: placeholder,
+          }),
+        }),
+      );
     });
 
     it('should use system folderTrust over user setting', () => {
@@ -732,6 +929,34 @@ describe('Settings Loading and Merging', () => {
       expect(settings.merged.telemetry?.enabled).toBe(false);
     });
 
+    it('should load telemetry.otlpHeaders from settings', () => {
+      (mockFsExistsSync as Mock).mockImplementation(
+        (p: fs.PathLike) =>
+          normalizePath(p) === normalizePath(USER_SETTINGS_PATH),
+      );
+      const userSettingsContent = {
+        telemetry: {
+          enabled: true,
+          otlpHeaders: {
+            Authorization: 'Bearer test-token-value',
+            'x-custom': 'static-val',
+          },
+        },
+      };
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH))
+            return JSON.stringify(userSettingsContent);
+          return '{}';
+        },
+      );
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+      expect(settings.merged.telemetry?.otlpHeaders).toEqual({
+        Authorization: 'Bearer test-token-value',
+        'x-custom': 'static-val',
+      });
+    });
+
     it('should have telemetry as undefined if not in any settings file', () => {
       (mockFsExistsSync as Mock).mockReturnValue(false); // No settings files exist
       (fs.readFileSync as Mock).mockReturnValue('{}');
@@ -973,6 +1198,77 @@ describe('Settings Loading and Merging', () => {
       expect(settings.merged.mcp).toEqual({
         allowed: ['system-allowed'],
         excluded: ['workspace-excluded'],
+      });
+    });
+
+    describe('LoadedSettings MCP consolidation', () => {
+      it('should consolidate mcp excluded list across all scopes', () => {
+        const loaded = new LoadedSettings(
+          {
+            path: '',
+            settings: { mcp: { excluded: ['system-excluded'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { excluded: ['defaults-excluded'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { excluded: ['user-excluded'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { excluded: ['workspace-excluded'] } },
+            originalSettings: {},
+          },
+          true,
+        );
+
+        expect(loaded.getConsolidatedExcludedMcpServers()).toEqual([
+          'system-excluded',
+          'defaults-excluded',
+          'user-excluded',
+          'workspace-excluded',
+        ]);
+      });
+
+      it('should consolidate allowed mcp list via case-insensitive intersection', () => {
+        const loaded = new LoadedSettings(
+          {
+            path: '',
+            settings: { mcp: { allowed: ['Server-A', 'Server-B'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { allowed: ['server-a', 'Server-C'] } },
+            originalSettings: {},
+          },
+          { path: '', settings: {}, originalSettings: {} }, // no allowlist in user
+          {
+            path: '',
+            settings: { mcp: { allowed: ['SERVER-A', 'Server-D'] } },
+            originalSettings: {},
+          },
+          true,
+        );
+
+        expect(loaded.getConsolidatedAllowedMcpServers()).toEqual(['Server-A']);
+      });
+
+      it('should return undefined allowed list if no scopes define one', () => {
+        const loaded = new LoadedSettings(
+          { path: '', settings: {}, originalSettings: {} },
+          { path: '', settings: {}, originalSettings: {} },
+          { path: '', settings: {}, originalSettings: {} },
+          { path: '', settings: {}, originalSettings: {} },
+          true,
+        );
+
+        expect(loaded.getConsolidatedAllowedMcpServers()).toBeUndefined();
       });
     });
 
@@ -1900,6 +2196,117 @@ describe('Settings Loading and Merging', () => {
       expect(settings.merged.tools?.sandbox).toBe(false); // User setting
       expect(settings.merged.context?.fileName).toBe('USER.md'); // User setting
     });
+
+    it('should mark workspace scope as readOnly and block setValue when workspace is not trusted', () => {
+      vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
+        isTrusted: false,
+        source: 'file',
+      });
+      (mockFsExistsSync as Mock).mockReturnValue(true);
+      const workspaceSettingsContent = {
+        ui: { theme: 'dark' },
+        mcpServers: {
+          existing: { command: 'node', args: ['server.js'] },
+        },
+      };
+
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH))
+            return JSON.stringify(workspaceSettingsContent);
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.workspace.readOnly).toBe(true);
+      expect(settings.forScope(SettingScope.Workspace).readOnly).toBe(true);
+
+      expect(() => {
+        settings.setValue(SettingScope.Workspace, 'mcpServers', {
+          newsrv: { command: 'echo' },
+        });
+      }).toThrow(/Cannot modify settings in an untrusted workspace/);
+
+      expect(updateSettingsFilePreservingFormat).not.toHaveBeenCalled();
+    });
+
+    it('should restore workspace writability when setTrusted(true) is called and re-block when setTrusted(false) is called', () => {
+      vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
+        isTrusted: false,
+        source: 'file',
+      });
+      (mockFsExistsSync as Mock).mockReturnValue(true);
+      const workspaceSettingsContent = {
+        ui: { theme: 'dark' },
+        mcpServers: {
+          existing: { command: 'node', args: ['server.js'] },
+        },
+      };
+
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH))
+            return JSON.stringify(workspaceSettingsContent);
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+      expect(settings.workspace.readOnly).toBe(true);
+
+      settings.setTrusted(true);
+      expect(settings.workspace.readOnly).toBe(false);
+      expect(settings.workspace.settings).toEqual(workspaceSettingsContent);
+
+      settings.setValue(SettingScope.Workspace, 'mcpServers', {
+        ...workspaceSettingsContent.mcpServers,
+        newsrv: { command: 'echo' },
+      });
+      expect(updateSettingsFilePreservingFormat).toHaveBeenCalledWith(
+        MOCK_WORKSPACE_SETTINGS_PATH,
+        expect.objectContaining({
+          ui: { theme: 'dark' },
+          mcpServers: {
+            existing: { command: 'node', args: ['server.js'] },
+            newsrv: { command: 'echo' },
+          },
+        }),
+      );
+
+      vi.mocked(updateSettingsFilePreservingFormat).mockClear();
+      settings.setTrusted(false);
+      expect(settings.workspace.readOnly).toBe(true);
+      expect(() => {
+        settings.setValue(SettingScope.Workspace, 'ui.theme', 'light');
+      }).toThrow(/Cannot modify settings in an untrusted workspace/);
+      expect(updateSettingsFilePreservingFormat).not.toHaveBeenCalled();
+    });
+
+    it('should throw a home directory error when setValue is called on workspace scope in the home directory', () => {
+      const isWorkspaceHomeDirSpy = vi
+        .spyOn(Storage.prototype, 'isWorkspaceHomeDir')
+        .mockReturnValue(true);
+
+      try {
+        const settings = loadSettings(path.resolve('/mock/home/user'));
+
+        expect(settings.workspace.path).toBe('');
+        expect(settings.workspace.readOnly).toBe(true);
+
+        expect(() => {
+          settings.setValue(SettingScope.Workspace, 'mcpServers', {
+            newsrv: { command: 'echo' },
+          });
+        }).toThrow(
+          'Cannot modify workspace settings in the home directory. Please use user scope instead.',
+        );
+        expect(updateSettingsFilePreservingFormat).not.toHaveBeenCalled();
+      } finally {
+        isWorkspaceHomeDirSpy.mockRestore();
+      }
+    });
   });
 
   describe('loadEnvironment', () => {
@@ -1912,6 +2319,9 @@ describe('Settings Loading and Merging', () => {
       const geminiEnvPath = path.resolve(
         path.join(MOCK_WORKSPACE_DIR, GEMINI_DIR, '.env'),
       );
+      const workspaceEnvPath = path.resolve(
+        path.join(MOCK_WORKSPACE_DIR, '.env'),
+      );
 
       vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
         isTrusted: isWorkspaceTrustedValue,
@@ -1919,9 +2329,11 @@ describe('Settings Loading and Merging', () => {
       });
       (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) => {
         const normalizedP = path.resolve(p.toString());
-        return [path.resolve(USER_SETTINGS_PATH), geminiEnvPath].includes(
-          normalizedP,
-        );
+        return [
+          path.resolve(USER_SETTINGS_PATH),
+          geminiEnvPath,
+          workspaceEnvPath,
+        ].includes(normalizedP);
       });
       const userSettingsContent: Settings = {
         ui: {
@@ -1941,7 +2353,7 @@ describe('Settings Loading and Merging', () => {
           const normalizedP = path.resolve(p.toString());
           if (normalizedP === path.resolve(USER_SETTINGS_PATH))
             return JSON.stringify(userSettingsContent);
-          if (normalizedP === geminiEnvPath)
+          if (normalizedP === geminiEnvPath || normalizedP === workspaceEnvPath)
             return 'TESTTEST=1234\nGEMINI_API_KEY=test-key';
           return '{}';
         },
@@ -1970,7 +2382,7 @@ describe('Settings Loading and Merging', () => {
       expect(process.env['TESTTEST']).not.toEqual('1234');
     });
 
-    it('does load env files from untrusted spaces when NOT sandboxed', () => {
+    it('does NOT load non-whitelisted env files from untrusted spaces even when NOT sandboxed', () => {
       setup({ isFolderTrustEnabled: true, isWorkspaceTrustedValue: false });
       const settings = {
         security: { folderTrust: { enabled: true } },
@@ -1978,7 +2390,8 @@ describe('Settings Loading and Merging', () => {
       } as Settings;
       loadEnvironment(settings, MOCK_WORKSPACE_DIR, isWorkspaceTrusted);
 
-      expect(process.env['TESTTEST']).toEqual('1234');
+      expect(process.env['TESTTEST']).not.toEqual('1234');
+      expect(process.env['GEMINI_API_KEY']).toEqual('test-key');
     });
 
     it('does not load env files when trust is undefined and sandboxed', () => {
@@ -2028,6 +2441,253 @@ describe('Settings Loading and Merging', () => {
     });
   });
 
+  describe('resolving settings placeholders from .env files', () => {
+    const WORKSPACE_ENV_PATH = path.resolve(
+      path.join(MOCK_WORKSPACE_DIR, '.env'),
+    );
+
+    /**
+     * Sets up a workspace containing a project `.env` file alongside the
+     * given user and workspace settings files.
+     */
+    function setupEnvFileScenario({
+      envFileContent,
+      userSettingsContent = {},
+      workspaceSettingsContent = {},
+    }: {
+      envFileContent: string;
+      userSettingsContent?: Record<string, unknown>;
+      workspaceSettingsContent?: Record<string, unknown>;
+    }) {
+      (mockFsExistsSync as Mock).mockImplementation((p: fs.PathLike) =>
+        [
+          path.resolve(USER_SETTINGS_PATH),
+          path.resolve(MOCK_WORKSPACE_SETTINGS_PATH),
+          WORKSPACE_ENV_PATH,
+        ].includes(path.resolve(p.toString())),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          const normalizedP = path.resolve(p.toString());
+          if (normalizedP === path.resolve(USER_SETTINGS_PATH)) {
+            return JSON.stringify(userSettingsContent);
+          }
+          if (normalizedP === path.resolve(MOCK_WORKSPACE_SETTINGS_PATH)) {
+            return JSON.stringify(workspaceSettingsContent);
+          }
+          if (normalizedP === WORKSPACE_ENV_PATH) {
+            return envFileContent;
+          }
+          return '{}';
+        },
+      );
+    }
+
+    it('should resolve placeholders in settings using variables defined only in a .env file', () => {
+      setupEnvFileScenario({
+        envFileContent:
+          'GITHUB_MCP_PAT=ghp_secretTokenHere\nWORKSPACE_API_TOKEN=ws-token',
+        userSettingsContent: {
+          mcpServers: {
+            github: {
+              httpUrl: 'https://api.githubcopilot.com/mcp/',
+              headers: { Authorization: 'Bearer $GITHUB_MCP_PAT' },
+            },
+          },
+        },
+        workspaceSettingsContent: {
+          mcpServers: {
+            internal: {
+              url: 'https://internal.example.com/sse?token=${WORKSPACE_API_TOKEN}',
+            },
+          },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.merged.mcpServers?.['github']?.headers).toEqual({
+        Authorization: 'Bearer ghp_secretTokenHere',
+      });
+      expect(settings.merged.mcpServers?.['internal']?.url).toBe(
+        'https://internal.example.com/sse?token=ws-token',
+      );
+      expect(settings.user.settings.mcpServers?.['github']?.headers).toEqual({
+        Authorization: 'Bearer ghp_secretTokenHere',
+      });
+      expect(settings.workspace.settings.mcpServers?.['internal']?.url).toBe(
+        'https://internal.example.com/sse?token=ws-token',
+      );
+    });
+
+    it('should keep the unexpanded placeholders in originalSettings', () => {
+      setupEnvFileScenario({
+        envFileContent: 'GITHUB_ORIGINAL_MCP_PAT=ghp_secretTokenHere',
+        userSettingsContent: {
+          mcpServers: {
+            github: {
+              headers: { Authorization: 'Bearer $GITHUB_ORIGINAL_MCP_PAT' },
+            },
+          },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(
+        settings.user.originalSettings.mcpServers?.['github']?.headers,
+      ).toEqual({ Authorization: 'Bearer $GITHUB_ORIGINAL_MCP_PAT' });
+    });
+
+    it('should validate settings after .env variables have been resolved', () => {
+      setupEnvFileScenario({
+        envFileContent: 'MAX_TURNS_FROM_ENV_FILE=15',
+        userSettingsContent: {
+          model: { maxSessionTurns: '$MAX_TURNS_FROM_ENV_FILE' },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.merged.model.maxSessionTurns).toBe(15);
+      expect(settings.errors).toHaveLength(0);
+    });
+
+    it('should record validation warnings only once when a .env variable expands to an invalid type', () => {
+      setupEnvFileScenario({
+        envFileContent: 'INVALID_MAX_TURNS_FROM_ENV_FILE=not-a-number',
+        userSettingsContent: {
+          model: { maxSessionTurns: '$INVALID_MAX_TURNS_FROM_ENV_FILE' },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors).toHaveLength(1);
+      expect(settings.errors[0]?.severity).toBe('warning');
+    });
+
+    it('should prefer variables from the shell environment over .env files', () => {
+      vi.stubEnv('SHELL_PRECEDENCE_MCP_PAT', 'token-from-shell');
+      setupEnvFileScenario({
+        envFileContent: 'SHELL_PRECEDENCE_MCP_PAT=token-from-env-file',
+        userSettingsContent: {
+          mcpServers: {
+            github: {
+              headers: { Authorization: 'Bearer $SHELL_PRECEDENCE_MCP_PAT' },
+            },
+          },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.merged.mcpServers?.['github']?.headers).toEqual({
+        Authorization: 'Bearer token-from-shell',
+      });
+    });
+
+    it('should not resolve placeholders from a .env file in an untrusted workspace', () => {
+      vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
+        isTrusted: false,
+        source: 'file',
+      });
+      setupEnvFileScenario({
+        envFileContent: 'UNTRUSTED_MCP_PAT=ghp_secretTokenHere',
+        userSettingsContent: {
+          mcpServers: {
+            github: {
+              headers: { Authorization: 'Bearer $UNTRUSTED_MCP_PAT' },
+            },
+          },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(process.env['UNTRUSTED_MCP_PAT']).toBeUndefined();
+      expect(settings.merged.mcpServers?.['github']?.headers).toEqual({
+        Authorization: 'Bearer $UNTRUSTED_MCP_PAT',
+      });
+    });
+
+    it('should not resolve or validate workspace settings in an untrusted workspace to avoid leaking shell secrets in validation errors', () => {
+      vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
+        isTrusted: false,
+        source: 'file',
+      });
+      vi.stubEnv('SECRET_TOKEN_FROM_SHELL', 'super-secret-shell-value');
+      setupEnvFileScenario({
+        envFileContent: '',
+        workspaceSettingsContent: {
+          model: { maxSessionTurns: '$SECRET_TOKEN_FROM_SHELL' },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors).toEqual([]);
+      expect(settings.workspace.settings).toEqual({});
+
+      settings.setTrusted(true);
+
+      expect(settings.workspace.settings).toEqual({
+        model: { maxSessionTurns: 'super-secret-shell-value' },
+      });
+      expect(settings.errors).toHaveLength(1);
+    });
+
+    it('should normalize legacy theme names when an initially untrusted workspace is later trusted', () => {
+      vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
+        isTrusted: false,
+        source: 'file',
+      });
+      setupEnvFileScenario({
+        envFileContent: '',
+        workspaceSettingsContent: {
+          ui: { theme: 'VS2015' },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+      expect(settings.workspace.settings).toEqual({});
+
+      settings.setTrusted(true);
+
+      expect(settings.workspace.settings.ui?.theme).toBe('Default');
+      expect(settings.merged.ui.theme).toBe('Default');
+    });
+
+    it('should evaluate workspace trust with settings resolved from the shell environment even when other settings reference .env variables', () => {
+      // The trust check gates whether a workspace .env file may be loaded, so
+      // it must be evaluated against the environment as it exists *before*
+      // any .env file is loaded, with placeholders resolved and coerced even if
+      // another typed setting still holds an unexpanded .env placeholder.
+      vi.stubEnv('FOLDER_TRUST_FROM_SHELL', 'false');
+      setupEnvFileScenario({
+        envFileContent: 'TRUST_CHECK_MAX_TURNS=25',
+        userSettingsContent: {
+          security: { folderTrust: { enabled: '$FOLDER_TRUST_FROM_SHELL' } },
+          model: { maxSessionTurns: '$TRUST_CHECK_MAX_TURNS' },
+        },
+      });
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(isWorkspaceTrusted).toHaveBeenCalledWith(
+        expect.objectContaining({
+          security: expect.objectContaining({
+            folderTrust: expect.objectContaining({ enabled: false }),
+          }),
+        }),
+        MOCK_WORKSPACE_DIR,
+      );
+      expect(settings.merged.security.folderTrust.enabled).toBe(false);
+      expect(settings.merged.model.maxSessionTurns).toBe(25);
+      expect(settings.errors).toEqual([]);
+    });
+  });
+
   describe('migrateDeprecatedSettings', () => {
     let mockFsExistsSync: Mock;
     let mockFsReadFileSync: Mock;
@@ -2045,6 +2705,7 @@ describe('Settings Loading and Merging', () => {
     });
 
     afterEach(() => {
+      vi.unstubAllEnvs();
       vi.restoreAllMocks();
     });
 
@@ -2102,6 +2763,7 @@ describe('Settings Loading and Merging', () => {
         SettingScope.User,
         'general',
         expect.objectContaining({ enableAutoUpdate: false }),
+        expect.objectContaining({ enableAutoUpdate: false }),
       );
     });
 
@@ -2129,12 +2791,14 @@ describe('Settings Loading and Merging', () => {
         SettingScope.User,
         'general',
         expect.objectContaining({ defaultApprovalMode: 'plan' }),
+        expect.objectContaining({ defaultApprovalMode: 'plan' }),
       );
 
       // Verify removal
       expect(setValueSpy).toHaveBeenCalledWith(
         SettingScope.User,
         'tools',
+        expect.not.objectContaining({ approvalMode: 'plan' }),
         expect.not.objectContaining({ approvalMode: 'plan' }),
       );
     });
@@ -2175,10 +2839,12 @@ describe('Settings Loading and Merging', () => {
         SettingScope.User,
         'general',
         expect.objectContaining({ enableAutoUpdate: true }),
+        expect.objectContaining({ enableAutoUpdate: true }),
       );
       expect(setValueSpy).toHaveBeenCalledWith(
         SettingScope.User,
         'general',
+        expect.objectContaining({ enableAutoUpdateNotification: false }),
         expect.objectContaining({ enableAutoUpdateNotification: false }),
       );
 
@@ -2186,6 +2852,9 @@ describe('Settings Loading and Merging', () => {
       expect(setValueSpy).toHaveBeenCalledWith(
         SettingScope.User,
         'context',
+        expect.objectContaining({
+          fileFiltering: expect.objectContaining({ enableFuzzySearch: true }),
+        }),
         expect.objectContaining({
           fileFiltering: expect.objectContaining({ enableFuzzySearch: true }),
         }),
@@ -2200,12 +2869,20 @@ describe('Settings Loading and Merging', () => {
             enableLoadingPhrases: false,
           }),
         }),
+        expect.objectContaining({
+          accessibility: expect.objectContaining({
+            enableLoadingPhrases: false,
+          }),
+        }),
       );
 
       // Check that enableLoadingPhrases: false was further migrated to loadingPhrases: 'off'
       expect(setValueSpy).toHaveBeenCalledWith(
         SettingScope.User,
         'ui',
+        expect.objectContaining({
+          loadingPhrases: 'off',
+        }),
         expect.objectContaining({
           loadingPhrases: 'off',
         }),
@@ -2229,6 +2906,9 @@ describe('Settings Loading and Merging', () => {
       expect(setValueSpy).toHaveBeenCalledWith(
         SettingScope.User,
         'ui',
+        expect.objectContaining({
+          loadingPhrases: 'off',
+        }),
         expect.objectContaining({
           loadingPhrases: 'off',
         }),
@@ -2303,14 +2983,28 @@ describe('Settings Loading and Merging', () => {
       migrateDeprecatedSettings(loadedSettings);
 
       // Should remove disableAutoUpdate and trust enableAutoUpdate: true
-      expect(setValueSpy).toHaveBeenCalledWith(SettingScope.User, 'general', {
-        enableAutoUpdate: true,
-      });
+      expect(setValueSpy).toHaveBeenCalledWith(
+        SettingScope.User,
+        'general',
+        {
+          enableAutoUpdate: true,
+        },
+        {
+          enableAutoUpdate: true,
+        },
+      );
 
       // Should remove disableFuzzySearch and trust enableFuzzySearch: false
-      expect(setValueSpy).toHaveBeenCalledWith(SettingScope.User, 'context', {
-        fileFiltering: { enableFuzzySearch: false },
-      });
+      expect(setValueSpy).toHaveBeenCalledWith(
+        SettingScope.User,
+        'context',
+        {
+          fileFiltering: { enableFuzzySearch: false },
+        },
+        {
+          fileFiltering: { enableFuzzySearch: false },
+        },
+      );
     });
 
     it('should preserve deprecated settings when removeDeprecated is explicitly false', () => {
@@ -2545,6 +3239,308 @@ describe('Settings Loading and Merging', () => {
         },
       });
     });
+
+    it('should preserve ${VAR} placeholders in ui and ui.accessibility during migration while keeping runtime settings expanded', () => {
+      vi.stubEnv('TEST_THEME_NAME', 'GitHub');
+      vi.stubEnv('TEST_AUTO_THEME', 'true');
+      vi.stubEnv('TEST_SCREEN_READER', 'true');
+
+      const userSettingsContent = {
+        ui: {
+          theme: '${TEST_THEME_NAME:-Default}',
+          autoThemeSwitching: '${TEST_AUTO_THEME:-false}',
+          accessibility: {
+            disableLoadingPhrases: true,
+            screenReader: '${TEST_SCREEN_READER:-false}',
+          },
+        },
+      };
+
+      mockFsExistsSync.mockImplementation(
+        (p: fs.PathLike) =>
+          normalizePath(p) === normalizePath(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH))
+            return JSON.stringify(userSettingsContent);
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors).toEqual([]);
+
+      // Runtime settings must remain expanded and coerced
+      expect(settings.merged.ui.theme).toBe('GitHub');
+      expect(settings.merged.ui.autoThemeSwitching).toBe(true);
+      expect(settings.merged.ui.accessibility.screenReader).toBe(true);
+      expect(settings.merged.ui.accessibility.enableLoadingPhrases).toBe(false);
+      expect(settings.merged.ui.loadingPhrases).toBe('off');
+      expect(settings.user.settings.ui?.accessibility).not.toHaveProperty(
+        'disableLoadingPhrases',
+      );
+
+      // Persisted originalSettings and file writes must preserve raw ${VAR} placeholders
+      const expectedOriginalUi = {
+        theme: '${TEST_THEME_NAME:-Default}',
+        autoThemeSwitching: '${TEST_AUTO_THEME:-false}',
+        loadingPhrases: 'off',
+        accessibility: {
+          enableLoadingPhrases: false,
+          screenReader: '${TEST_SCREEN_READER:-false}',
+        },
+      };
+      expect(settings.user.originalSettings.ui).toEqual(expectedOriginalUi);
+
+      const mockUpdate = vi.mocked(updateSettingsFilePreservingFormat);
+      const userWriteCalls = mockUpdate.mock.calls.filter(
+        ([filePath]) =>
+          normalizePath(filePath) === normalizePath(USER_SETTINGS_PATH),
+      );
+      expect(userWriteCalls.length).toBeGreaterThan(0);
+      expect(userWriteCalls[userWriteCalls.length - 1]?.[1]).toEqual({
+        ui: expectedOriginalUi,
+      });
+    });
+
+    it('should preserve ${VAR} placeholders in general and context.fileFiltering migrations, including when both deprecated and new keys exist', () => {
+      vi.stubEnv('TEST_VIM_MODE', 'true');
+      vi.stubEnv('TEST_PREFERRED_EDITOR', 'vim');
+      vi.stubEnv('TEST_AUTO_UPDATE_NAG', 'false');
+      vi.stubEnv('TEST_CONTEXT_FILE', 'AGENTS.md');
+      vi.stubEnv('TEST_RESPECT_GITIGNORE', 'false');
+
+      const userSettingsContent = {
+        general: {
+          vimMode: '${TEST_VIM_MODE:-false}',
+          preferredEditor: '${TEST_PREFERRED_EDITOR:-vscode}',
+          disableAutoUpdate: true,
+          disableUpdateNag: false,
+          enableAutoUpdateNotification: '${TEST_AUTO_UPDATE_NAG:-true}',
+        },
+        context: {
+          fileName: '${TEST_CONTEXT_FILE:-GEMINI.md}',
+          fileFiltering: {
+            disableFuzzySearch: true,
+            respectGitIgnore: '${TEST_RESPECT_GITIGNORE:-true}',
+          },
+        },
+      };
+
+      mockFsExistsSync.mockImplementation(
+        (p: fs.PathLike) =>
+          normalizePath(p) === normalizePath(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH))
+            return JSON.stringify(userSettingsContent);
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors).toEqual([]);
+
+      // Runtime settings must remain expanded and coerced
+      expect(settings.merged.general.vimMode).toBe(true);
+      expect(settings.merged.general.preferredEditor).toBe('vim');
+      expect(settings.merged.general.enableAutoUpdate).toBe(false);
+      expect(settings.merged.general.enableAutoUpdateNotification).toBe(false);
+      expect(settings.merged.context.fileName).toBe('AGENTS.md');
+      expect(settings.merged.context.fileFiltering.enableFuzzySearch).toBe(
+        false,
+      );
+      expect(settings.merged.context.fileFiltering.respectGitIgnore).toBe(
+        false,
+      );
+
+      // Persisted originalSettings must retain raw ${VAR} placeholders (including on enableAutoUpdateNotification)
+      expect(settings.user.originalSettings).toEqual({
+        general: {
+          vimMode: '${TEST_VIM_MODE:-false}',
+          preferredEditor: '${TEST_PREFERRED_EDITOR:-vscode}',
+          enableAutoUpdate: false,
+          enableAutoUpdateNotification: '${TEST_AUTO_UPDATE_NAG:-true}',
+        },
+        context: {
+          fileName: '${TEST_CONTEXT_FILE:-GEMINI.md}',
+          fileFiltering: {
+            enableFuzzySearch: false,
+            respectGitIgnore: '${TEST_RESPECT_GITIGNORE:-true}',
+          },
+        },
+      });
+    });
+
+    it('should preserve ${VAR} placeholders across tools.approvalMode -> general.defaultApprovalMode cross-subtree migration', () => {
+      vi.stubEnv('TEST_VIM_MODE', 'true');
+      vi.stubEnv('TEST_APPROVAL_MODE', 'auto_edit');
+      vi.stubEnv('TEST_USE_RIPGREP', 'false');
+
+      const userSettingsContent = {
+        general: {
+          vimMode: '${TEST_VIM_MODE:-false}',
+        },
+        tools: {
+          approvalMode: '${TEST_APPROVAL_MODE:-default}',
+          useRipgrep: '${TEST_USE_RIPGREP:-true}',
+        },
+      };
+
+      mockFsExistsSync.mockImplementation(
+        (p: fs.PathLike) =>
+          normalizePath(p) === normalizePath(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH))
+            return JSON.stringify(userSettingsContent);
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors).toEqual([]);
+
+      // Runtime settings must use expanded values
+      expect(settings.merged.general.vimMode).toBe(true);
+      expect(settings.merged.general.defaultApprovalMode).toBe('auto_edit');
+      expect(settings.merged.tools.useRipgrep).toBe(false);
+      expect(settings.user.settings.tools).not.toHaveProperty('approvalMode');
+
+      // Persisted originalSettings must keep raw ${VAR} placeholders in both subtrees and on the migrated value
+      expect(settings.user.originalSettings).toEqual({
+        general: {
+          vimMode: '${TEST_VIM_MODE:-false}',
+          defaultApprovalMode: '${TEST_APPROVAL_MODE:-default}',
+        },
+        tools: {
+          useRipgrep: '${TEST_USE_RIPGREP:-true}',
+        },
+      });
+    });
+
+    it('should preserve ${VAR} placeholders across experimental settings migrations into agents.overrides and general.plan', () => {
+      vi.stubEnv('TEST_PLAN_DIR', '.gemini/plans');
+      vi.stubEnv('TEST_PLAN_MODEL_ROUTING', 'false');
+      vi.stubEnv('TEST_AUTO_MEMORY', 'true');
+      vi.stubEnv('TEST_CI_MODEL', 'gemini-2.5-pro');
+      vi.stubEnv('TEST_OTHER_MODEL', 'gemini-2.5-flash');
+
+      const userSettingsContent = {
+        general: {
+          plan: {
+            directory: '${TEST_PLAN_DIR:-plans}',
+            modelRouting: '${TEST_PLAN_MODEL_ROUTING:-true}',
+          },
+        },
+        agents: {
+          overrides: {
+            generalist: {
+              modelConfig: {
+                model: '${TEST_OTHER_MODEL:-default-model}',
+              },
+            },
+          },
+        },
+        experimental: {
+          autoMemory: '${TEST_AUTO_MEMORY:-false}',
+          plan: false,
+          codebaseInvestigatorSettings: {
+            enabled: true,
+            maxNumTurns: 12,
+            model: '${TEST_CI_MODEL:-gemini-1.5-pro}',
+          },
+          cliHelpAgentSettings: {
+            enabled: false,
+          },
+        },
+      };
+
+      mockFsExistsSync.mockImplementation(
+        (p: fs.PathLike) =>
+          normalizePath(p) === normalizePath(USER_SETTINGS_PATH),
+      );
+      (fs.readFileSync as Mock).mockImplementation(
+        (p: fs.PathOrFileDescriptor) => {
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH))
+            return JSON.stringify(userSettingsContent);
+          return '{}';
+        },
+      );
+
+      const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+      expect(settings.errors).toEqual([]);
+
+      // Runtime settings must use expanded and coerced values
+      expect(settings.merged.general.plan.directory).toBe('.gemini/plans');
+      expect(settings.merged.general.plan.modelRouting).toBe(false);
+      expect(settings.merged.general.plan.enabled).toBe(false);
+      expect(settings.merged.experimental.autoMemory).toBe(true);
+      expect(settings.user.settings.agents?.overrides).toMatchObject({
+        generalist: {
+          modelConfig: {
+            model: 'gemini-2.5-flash',
+          },
+        },
+        codebase_investigator: {
+          enabled: true,
+          runConfig: {
+            maxTurns: 12,
+          },
+          modelConfig: {
+            model: 'gemini-2.5-pro',
+          },
+        },
+        cli_help: {
+          enabled: false,
+        },
+      });
+      expect(settings.user.settings.experimental).toEqual({
+        autoMemory: true,
+      });
+
+      // Persisted originalSettings must retain raw ${VAR} placeholders everywhere
+      expect(settings.user.originalSettings).toEqual({
+        general: {
+          plan: {
+            directory: '${TEST_PLAN_DIR:-plans}',
+            modelRouting: '${TEST_PLAN_MODEL_ROUTING:-true}',
+            enabled: false,
+          },
+        },
+        agents: {
+          overrides: {
+            generalist: {
+              modelConfig: {
+                model: '${TEST_OTHER_MODEL:-default-model}',
+              },
+            },
+            codebase_investigator: {
+              enabled: true,
+              runConfig: {
+                maxTurns: 12,
+              },
+              modelConfig: {
+                model: '${TEST_CI_MODEL:-gemini-1.5-pro}',
+              },
+            },
+            cli_help: {
+              enabled: false,
+            },
+          },
+        },
+        experimental: {
+          autoMemory: '${TEST_AUTO_MEMORY:-false}',
+        },
+      });
+    });
   });
 
   describe('saveSettings', () => {
@@ -2751,6 +3747,28 @@ describe('Settings Loading and Merging', () => {
       expect(loadedSettings.merged.admin?.mcp?.config).toEqual(mcpServers);
     });
 
+    it('should map requiredMcpConfig from remote settings', () => {
+      const loadedSettings = loadSettings(MOCK_WORKSPACE_DIR);
+      const requiredMcpConfig = {
+        'corp-tool': {
+          url: 'https://mcp.corp/tool',
+          type: 'http' as const,
+          trust: true,
+        },
+      };
+
+      loadedSettings.setRemoteAdminSettings({
+        mcpSetting: {
+          mcpEnabled: true,
+          requiredMcpConfig,
+        },
+      });
+
+      expect(loadedSettings.merged.admin?.mcp?.requiredConfig).toEqual(
+        requiredMcpConfig,
+      );
+    });
+
     it('should set skills based on unmanagedCapabilitiesEnabled', () => {
       const loadedSettings = loadSettings();
       loadedSettings.setRemoteAdminSettings({
@@ -2844,6 +3862,44 @@ describe('Settings Loading and Merging', () => {
       expect(snap1).toBe(snap2);
     });
 
+    it('getSnapshot() should preserve readOnly metadata for each scope', () => {
+      const readonlySettings = new LoadedSettings(
+        {
+          path: getSystemSettingsPath(),
+          settings: {},
+          originalSettings: {},
+          readOnly: true,
+        },
+        {
+          path: getSystemDefaultsPath(),
+          settings: {},
+          originalSettings: {},
+          readOnly: true,
+        },
+        {
+          path: USER_SETTINGS_PATH,
+          settings: {},
+          originalSettings: {},
+          readOnly: false,
+        },
+        {
+          path: MOCK_WORKSPACE_SETTINGS_PATH,
+          settings: {},
+          originalSettings: {},
+          readOnly: true,
+        },
+        true,
+        [],
+      );
+
+      const snapshot = readonlySettings.getSnapshot();
+
+      expect(snapshot.system.readOnly).toBe(true);
+      expect(snapshot.systemDefaults.readOnly).toBe(true);
+      expect(snapshot.user.readOnly).toBe(false);
+      expect(snapshot.workspace.readOnly).toBe(true);
+    });
+
     it('setValue() should create a new snapshot reference and emit event', () => {
       const oldSnapshot = loadedSettings.getSnapshot();
       const oldUserRef = oldSnapshot.user.settings;
@@ -2877,6 +3933,7 @@ describe('Settings Loading and Merging', () => {
       delete process.env['CLOUD_SHELL'];
       delete process.env['MALICIOUS_VAR'];
       delete process.env['FOO'];
+      delete process.env['_GEMINI_USER_GCP_PROJECT'];
       vi.resetAllMocks();
       vi.mocked(fs.existsSync).mockReturnValue(false);
     });
@@ -3109,6 +4166,134 @@ MALICIOUS_VAR=allowed-because-trusted
         expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('cloudshell-gca');
       });
 
+      it('should not override GOOGLE_CLOUD_PROJECT in Cloud Shell when auth type is vertex-ai', () => {
+        vi.stubEnv('CLOUD_SHELL', 'true');
+        vi.stubEnv('GOOGLE_CLOUD_PROJECT', 'my-vertex-project');
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+
+        // No .env file
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-vertex-project');
+      });
+
+      it('should respect .env override for GOOGLE_CLOUD_PROJECT in Cloud Shell when auth type is vertex-ai', () => {
+        vi.stubEnv('CLOUD_SHELL', 'true');
+        vi.stubEnv('GOOGLE_CLOUD_PROJECT', 'my-vertex-project');
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: true,
+          source: 'file',
+        });
+
+        // Mock .env file to override the shell project
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        vi.mocked(fs.readFileSync).mockReturnValue(
+          'GOOGLE_CLOUD_PROJECT=env-vertex-project',
+        );
+
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('env-vertex-project');
+      });
+
+      it('should clear cloudshell-gca when switching to Vertex AI without an original project', () => {
+        process.env['CLOUD_SHELL'] = 'true';
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        // First call: normal Cloud Shell auth sets cloudshell-gca
+        loadEnvironment(
+          createMockSettings({ tools: { sandbox: false } }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('cloudshell-gca');
+
+        // Second call: user switched to Vertex AI, should remove cloudshell-gca
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBeUndefined();
+      });
+
+      it('should restore original project when switching to Vertex AI after Cloud Shell override', () => {
+        process.env['CLOUD_SHELL'] = 'true';
+        process.env['GOOGLE_CLOUD_PROJECT'] = 'my-real-project';
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        // First call: saves original to _GEMINI_USER_GCP_PROJECT, sets cloudshell-gca
+        loadEnvironment(
+          createMockSettings({ tools: { sandbox: false } }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('cloudshell-gca');
+        expect(process.env['_GEMINI_USER_GCP_PROJECT']).toBe('my-real-project');
+
+        // Second call: switching to Vertex AI should restore the saved value
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-real-project');
+      });
+
+      it('should restore project after restart when child inherits cloudshell-gca', () => {
+        // Simulate child process after restart: inherits cloudshell-gca and
+        // the saved original from the parent process.
+        process.env['CLOUD_SHELL'] = 'true';
+        process.env['GOOGLE_CLOUD_PROJECT'] = 'cloudshell-gca';
+        process.env['_GEMINI_USER_GCP_PROJECT'] = 'my-real-project';
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-real-project');
+      });
+
       it('should sanitize GOOGLE_CLOUD_PROJECT in Cloud Shell when loaded from .env in untrusted mode', () => {
         process.env['CLOUD_SHELL'] = 'true';
         process.argv = ['node', 'gemini', '-s', 'prompt'];
@@ -3129,6 +4314,892 @@ MALICIOUS_VAR=allowed-because-trusted
         expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe(
           'attacker-projectinject',
         );
+      });
+    });
+
+    describe('system configuration security', () => {
+      beforeEach(() => {
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: true,
+          source: 'file',
+        });
+      });
+
+      it('should skip system-defaults.json when insecure and record a warning', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemDefaultsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemDefaultsPath()) {
+            return JSON.stringify({
+              hooks: {
+                onSessionStart: { command: 'malicious-command.exe' },
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockReturnValue({
+          secure: false,
+          reason:
+            'Directory is insecure. User group Users has write permissions.',
+        });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.systemDefaults.settings).toEqual({});
+        expect(settings.errors).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              message: expect.stringContaining('Skipping system defaults file'),
+              severity: 'warning',
+            }),
+          ]),
+        );
+      });
+
+      it('should skip system settings.json when insecure and record a warning', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              hooks: {
+                onSessionStart: { command: 'malicious-command.exe' },
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockReturnValue({
+          secure: false,
+          reason: 'File is not owned by root (uid 0).',
+        });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.system.settings).toEqual({});
+        expect(settings.errors).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              message: expect.stringContaining('Skipping system settings file'),
+              severity: 'warning',
+            }),
+          ]),
+        );
+      });
+
+      it('should load system-defaults.json when secure', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemDefaultsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemDefaultsPath()) {
+            return JSON.stringify({
+              ui: { theme: 'corporate-theme' },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockReturnValue({
+          secure: true,
+        });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.systemDefaults.settings).toEqual({
+          ui: { theme: 'corporate-theme' },
+        });
+      });
+
+      it('should skip an insecure system settings MCP server, block user/workspace overrides, and record a warning', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) =>
+            normalizePath(p) === normalizePath(getSystemSettingsPath()) ||
+            normalizePath(p) === normalizePath(USER_SETTINGS_PATH) ||
+            normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (normalizePath(p) === normalizePath(getSystemSettingsPath())) {
+            return JSON.stringify({
+              mcp: { allowed: ['corp-mcp'] },
+              mcpServers: {
+                'corp-mcp': { command: '/opt/mcp.sh' },
+              },
+            });
+          }
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH)) {
+            return JSON.stringify({
+              mcpServers: {
+                'corp-mcp': { command: '/mock/home/user/override-mcp.sh' },
+              },
+            });
+          }
+          if (
+            normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              mcpServers: {
+                'CORP-MCP': { command: './workspace-override-mcp.sh' },
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockImplementation(
+          (targetPath) => {
+            if (targetPath === getSystemSettingsPath()) {
+              return { secure: true };
+            }
+            if (targetPath === '/opt/mcp.sh') {
+              return {
+                secure: false,
+                reason:
+                  "File '/opt/mcp.sh' is writable by group or others (mode: 100775).",
+              };
+            }
+            return { secure: true };
+          },
+        );
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(
+          settings.system.settings.mcpServers?.['corp-mcp'],
+        ).toBeUndefined();
+        expect(settings.merged.mcpServers).toEqual({});
+        expect(settings.getConsolidatedExcludedMcpServers()).toContain(
+          'corp-mcp',
+        );
+        expect(settings.errors).toEqual([
+          {
+            message: expect.stringContaining(
+              "Security Warning: Skipping MCP server 'corp-mcp' in system settings file",
+            ),
+            path: getSystemSettingsPath(),
+            severity: 'warning',
+          },
+        ]);
+        expect(settings.errors[0]?.message).toContain('/opt/mcp.sh');
+        expect(settings.errors[0]?.message).toContain(
+          'writable by group or others',
+        );
+      });
+
+      it('should skip an insecure system-defaults.json MCP server and record a warning', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemDefaultsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemDefaultsPath()) {
+            return JSON.stringify({
+              mcpServers: {
+                'default-mcp': { command: '/opt/default-mcp.sh' },
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockImplementation(
+          (targetPath) => {
+            if (targetPath === '/opt/default-mcp.sh') {
+              return {
+                secure: false,
+                reason:
+                  "File '/opt/default-mcp.sh' is not owned by root (uid 0).",
+              };
+            }
+            return { secure: true };
+          },
+        );
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.merged.mcpServers?.['default-mcp']).toBeUndefined();
+        expect(settings.getConsolidatedExcludedMcpServers()).toContain(
+          'default-mcp',
+        );
+        expect(settings.errors).toEqual([
+          {
+            message: expect.stringContaining(
+              "Security Warning: Skipping MCP server 'default-mcp' in system defaults file",
+            ),
+            path: getSystemDefaultsPath(),
+            severity: 'warning',
+          },
+        ]);
+      });
+
+      it('should load a system MCP server without warning when its command path is secure', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcp: { allowed: ['corp-mcp'] },
+              mcpServers: {
+                'corp-mcp': { command: '/opt/mcp.sh' },
+              },
+            });
+          }
+          return '';
+        });
+        const secureSpy = vi
+          .spyOn(core, 'isFileAndDirectorySecureSync')
+          .mockReturnValue({ secure: true });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(secureSpy).toHaveBeenCalledWith(
+          '/opt/mcp.sh',
+          expect.anything(),
+        );
+        expect(settings.merged.mcpServers?.['corp-mcp']).toEqual({
+          command: '/opt/mcp.sh',
+        });
+        expect(settings.errors).toEqual([]);
+      });
+
+      it('should validate interpreter script arguments and skip insecure script paths', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcpServers: {
+                'bash-script': {
+                  command: 'bash',
+                  args: ['/opt/mcp.sh'],
+                },
+                'node-script': {
+                  command: '/usr/bin/node',
+                  args: ['--no-warnings', '/opt/corp/server.mjs'],
+                },
+                'node-preload-bypass': {
+                  command: 'node',
+                  args: [
+                    '--require',
+                    '/usr/local/bin/secure-preload.js',
+                    './insecure-script.js',
+                  ],
+                },
+                'node-inline-flag-path': {
+                  command: 'node',
+                  args: [
+                    '--require=/opt/insecure-preload.js',
+                    '/usr/local/bin/secure-server.js',
+                  ],
+                },
+                'node-preload-before-eval': {
+                  command: 'node',
+                  args: [
+                    '--require',
+                    '/opt/insecure-preload.js',
+                    '-e',
+                    'process.exit(0)',
+                  ],
+                },
+                'node-inline': {
+                  command: 'node',
+                  args: ['-e', 'process.exit(0)'],
+                },
+              },
+            });
+          }
+          return '';
+        });
+        const expectedRelativeInsecure = path.resolve(
+          MOCK_WORKSPACE_DIR,
+          './insecure-script.js',
+        );
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockImplementation(
+          (targetPath) => {
+            if (
+              targetPath === '/opt/mcp.sh' ||
+              targetPath === '/opt/corp/server.mjs' ||
+              targetPath === expectedRelativeInsecure ||
+              targetPath === '/opt/insecure-preload.js'
+            ) {
+              return {
+                secure: false,
+                reason: 'File is writable by group or others.',
+              };
+            }
+            return { secure: true };
+          },
+        );
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.merged.mcpServers?.['bash-script']).toBeUndefined();
+        expect(settings.merged.mcpServers?.['node-script']).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['node-preload-bypass'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['node-inline-flag-path'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['node-preload-before-eval'],
+        ).toBeUndefined();
+        expect(settings.merged.mcpServers?.['node-inline']).toEqual({
+          command: 'node',
+          args: ['-e', 'process.exit(0)'],
+        });
+        expect(settings.errors).toHaveLength(5);
+      });
+
+      it('should resolve relative system MCP command paths against server cwd or workspaceDir', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcpServers: {
+                'rel-default-cwd': { command: './scripts/start.sh' },
+                'rel-custom-cwd': {
+                  command: './bin/run.sh',
+                  cwd: 'tools/mcp',
+                },
+                'win-drive-path': { command: 'C:\\ProgramData\\Corp\\mcp.cmd' },
+              },
+            });
+          }
+          return '';
+        });
+        const expectedDefaultResolved = path.resolve(
+          MOCK_WORKSPACE_DIR,
+          './scripts/start.sh',
+        );
+        const expectedCustomResolved = path.resolve(
+          MOCK_WORKSPACE_DIR,
+          'tools/mcp',
+          './bin/run.sh',
+        );
+        const expectedWinPath = 'C:\\ProgramData\\Corp\\mcp.cmd';
+        const secureSpy = vi
+          .spyOn(core, 'isFileAndDirectorySecureSync')
+          .mockImplementation((targetPath) => {
+            if (
+              targetPath === expectedDefaultResolved ||
+              targetPath === expectedCustomResolved ||
+              targetPath === expectedWinPath
+            ) {
+              return {
+                secure: false,
+                reason: 'File is not owned by root (uid 0).',
+              };
+            }
+            return { secure: true };
+          });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(secureSpy).toHaveBeenCalledWith(
+          expectedDefaultResolved,
+          expect.anything(),
+        );
+        expect(secureSpy).toHaveBeenCalledWith(
+          expectedCustomResolved,
+          expect.anything(),
+        );
+        expect(secureSpy).toHaveBeenCalledWith(
+          expectedWinPath,
+          expect.anything(),
+        );
+        expect(settings.merged.mcpServers).toEqual({});
+        expect(settings.errors).toHaveLength(3);
+      });
+
+      it('should skip security path checks for bare command names and remote URL MCP servers', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcp: { serverCommand: 'npx -y @corp/default-mcp' },
+              mcpServers: {
+                'bare-cmd': { command: 'npx', args: ['-y', '@corp/mcp'] },
+                'remote-sse': { url: 'https://mcp.corp.example/sse' },
+              },
+            });
+          }
+          return '';
+        });
+        const secureSpy = vi
+          .spyOn(core, 'isFileAndDirectorySecureSync')
+          .mockReturnValue({ secure: true });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(secureSpy).toHaveBeenCalledTimes(1);
+        expect(secureSpy).toHaveBeenCalledWith(
+          getSystemSettingsPath(),
+          expect.anything(),
+        );
+        expect(settings.errors).toEqual([]);
+      });
+
+      it('should skip insecure system MCP commands after env expansion and clear insecure mcp.serverCommand', () => {
+        resetSettingsCacheForTesting();
+        vi.stubEnv('CORP_MCP_ROOT', '/opt/corp-tools');
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcp: { serverCommand: '/opt/legacy-mcp.sh --stdio' },
+              mcpServers: {
+                'env-mcp': { command: '${CORP_MCP_ROOT}/start.sh' },
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockImplementation(
+          (targetPath) => {
+            if (
+              targetPath === '/opt/corp-tools/start.sh' ||
+              targetPath === '/opt/legacy-mcp.sh'
+            ) {
+              return {
+                secure: false,
+                reason: 'File is writable by group or others.',
+              };
+            }
+            return { secure: true };
+          },
+        );
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.merged.mcpServers?.['env-mcp']).toBeUndefined();
+        expect(settings.merged.mcp?.serverCommand).toBeUndefined();
+        expect(settings.errors).toHaveLength(2);
+        expect(settings.errors[0]?.message).toContain(
+          '/opt/corp-tools/start.sh',
+        );
+        expect(settings.errors[1]?.message).toContain('/opt/legacy-mcp.sh');
+      });
+
+      it('should not run system MCP command security checks on user or workspace MCP servers', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) =>
+            normalizePath(p) === normalizePath(USER_SETTINGS_PATH) ||
+            normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (normalizePath(p) === normalizePath(USER_SETTINGS_PATH)) {
+            return JSON.stringify({
+              mcpServers: {
+                'user-mcp': { command: '/mock/home/user/mcp.sh' },
+              },
+            });
+          }
+          if (
+            normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              mcpServers: {
+                'workspace-mcp': { command: './local-mcp.sh' },
+              },
+            });
+          }
+          return '';
+        });
+        const secureSpy = vi
+          .spyOn(core, 'isFileAndDirectorySecureSync')
+          .mockReturnValue({
+            secure: false,
+            reason: 'Not owned by root.',
+          });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(secureSpy).not.toHaveBeenCalled();
+        expect(settings.errors).toEqual([]);
+      });
+
+      it('should preserve workspace originalSettings on disk while still blocking skipped system MCP servers across setTrusted', () => {
+        resetSettingsCacheForTesting();
+        vi.spyOn(trustedFolders, 'isWorkspaceTrusted').mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) =>
+            normalizePath(p) === normalizePath(getSystemSettingsPath()) ||
+            normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (normalizePath(p) === normalizePath(getSystemSettingsPath())) {
+            return JSON.stringify({
+              mcp: { allowed: ['corp-mcp'] },
+              mcpServers: {
+                'corp-mcp': { command: '/opt/mcp.sh' },
+              },
+            });
+          }
+          if (
+            normalizePath(p) === normalizePath(MOCK_WORKSPACE_SETTINGS_PATH)
+          ) {
+            return JSON.stringify({
+              mcpServers: {
+                'CORP-MCP': { command: './workspace-override-mcp.sh' },
+                'keep-mcp': { command: './keep-mcp.sh' },
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockImplementation(
+          (targetPath) => {
+            if (targetPath === '/opt/mcp.sh') {
+              return {
+                secure: false,
+                reason: 'File is writable by group or others.',
+              };
+            }
+            return { secure: true };
+          },
+        );
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        // Even before folder trust is granted, getMergedSettingsAsIfTrusted must strip CORP-MCP
+        expect(settings.getMergedSettingsAsIfTrusted().mcpServers).toEqual({
+          'keep-mcp': { command: './keep-mcp.sh' },
+        });
+
+        // Granting trust interactively must still strip CORP-MCP from merged & workspace settings
+        settings.setTrusted(true);
+        expect(settings.merged.mcpServers).toEqual({
+          'keep-mcp': { command: './keep-mcp.sh' },
+        });
+        expect(settings.workspace.settings.mcpServers).toEqual({
+          'keep-mcp': { command: './keep-mcp.sh' },
+        });
+
+        // However, workspace.originalSettings MUST preserve CORP-MCP so saving does not lose user data on disk
+        expect(settings.workspace.originalSettings.mcpServers).toEqual({
+          'CORP-MCP': { command: './workspace-override-mcp.sh' },
+          'keep-mcp': { command: './keep-mcp.sh' },
+        });
+        settings.setValue(SettingScope.Workspace, 'ui.theme', 'Default');
+        expect(updateSettingsFilePreservingFormat).toHaveBeenCalledWith(
+          MOCK_WORKSPACE_SETTINGS_PATH,
+          expect.objectContaining({
+            mcpServers: {
+              'CORP-MCP': { command: './workspace-override-mcp.sh' },
+              'keep-mcp': { command: './keep-mcp.sh' },
+            },
+            ui: { theme: 'Default' },
+          }),
+        );
+      });
+
+      it('should handle malformed mcp.serverCommand gracefully without crashing startup', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcp: { serverCommand: '/opt/mcp.sh ${}' },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockReturnValue({
+          secure: true,
+        });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.merged.mcp?.serverCommand).toBeUndefined();
+        expect(settings.errors).toEqual([
+          {
+            message: expect.stringContaining(
+              'Security Warning: Skipping mcp.serverCommand in system settings file',
+            ),
+            path: getSystemSettingsPath(),
+            severity: 'warning',
+          },
+        ]);
+        expect(settings.errors[0]?.message).toContain(
+          'parse failure: Bad substitution',
+        );
+      });
+
+      it('should skip mcp.serverCommand when shell operators are present', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) => String(p) === getSystemSettingsPath(),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcp: {
+                serverCommand: '/opt/secure-mcp.sh && /opt/insecure-mcp.sh',
+              },
+            });
+          }
+          return '';
+        });
+        vi.spyOn(core, 'isFileAndDirectorySecureSync').mockReturnValue({
+          secure: true,
+        });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.merged.mcp?.serverCommand).toBeUndefined();
+        expect(settings.errors).toEqual([
+          {
+            message: expect.stringContaining(
+              'Security Warning: Skipping mcp.serverCommand in system settings file',
+            ),
+            path: getSystemSettingsPath(),
+            severity: 'warning',
+          },
+        ]);
+        expect(settings.errors[0]?.message).toContain(
+          'due to presence of shell operators',
+        );
+      });
+
+      it('should ignore non-path positional arguments on interpreter MCP commands while still validating bare script filenames', () => {
+        resetSettingsCacheForTesting();
+        vi.mocked(fs.existsSync).mockImplementation(
+          (p) =>
+            String(p) === getSystemSettingsPath() ||
+            String(p).endsWith('server.js') ||
+            String(p).endsWith('server') ||
+            String(p).endsWith(`${path.sep}env`) ||
+            String(p).endsWith(`${path.sep}node`),
+        );
+        vi.mocked(fs.readFileSync).mockImplementation((p) => {
+          if (String(p) === getSystemSettingsPath()) {
+            return JSON.stringify({
+              mcpServers: {
+                'secure-with-args': {
+                  command: 'env',
+                  args: [
+                    'NODE_ENV=production',
+                    'node',
+                    '--log-file',
+                    './app.log',
+                    '/opt/corp/server.mjs',
+                    './src',
+                    'production',
+                    '8080',
+                  ],
+                },
+                'bare-script-in-workspace': {
+                  command: 'node',
+                  args: ['--require', '/usr/local/bin/preload.js', 'local.js'],
+                },
+                'flag-value-before-script': {
+                  command: 'node',
+                  args: [
+                    '--max-old-space-size',
+                    '4096',
+                    './insecure-after-flag.js',
+                  ],
+                },
+                'non-script-path-before-script': {
+                  command: 'node',
+                  args: [
+                    '--config',
+                    './config.json',
+                    './insecure-after-config.js',
+                  ],
+                },
+                'extensionless-bare-script': {
+                  command: 'node',
+                  args: ['server'],
+                },
+                'ts-node-with-project-flag': {
+                  command: 'ts-node',
+                  args: ['-P', './tsconfig.json', './insecure-ts-server.ts'],
+                },
+                'python-warning-flag': {
+                  command: 'python3',
+                  args: ['-W', 'ignore', './insecure-py-server.py'],
+                },
+                'env-wrapper-node': {
+                  command: '/usr/bin/env',
+                  args: [
+                    '-i',
+                    'NODE_ENV=production',
+                    'node',
+                    './insecure-env-wrapped.js',
+                  ],
+                },
+                'unlisted-flag-extensionless-val': {
+                  command: 'node',
+                  args: [
+                    '--custom-mode',
+                    'nonexistent_mode',
+                    './insecure-after-mode.js',
+                  ],
+                },
+                'bare-command-script-ext': {
+                  command: 'corp-mcp.sh',
+                },
+                'boolean-short-flags': {
+                  command: 'bash',
+                  args: ['-x', './insecure-xtrace.sh'],
+                },
+                'perl-upper-eval': {
+                  command: 'perl',
+                  args: ['-E', 'say "./not-a-file.pl"'],
+                },
+                'unknown-flag-script-arg': {
+                  command: 'node',
+                  args: [
+                    '--custom-flag',
+                    '/opt/corp/secure-arg.js',
+                    './insecure-main.js',
+                  ],
+                },
+                'cmd-slash-c-bat': {
+                  command: 'cmd.exe',
+                  args: ['/c', 'C:\\opt\\mcp.bat'],
+                },
+                'cscript-nologo-vbs': {
+                  command: 'cscript',
+                  args: ['//Nologo', './insecure-wsh.vbs'],
+                },
+                'osascript-scpt': {
+                  command: 'osascript',
+                  args: ['-l', 'JavaScript', './insecure-osa.scpt'],
+                },
+              },
+            });
+          }
+          return '';
+        });
+        const secureSpy = vi
+          .spyOn(core, 'isFileAndDirectorySecureSync')
+          .mockImplementation((targetPath) => {
+            if (
+              targetPath === 'C:\\opt\\mcp.bat' ||
+              normalizePath(targetPath).startsWith(
+                normalizePath(MOCK_WORKSPACE_DIR),
+              )
+            ) {
+              return {
+                secure: false,
+                reason: 'Workspace directory is not owned by root (uid 0).',
+              };
+            }
+            return { secure: true };
+          });
+
+        const settings = loadSettings(MOCK_WORKSPACE_DIR);
+
+        expect(settings.merged.mcpServers?.['secure-with-args']).toEqual({
+          command: 'env',
+          args: [
+            'NODE_ENV=production',
+            'node',
+            '--log-file',
+            './app.log',
+            '/opt/corp/server.mjs',
+            './src',
+            'production',
+            '8080',
+          ],
+        });
+        expect(settings.merged.mcpServers?.['perl-upper-eval']).toEqual({
+          command: 'perl',
+          args: ['-E', 'say "./not-a-file.pl"'],
+        });
+        expect(
+          settings.merged.mcpServers?.['bare-script-in-workspace'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['flag-value-before-script'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['non-script-path-before-script'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['extensionless-bare-script'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['ts-node-with-project-flag'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['python-warning-flag'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['env-wrapper-node'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['unlisted-flag-extensionless-val'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['bare-command-script-ext'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['boolean-short-flags'],
+        ).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['unknown-flag-script-arg'],
+        ).toBeUndefined();
+        expect(settings.merged.mcpServers?.['cmd-slash-c-bat']).toBeUndefined();
+        expect(
+          settings.merged.mcpServers?.['cscript-nologo-vbs'],
+        ).toBeUndefined();
+        expect(settings.merged.mcpServers?.['osascript-scpt']).toBeUndefined();
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, './app.log'),
+          expect.anything(),
+        );
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, './config.json'),
+          expect.anything(),
+        );
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, './src'),
+          expect.anything(),
+        );
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, 'production'),
+          expect.anything(),
+        );
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, '8080'),
+          expect.anything(),
+        );
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, 'ignore'),
+          expect.anything(),
+        );
+        expect(secureSpy).not.toHaveBeenCalledWith(
+          path.resolve(MOCK_WORKSPACE_DIR, 'nonexistent_mode'),
+          expect.anything(),
+        );
+        expect(settings.errors).toHaveLength(14);
+        expect(settings.errors[0]?.message).toContain('local.js');
       });
     });
   });
@@ -3216,6 +5287,25 @@ describe('LoadedSettings Isolation and Serializability', () => {
       expect(userSettings.settings.mcpServers).not.toBe(
         userSettings.originalSettings.mcpServers,
       );
+    });
+
+    it('should support distinct runtime value and persisted originalValue while isolating references', () => {
+      const runtimeUi = {
+        autoThemeSwitching: true,
+        loadingPhrases: 'off',
+      };
+      const originalUi = {
+        autoThemeSwitching: '${AUTO_THEME:-false}',
+        loadingPhrases: 'off',
+      };
+
+      loadedSettings.setValue(SettingScope.User, 'ui', runtimeUi, originalUi);
+
+      const userSettings = loadedSettings.forScope(SettingScope.User);
+      expect(userSettings.settings.ui).toEqual(runtimeUi);
+      expect(userSettings.originalSettings.ui).toEqual(originalUi);
+      expect(userSettings.settings.ui).not.toBe(runtimeUi);
+      expect(userSettings.originalSettings.ui).not.toBe(originalUi);
     });
   });
 

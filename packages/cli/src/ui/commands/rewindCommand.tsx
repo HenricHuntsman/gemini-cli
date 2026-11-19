@@ -8,13 +8,13 @@ import {
   CommandKind,
   type CommandContext,
   type SlashCommand,
+  type SlashCommandActionReturn,
 } from './types.js';
 import { RewindViewer } from '../components/RewindViewer.js';
 import { type HistoryItem } from '../types.js';
 import { convertSessionToHistoryFormats } from '../hooks/useSessionBrowser.js';
 import { revertFileChanges } from '../utils/rewindFileOps.js';
 import { RewindOutcome } from '../components/RewindConfirmation.js';
-import type { Content } from '@google/genai';
 import {
   checkExhaustive,
   coreEvents,
@@ -45,7 +45,9 @@ async function rewindConversation(
   newText: string,
 ) {
   try {
-    const conversation = recordingService.rewindTo(messageId);
+    const conversation = await (recordingService.rewindToAsync
+      ? recordingService.rewindToAsync(messageId)
+      : recordingService.rewindTo(messageId));
     if (!conversation) {
       const errorMsg = 'Could not fetch conversation file';
       debugLogger.error(errorMsg);
@@ -55,13 +57,23 @@ async function rewindConversation(
     }
 
     // Convert to UI and Client formats
-    const { uiHistory } = convertSessionToHistoryFormats(conversation.messages);
-    const clientHistory = convertSessionToClientHistory(conversation.messages);
+    const messages = conversation.messages ?? [];
+    const { uiHistory } = convertSessionToHistoryFormats(messages);
+    const clientHistory = convertSessionToClientHistory(messages);
 
-    client.setHistory(clientHistory as Content[]);
+    client.setHistory(clientHistory);
+    client.clearCurrentSequenceModel?.();
 
-    // Reset context manager as we are rewinding history
-    await context.services.config?.getContextManager()?.refresh();
+    // Reset transient model availability, active model drift, and context manager as we are rewinding history
+    const config = context.services.agentContext?.config;
+    if (config) {
+      config.getModelAvailabilityService?.()?.reset();
+      const configuredModel = config.getModel?.();
+      if (configuredModel) {
+        config.setActiveModel?.(configuredModel);
+      }
+      await config.getMemoryContextManager()?.refresh();
+    }
 
     // Update UI History
     // We generate IDs based on index for the rewind history
@@ -94,7 +106,8 @@ export const rewindCommand: SlashCommand = {
   description: 'Jump back to a specific message and restart the conversation',
   kind: CommandKind.BUILT_IN,
   action: (context) => {
-    const config = context.services.config;
+    const agentContext = context.services.agentContext;
+    const config = agentContext?.config;
     if (!config)
       return {
         type: 'message',
@@ -102,7 +115,7 @@ export const rewindCommand: SlashCommand = {
         content: 'Config not found',
       };
 
-    const client = config.getGeminiClient();
+    const client = agentContext.geminiClient;
     if (!client)
       return {
         type: 'message',
@@ -118,79 +131,90 @@ export const rewindCommand: SlashCommand = {
         content: 'Recording service unavailable',
       };
 
-    const conversation = recordingService.getConversation();
-    if (!conversation)
-      return {
-        type: 'message',
-        messageType: 'info',
-        content: 'No conversation found.',
-      };
+    const buildRewindActionReturn = (
+      conversation: ReturnType<ChatRecordingService['getConversation']>,
+    ): SlashCommandActionReturn => {
+      if (!conversation)
+        return {
+          type: 'message',
+          messageType: 'info',
+          content: 'No conversation found.',
+        };
 
-    const hasUserInteractions = conversation.messages.some(
-      (msg) => msg.type === 'user',
-    );
-    if (!hasUserInteractions) {
+      const hasUserInteractions = (conversation.messages ?? []).some(
+        (msg) => msg.type === 'user',
+      );
+      if (!hasUserInteractions) {
+        return {
+          type: 'message',
+          messageType: 'info',
+          content: 'Nothing to rewind to.',
+        };
+      }
+
       return {
-        type: 'message',
-        messageType: 'info',
-        content: 'Nothing to rewind to.',
+        type: 'custom_dialog',
+        component: (
+          <RewindViewer
+            conversation={conversation}
+            onExit={() => {
+              context.ui.removeComponent();
+            }}
+            onRewind={async (messageId, newText, outcome) => {
+              if (outcome !== RewindOutcome.Cancel) {
+                logRewind(config, new RewindEvent(outcome));
+              }
+              switch (outcome) {
+                case RewindOutcome.Cancel:
+                  context.ui.removeComponent();
+                  return;
+
+                case RewindOutcome.RevertOnly:
+                  if (conversation) {
+                    await revertFileChanges(conversation, messageId);
+                  }
+                  context.ui.removeComponent();
+                  coreEvents.emitFeedback('info', 'File changes reverted.');
+                  return;
+
+                case RewindOutcome.RewindAndRevert:
+                  if (conversation) {
+                    await revertFileChanges(conversation, messageId);
+                  }
+                  await rewindConversation(
+                    context,
+                    client,
+                    recordingService,
+                    messageId,
+                    newText,
+                  );
+                  return;
+
+                case RewindOutcome.RewindOnly:
+                  await rewindConversation(
+                    context,
+                    client,
+                    recordingService,
+                    messageId,
+                    newText,
+                  );
+                  return;
+
+                default:
+                  checkExhaustive(outcome);
+              }
+            }}
+          />
+        ),
       };
+    };
+
+    if (recordingService.getConversationAsync) {
+      return recordingService
+        .getConversationAsync()
+        .then(buildRewindActionReturn);
     }
 
-    return {
-      type: 'custom_dialog',
-      component: (
-        <RewindViewer
-          conversation={conversation}
-          onExit={() => {
-            context.ui.removeComponent();
-          }}
-          onRewind={async (messageId, newText, outcome) => {
-            if (outcome !== RewindOutcome.Cancel) {
-              logRewind(config, new RewindEvent(outcome));
-            }
-            switch (outcome) {
-              case RewindOutcome.Cancel:
-                context.ui.removeComponent();
-                return;
-
-              case RewindOutcome.RevertOnly:
-                if (conversation) {
-                  await revertFileChanges(conversation, messageId);
-                }
-                context.ui.removeComponent();
-                coreEvents.emitFeedback('info', 'File changes reverted.');
-                return;
-
-              case RewindOutcome.RewindAndRevert:
-                if (conversation) {
-                  await revertFileChanges(conversation, messageId);
-                }
-                await rewindConversation(
-                  context,
-                  client,
-                  recordingService,
-                  messageId,
-                  newText,
-                );
-                return;
-
-              case RewindOutcome.RewindOnly:
-                await rewindConversation(
-                  context,
-                  client,
-                  recordingService,
-                  messageId,
-                  newText,
-                );
-                return;
-
-              default:
-                checkExhaustive(outcome);
-            }
-          }}
-        />
-      ),
-    };
+    return buildRewindActionReturn(recordingService.getConversation());
   },
 };

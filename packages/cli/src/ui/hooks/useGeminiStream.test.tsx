@@ -32,7 +32,10 @@ import type {
   Config,
   EditorType,
   AnyToolInvocation,
+  AnyDeclarativeTool,
   SpanMetadata,
+  CompletedToolCall,
+  ToolCallRequestInfo,
 } from '@google/gemini-cli-core';
 import {
   CoreToolCallStatus,
@@ -46,13 +49,23 @@ import {
   debugLogger,
   coreEvents,
   CoreEvent,
+  SHELL_TOOL_NAME,
   MCPDiscoveryState,
   GeminiCliOperation,
   getPlanModeExitMessage,
+  UPDATE_TOPIC_TOOL_NAME,
+  TRUE_EMPTY_RESPONSE_MESSAGE,
+  DEFAULT_GEMINI_FLASH_MODEL,
+  Kind,
+  LlmRole,
 } from '@google/gemini-cli-core';
 import type { Part, PartListUnion } from '@google/genai';
 import type { UseHistoryManagerReturn } from './useHistoryManager.js';
-import type { SlashCommandProcessorResult } from '../types.js';
+import type {
+  SlashCommandProcessorResult,
+  HistoryItemWithoutId,
+  HistoryItem,
+} from '../types.js';
 import { MessageType, StreamingState } from '../types.js';
 
 import type { LoadedSettings } from '../../config/settings.js';
@@ -76,6 +89,24 @@ const MockedGeminiClientClass = vi.hoisted(() =>
     this.startChat = mockStartChat;
     this.sendMessageStream = mockSendMessageStream;
     this.addHistory = vi.fn();
+    let mockHistory: any[] = [];
+    this.getHistory = vi.fn().mockImplementation(() => mockHistory);
+    this.setHistory = vi.fn().mockImplementation((newHistory: any[]) => {
+      mockHistory = [...newHistory];
+    });
+    this.discardTrailingUnansweredToolCallTurn = vi
+      .fn()
+      .mockImplementation(() => {
+        const last = mockHistory[mockHistory.length - 1];
+        if (
+          last?.role !== 'model' ||
+          !last.parts?.some((part: any) => !!part.functionCall)
+        ) {
+          return false;
+        }
+        mockHistory = mockHistory.slice(0, -1);
+        return true;
+      });
     this.generateContent = vi.fn().mockResolvedValue({
       candidates: [
         { content: { parts: [{ text: 'Got it. Focusing on tests only.' }] } },
@@ -138,7 +169,6 @@ const mockRunInDevTraceSpan = vi.hoisted(() =>
     };
     return await fn({
       metadata,
-      endSpan: vi.fn(),
     });
   }),
 );
@@ -173,11 +203,18 @@ vi.mock('./useKeypress.js', () => ({
   useKeypress: vi.fn(),
 }));
 
-vi.mock('./shellCommandProcessor.js', () => ({
-  useShellCommandProcessor: vi.fn().mockReturnValue({
+vi.mock('./useExecutionLifecycle.js', () => ({
+  useExecutionLifecycle: vi.fn().mockReturnValue({
     handleShellCommand: vi.fn(),
     activeShellPtyId: null,
     lastShellOutputTime: 0,
+    backgroundTaskCount: 0,
+    isBackgroundTaskVisible: false,
+    toggleBackgroundTasks: vi.fn(),
+    backgroundCurrentExecution: vi.fn(),
+    backgroundTasks: new Map(),
+    dismissBackgroundTask: vi.fn(),
+    registerBackgroundTask: vi.fn(),
   }),
 }));
 
@@ -187,21 +224,43 @@ vi.mock('../utils/markdownUtilities.js', () => ({
   findLastSafeSplitPoint: vi.fn((s: string) => s.length),
 }));
 
-vi.mock('./useStateAndRef.js', () => ({
-  useStateAndRef: vi.fn((initial) => {
-    let val = initial;
-    const ref = { current: val };
-    const setVal = vi.fn((updater) => {
-      if (typeof updater === 'function') {
-        val = updater(val);
-      } else {
-        val = updater;
+vi.mock('./useStateAndRef.js', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+
+  return {
+    useStateAndRef: vi.fn((initial) => {
+      // Keep the heavyweight test file lightweight, but still let
+      // `isResponding` participate in real rerenders.
+      if (initial === false) {
+        const [state, setState] = React.useState(initial);
+        const ref = React.useRef(initial);
+        const setStateInternal = (
+          updater: typeof initial | ((prev: typeof initial) => typeof initial),
+        ) => {
+          const nextValue =
+            typeof updater === 'function'
+              ? (updater as (prev: typeof initial) => typeof initial)(
+                  ref.current,
+                )
+              : updater;
+          ref.current = nextValue;
+          setState(nextValue);
+        };
+        return [state, ref, setStateInternal];
       }
-      ref.current = val;
-    });
-    return [val, ref, setVal];
-  }),
-}));
+
+      const ref = React.useRef(initial);
+      const setVal = vi.fn((updater) => {
+        if (typeof updater === 'function') {
+          ref.current = updater(ref.current);
+        } else {
+          ref.current = updater;
+        }
+      });
+      return [ref.current, ref, setVal];
+    }),
+  };
+});
 
 vi.mock('./useLogger.js', () => ({
   useLogger: vi.fn().mockReturnValue({
@@ -243,8 +302,10 @@ describe('useGeminiStream', () => {
   let mockMarkToolsAsSubmitted: Mock;
   let handleAtCommandSpy: MockInstance;
 
-  const emptyHistory: any[] = [];
-  let capturedOnComplete: any = null;
+  const emptyHistory: HistoryItem[] = [];
+  let capturedOnComplete:
+    | ((tools: CompletedToolCall[]) => Promise<void>)
+    | null = null;
   const mockGetPreferredEditor = vi.fn(() => 'vscode' as EditorType);
   const mockOnAuthError = vi.fn();
   const mockPerformMemoryRefresh = vi.fn(() => Promise.resolve());
@@ -311,7 +372,6 @@ describe('useGeminiStream', () => {
     isInteractive: () => false,
     getExperiments: () => {},
     getMaxSessionTurns: vi.fn(() => 100),
-    isJitContextEnabled: vi.fn(() => false),
     getGlobalMemory: vi.fn(() => ''),
     getUserMemory: vi.fn(() => ''),
     getMessageBus: vi.fn(() => mockMessageBus),
@@ -375,7 +435,7 @@ describe('useGeminiStream', () => {
     setValue: vi.fn(),
   } as unknown as LoadedSettings;
 
-  const renderTestHook = (
+  const renderTestHook = async (
     initialToolCalls: TrackedToolCall[] = [],
     geminiClient?: any,
     loadedSettings: LoadedSettings = mockLoadedSettings,
@@ -403,13 +463,17 @@ describe('useGeminiStream', () => {
         lastToolCalls,
         mockScheduleToolCalls,
         mockMarkToolsAsSubmitted,
-        (updater: any) => {
+        (
+          updater:
+            | TrackedToolCall[]
+            | ((prev: TrackedToolCall[]) => TrackedToolCall[]),
+        ) => {
           lastToolCalls =
             typeof updater === 'function' ? updater(lastToolCalls) : updater;
           rerender({ ...initialProps, toolCalls: lastToolCalls });
         },
-        (...args: any[]) => {
-          mockCancelAllToolCalls(...args);
+        (signal: AbortSignal) => {
+          mockCancelAllToolCalls(signal);
           lastToolCalls = lastToolCalls.map((tc) => {
             if (
               tc.status === CoreToolCallStatus.AwaitingApproval ||
@@ -436,7 +500,7 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    const { result, rerender } = renderHookWithProviders(
+    const { result, rerender } = await renderHookWithProviders(
       (props: typeof initialProps) =>
         useGeminiStream(
           props.client,
@@ -518,7 +582,7 @@ describe('useGeminiStream', () => {
   });
 
   // Helper to render hook with default parameters - reduces boilerplate
-  const renderHookWithDefaults = (
+  const renderHookWithDefaults = async (
     options: {
       shellModeActive?: boolean;
       onCancelSubmit?: () => void;
@@ -562,7 +626,7 @@ describe('useGeminiStream', () => {
     );
   };
 
-  it('should not submit tool responses if not all tool calls are completed', () => {
+  it('should not submit tool responses if not all tool calls are completed', async () => {
     const toolCalls: TrackedToolCall[] = [
       {
         request: {
@@ -617,7 +681,7 @@ describe('useGeminiStream', () => {
     ];
 
     const { mockMarkToolsAsSubmitted, mockSendMessageStream } =
-      renderTestHook(toolCalls);
+      await renderTestHook(toolCalls);
 
     // Effect for submitting tool responses depends on toolCalls and isResponding
     // isResponding is initially false, so the effect should run.
@@ -626,7 +690,7 @@ describe('useGeminiStream', () => {
     expect(mockSendMessageStream).not.toHaveBeenCalled(); // submitQuery uses this
   });
 
-  it('should expose activePtyId for non-shell executing tools that report an execution ID', () => {
+  it('should expose activePtyId for non-shell executing tools that report an execution ID', async () => {
     const remoteExecutingTool: TrackedExecutingToolCall = {
       request: {
         callId: 'remote-call-1',
@@ -651,7 +715,7 @@ describe('useGeminiStream', () => {
       pid: 4242,
     };
 
-    const { result } = renderTestHook([remoteExecutingTool]);
+    const { result } = await renderTestHook([remoteExecutingTool]);
     expect(result.current.activePtyId).toBe(4242);
   });
 
@@ -716,7 +780,16 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    renderHookWithProviders(() =>
+    mockSendMessageStream.mockReturnValue(
+      (async function* () {
+        yield {
+          type: ServerGeminiEventType.Content,
+          value: 'Visible response text',
+        };
+      })(),
+    );
+
+    await renderHookWithProviders(() =>
       useGeminiStream(
         new MockedGeminiClientClass(mockConfig),
         [],
@@ -761,7 +834,6 @@ describe('useGeminiStream', () => {
       expect.any(AbortSignal),
       'prompt-id-2',
       undefined,
-      false,
       expectedMergedResponse,
     );
   });
@@ -817,7 +889,7 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    renderHookWithProviders(() =>
+    await renderHookWithProviders(() =>
       useGeminiStream(
         new MockedGeminiClientClass(mockConfig),
         [],
@@ -876,15 +948,138 @@ describe('useGeminiStream', () => {
     const fn = spanArgs[1];
     const metadata = { attributes: {} };
     await act(async () => {
-      await fn({ metadata, endSpan: vi.fn() });
+      await fn({ metadata });
     });
     expect(metadata).toMatchObject({
       input: sentParts,
     });
   });
 
-  it('should handle all tool calls being cancelled', async () => {
+  it('should auto-nudge the model when tool execution succeeds but model stream is empty', async () => {
+    const toolCallResponseParts: Part[] = [{ text: 'tool final response' }];
+    const completedToolCalls: TrackedToolCall[] = [
+      {
+        request: {
+          callId: 'call1',
+          name: 'tool1',
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-ack',
+        },
+        status: 'success',
+        responseSubmittedToGemini: false,
+        response: {
+          callId: 'call1',
+          responseParts: toolCallResponseParts,
+          errorType: undefined,
+        },
+        tool: {
+          displayName: 'MockTool',
+        },
+        invocation: {
+          getDescription: () => `Mock description`,
+        } as unknown as AnyToolInvocation,
+      } as TrackedCompletedToolCall,
+    ];
+
+    let callCount = 0;
+    mockSendMessageStream.mockImplementation(() => {
+      callCount += 1;
+      if (callCount === 1) {
+        return (async function* () {})();
+      } else {
+        return (async function* () {
+          yield {
+            type: ServerGeminiEventType.Content,
+            value:
+              'I have analyzed the empty response. Here is the final answer.',
+          };
+        })();
+      }
+    });
+
+    let capturedOnComplete:
+      | ((completedTools: TrackedToolCall[]) => Promise<void>)
+      | null = null;
+    mockUseToolScheduler.mockImplementation((onComplete) => {
+      capturedOnComplete = onComplete;
+      return [
+        [],
+        mockScheduleToolCalls,
+        mockMarkToolsAsSubmitted,
+        vi.fn(),
+        mockCancelAllToolCalls,
+        0,
+      ];
+    });
+
+    await renderHookWithProviders(() =>
+      useGeminiStream(
+        new MockedGeminiClientClass(mockConfig),
+        [],
+        mockAddItem,
+        mockConfig,
+        mockLoadedSettings,
+        mockOnDebugMessage,
+        mockHandleSlashCommand,
+        false,
+        () => 'vscode' as EditorType,
+        () => {},
+        () => Promise.resolve(),
+        false,
+        () => {},
+        () => {},
+        () => {},
+        80,
+        24,
+        undefined,
+        () => 'focus on tests only',
+      ),
+    );
+
+    await act(async () => {
+      if (capturedOnComplete) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await capturedOnComplete(completedToolCalls);
+      }
+    });
+
+    await waitFor(() => {
+      expect(mockSendMessageStream).toHaveBeenCalledTimes(2);
+    });
+
+    const sentParts = mockSendMessageStream.mock.calls[1][0] as Part[];
+    expect(sentParts[0].text).toContain(
+      '[System: You successfully executed a tool but returned an empty response. Please analyze the tool output and explain your progress or final answer.]',
+    );
+  });
+
+  it('should handle all tool calls being cancelled by rolling back the history', async () => {
     const cancelledToolCalls: TrackedToolCall[] = [
+      {
+        request: {
+          callId: 'topic1',
+          name: UPDATE_TOPIC_TOOL_NAME,
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-3',
+        },
+        status: CoreToolCallStatus.Success,
+        response: {
+          callId: 'topic1',
+          responseParts: [
+            {
+              functionResponse: {
+                name: UPDATE_TOPIC_TOOL_NAME,
+                id: 'topic1',
+                response: {},
+              },
+            },
+          ],
+        },
+        tool: { displayName: 'Update Topic Context' },
+        invocation: { getDescription: () => 'Updating topic' },
+      } as any,
       {
         request: {
           callId: '1',
@@ -905,10 +1100,11 @@ describe('useGeminiStream', () => {
         },
         invocation: {
           getDescription: () => `Mock description`,
-        } as unknown as AnyToolInvocation,
-      } as TrackedCancelledToolCall,
+        },
+      } as any,
     ];
     const client = new MockedGeminiClientClass(mockConfig);
+    client.setHistory([{ role: 'user', parts: [{ text: 'User prompt' }] }]);
 
     // Capture the onComplete callback
     let capturedOnComplete:
@@ -927,7 +1123,7 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    renderHookWithProviders(() =>
+    const { result } = await renderHookWithProviders(() =>
       useGeminiStream(
         client,
         [],
@@ -949,6 +1145,21 @@ describe('useGeminiStream', () => {
       ),
     );
 
+    // Call submitQuery to populate the user turn
+    await act(async () => {
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      result.current.submitQuery('User prompt');
+    });
+
+    // Model issues a functionCall request, which appends to history
+    client.setHistory([
+      { role: 'user', parts: [{ text: 'User prompt' }] },
+      {
+        role: 'model',
+        parts: [{ functionCall: { name: 'testTool', args: {} } }],
+      },
+    ]);
+
     // Trigger the onComplete callback with cancelled tools
     await act(async () => {
       if (capturedOnComplete) {
@@ -959,18 +1170,358 @@ describe('useGeminiStream', () => {
     });
 
     await waitFor(() => {
-      expect(mockMarkToolsAsSubmitted).toHaveBeenCalledWith(['1']);
+      expect(mockMarkToolsAsSubmitted).toHaveBeenCalledWith(['topic1', '1']);
+      // Should NOT have appended cancellations via addHistory
+      expect(client.addHistory).not.toHaveBeenCalled();
+      // Should have rolled history back to pre-model length (1)
+      expect(client.getHistory().length).toBe(1);
+      // Ensure we do NOT call back to the API a second time (only the initial user turn was sent)
+      expect(mockSendMessageStream).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('should keep the user prompt and completed tool rounds when a later tool batch is declined', async () => {
+    const cancelledToolCalls: TrackedToolCall[] = [
+      {
+        request: {
+          callId: '2',
+          name: 'testTool',
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-4',
+        },
+        status: CoreToolCallStatus.Cancelled,
+        response: {
+          callId: '2',
+          responseParts: [{ text: CoreToolCallStatus.Cancelled }],
+          errorType: undefined,
+        },
+        responseSubmittedToGemini: false,
+        tool: {
+          displayName: 'mock tool',
+        },
+        invocation: {
+          getDescription: () => `Mock description`,
+        },
+      } as any,
+    ];
+    const client = new MockedGeminiClientClass(mockConfig);
+    const priorTurn = [
+      { role: 'user', parts: [{ text: 'Earlier prompt' }] },
+      { role: 'model', parts: [{ text: 'Earlier answer' }] },
+    ];
+    client.setHistory(priorTurn);
+    // Model the real sendMessageStream contract: the user turn is recorded in
+    // the client history when the request is sent, not before submitQuery.
+    mockSendMessageStream.mockImplementation((query: PartListUnion) => {
+      const parts = (Array.isArray(query) ? query : [query]).map((part) =>
+        typeof part === 'string' ? { text: part } : part,
+      );
+      client.setHistory([...client.getHistory(), { role: 'user', parts }]);
+      return (async function* () {
+        yield { type: ServerGeminiEventType.Content, value: 'Working on it' };
+      })();
+    });
+
+    let capturedOnComplete:
+      | ((completedTools: TrackedToolCall[]) => Promise<void>)
+      | null = null;
+
+    mockUseToolScheduler.mockImplementation((onComplete) => {
+      capturedOnComplete = onComplete;
+      return [
+        [],
+        mockScheduleToolCalls,
+        mockMarkToolsAsSubmitted,
+        vi.fn(),
+        mockCancelAllToolCalls,
+        0,
+      ];
+    });
+
+    const { result } = await renderHookWithProviders(() =>
+      useGeminiStream(
+        client,
+        [],
+        mockAddItem,
+        mockConfig,
+        mockLoadedSettings,
+        mockOnDebugMessage,
+        mockHandleSlashCommand,
+        false,
+        () => 'vscode' as EditorType,
+        () => {},
+        () => Promise.resolve(),
+        false,
+        () => {},
+        () => {},
+        () => {},
+        80,
+        24,
+      ),
+    );
+
+    // Turn 1 starts: sendMessageStream records the user prompt.
+    await act(async () => {
+      await result.current.submitQuery('User prompt');
+    });
+
+    // The model answers with a first tool call, which completes and is sent
+    // back to the model as a continuation turn.
+    const firstRoundResponse: Part[] = [
+      {
+        functionResponse: {
+          name: 'testTool',
+          id: '1',
+          response: { output: 'first result' },
+        },
+      },
+    ];
+    client.setHistory([
+      ...client.getHistory(),
+      {
+        role: 'model',
+        parts: [{ functionCall: { name: 'testTool', id: '1', args: {} } }],
+      },
+    ]);
+    await act(async () => {
+      await result.current.submitQuery(firstRoundResponse, {
+        isContinuation: true,
+      });
+    });
+
+    // The model requests a second tool call within the same chain.
+    client.setHistory([
+      ...client.getHistory(),
+      {
+        role: 'model',
+        parts: [{ functionCall: { name: 'testTool', id: '2', args: {} } }],
+      },
+    ]);
+    vi.mocked(client.setHistory).mockClear();
+
+    // The second tool call is declined.
+    await act(async () => {
+      if (capturedOnComplete) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await capturedOnComplete(cancelledToolCalls);
+      }
+    });
+
+    try {
+      await waitFor(() => {
+        expect(mockMarkToolsAsSubmitted).toHaveBeenCalledWith(['2']);
+        expect(client.addHistory).not.toHaveBeenCalled();
+        // Only the trailing unanswered call is removed, without re-setting
+        // the whole history (which would re-record every turn).
+        expect(
+          client.discardTrailingUnansweredToolCallTurn,
+        ).toHaveBeenCalledTimes(1);
+        expect(client.setHistory).not.toHaveBeenCalled();
+        // The previous turn, the user prompt and the completed first round
+        // are preserved.
+        expect(client.getHistory()).toEqual([
+          ...priorTurn,
+          { role: 'user', parts: [{ text: 'User prompt' }] },
+          {
+            role: 'model',
+            parts: [{ functionCall: { name: 'testTool', id: '1', args: {} } }],
+          },
+          { role: 'user', parts: firstRoundResponse },
+        ]);
+      });
+    } finally {
+      mockSendMessageStream.mockImplementation(() => (async function* () {})());
+    }
+  });
+
+  it('should record tool responses in history when the model was switched due to a quota error', async () => {
+    // Regression test: returning early on a quota-triggered model switch
+    // without recording the responses leaves the already-recorded
+    // functionCall unpaired, which corrupts all subsequent requests.
+    const responseParts: Part[] = [
+      {
+        functionResponse: {
+          name: 'testTool',
+          id: 'call1',
+          response: { output: 'tool result' },
+        },
+      },
+    ];
+    const completedToolCalls: TrackedToolCall[] = [
+      {
+        request: {
+          callId: 'call1',
+          name: 'testTool',
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-quota',
+        },
+        status: CoreToolCallStatus.Success,
+        responseSubmittedToGemini: false,
+        response: {
+          callId: 'call1',
+          responseParts,
+          errorType: undefined,
+        },
+        tool: { displayName: 'MockTool' },
+        invocation: {
+          getDescription: () => `Mock description`,
+        } as unknown as AnyToolInvocation,
+      } as TrackedCompletedToolCall,
+    ];
+
+    const client = new MockedGeminiClientClass(mockConfig);
+    const mockConsumeUserHint = vi.fn(() => 'switch to the nprd database');
+
+    let capturedOnComplete:
+      | ((completedTools: TrackedToolCall[]) => Promise<void>)
+      | null = null;
+
+    mockUseToolScheduler.mockImplementation((onComplete) => {
+      capturedOnComplete = onComplete;
+      return [
+        [],
+        mockScheduleToolCalls,
+        mockMarkToolsAsSubmitted,
+        vi.fn(),
+        mockCancelAllToolCalls,
+        0,
+      ];
+    });
+
+    await renderHookWithProviders(() =>
+      useGeminiStream(
+        client,
+        [],
+        mockAddItem,
+        mockConfig,
+        mockLoadedSettings,
+        mockOnDebugMessage,
+        mockHandleSlashCommand,
+        false,
+        () => 'vscode' as EditorType,
+        () => {},
+        () => Promise.resolve(),
+        true, // modelSwitchedFromQuotaError
+        () => {},
+        () => {},
+        () => {},
+        80,
+        24,
+        false,
+        mockConsumeUserHint,
+      ),
+    );
+
+    await act(async () => {
+      if (capturedOnComplete) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await capturedOnComplete(completedToolCalls);
+      }
+    });
+
+    await waitFor(() => {
+      expect(mockMarkToolsAsSubmitted).toHaveBeenCalledWith(['call1']);
+      // The tool response must be paired with its functionCall in history,
+      // with no steering-hint text ahead of it...
       expect(client.addHistory).toHaveBeenCalledWith({
         role: 'user',
-        parts: [{ text: CoreToolCallStatus.Cancelled }],
+        parts: responseParts,
       });
-      // Ensure we do NOT call back to the API
+      // ...the turn must NOT auto-continue on the fallback model...
       expect(mockSendMessageStream).not.toHaveBeenCalled();
+      // ...and the pending hint is left for the next real submit.
+      expect(mockConsumeUserHint).not.toHaveBeenCalled();
+    });
+  });
+
+  it('should NOT stop responding when only update_topic is called', async () => {
+    const topicToolCalls: TrackedToolCall[] = [
+      {
+        request: {
+          callId: 'topic1',
+          name: UPDATE_TOPIC_TOOL_NAME,
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-3',
+        },
+        status: CoreToolCallStatus.Success,
+        response: {
+          callId: 'topic1',
+          responseParts: [
+            {
+              functionResponse: {
+                name: UPDATE_TOPIC_TOOL_NAME,
+                id: 'topic1',
+                response: {},
+              },
+            },
+          ],
+        },
+        tool: { displayName: 'Update Topic Context' },
+        invocation: { getDescription: () => 'Updating topic' },
+      } as any,
+    ];
+    const client = new MockedGeminiClientClass(mockConfig);
+
+    // Capture the onComplete callback
+    let capturedOnComplete:
+      | ((completedTools: TrackedToolCall[]) => Promise<void>)
+      | null = null;
+
+    mockUseToolScheduler.mockImplementation((onComplete) => {
+      capturedOnComplete = onComplete;
+      return [
+        topicToolCalls,
+        vi.fn(),
+        mockMarkToolsAsSubmitted,
+        vi.fn(),
+        vi.fn(),
+        0,
+      ];
+    });
+
+    await renderHookWithProviders(() =>
+      useGeminiStream(
+        client,
+        [],
+        mockAddItem,
+        mockConfig,
+        mockLoadedSettings,
+        mockOnDebugMessage,
+        mockHandleSlashCommand,
+        false,
+        () => 'vscode' as EditorType,
+        () => {},
+        () => Promise.resolve(),
+        false,
+        () => {},
+        () => {},
+        () => {},
+        80,
+        24,
+      ),
+    );
+
+    // Trigger the onComplete callback with the topic tool
+    await act(async () => {
+      if (capturedOnComplete) {
+        await capturedOnComplete(topicToolCalls);
+      }
+    });
+
+    await waitFor(() => {
+      // The streaming state should still be Responding because we didn't cancel anything important
+      // and we expect a continuation.
+      expect(mockMarkToolsAsSubmitted).toHaveBeenCalledWith(['topic1']);
+      // Should HAVE called back to the API for continuation
+      expect(mockSendMessageStream).toHaveBeenCalled();
     });
   });
 
   it('should stop agent execution immediately when a tool call returns STOP_EXECUTION error', async () => {
-    const stopExecutionToolCalls: TrackedToolCall[] = [
+    const stopExecutionToolCalls: TrackedCompletedToolCall[] = [
       {
         request: {
           callId: 'stop-call',
@@ -998,7 +1549,7 @@ describe('useGeminiStream', () => {
     ];
     const client = new MockedGeminiClientClass(mockConfig);
 
-    const { result } = renderTestHook([], client);
+    const { result } = await renderTestHook([], client);
 
     // Trigger the onComplete callback with STOP_EXECUTION tool
     await act(async () => {
@@ -1042,7 +1593,7 @@ describe('useGeminiStream', () => {
   });
 
   it('should add a compact suppressed-error note before STOP_EXECUTION terminal info in low verbosity mode', async () => {
-    const stopExecutionToolCalls: TrackedToolCall[] = [
+    const stopExecutionToolCalls: TrackedCompletedToolCall[] = [
       {
         request: {
           callId: 'stop-call',
@@ -1069,6 +1620,7 @@ describe('useGeminiStream', () => {
       } as unknown as TrackedCompletedToolCall,
     ];
     const lowVerbositySettings = {
+      // eslint-disable-next-line @typescript-eslint/no-misused-spread
       ...mockLoadedSettings,
       merged: {
         ...mockLoadedSettings.merged,
@@ -1077,7 +1629,7 @@ describe('useGeminiStream', () => {
     } as LoadedSettings;
     const client = new MockedGeminiClientClass(mockConfig);
 
-    const { result } = renderTestHook([], client, lowVerbositySettings);
+    const { result } = await renderTestHook([], client, lowVerbositySettings);
 
     await act(async () => {
       if (capturedOnComplete) {
@@ -1112,7 +1664,7 @@ describe('useGeminiStream', () => {
     expect(noteIndex).toBeLessThan(stopIndex);
   });
 
-  it('should group multiple cancelled tool call responses into a single history entry', async () => {
+  it('should rollback multiple cancelled tool calls rather than appending them to history', async () => {
     const cancelledToolCall1: TrackedCancelledToolCall = {
       request: {
         callId: 'cancel-1',
@@ -1173,6 +1725,7 @@ describe('useGeminiStream', () => {
     };
     const allCancelledTools = [cancelledToolCall1, cancelledToolCall2];
     const client = new MockedGeminiClientClass(mockConfig);
+    client.setHistory([{ role: 'user', parts: [{ text: 'User prompt' }] }]);
 
     let capturedOnComplete:
       | ((completedTools: TrackedToolCall[]) => Promise<void>)
@@ -1190,7 +1743,7 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    renderHookWithProviders(() =>
+    const { result } = await renderHookWithProviders(() =>
       useGeminiStream(
         client,
         [],
@@ -1212,6 +1765,18 @@ describe('useGeminiStream', () => {
       ),
     );
 
+    // Call submitQuery to populate the user turn
+    await act(async () => {
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      result.current.submitQuery('User prompt');
+    });
+
+    // Model issues model turns, which appends to history
+    client.setHistory([
+      { role: 'user', parts: [{ text: 'User prompt' }] },
+      { role: 'model', parts: [{ functionCall: { name: 'toolA', args: {} } }] },
+    ]);
+
     // Trigger the onComplete callback with multiple cancelled tools
     await act(async () => {
       if (capturedOnComplete) {
@@ -1228,20 +1793,14 @@ describe('useGeminiStream', () => {
         'cancel-2',
       ]);
 
-      // Crucially, addHistory should be called only ONCE
-      expect(client.addHistory).toHaveBeenCalledTimes(1);
+      // Crucially, addHistory should NOT be called
+      expect(client.addHistory).not.toHaveBeenCalled();
 
-      // And that single call should contain BOTH function responses
-      expect(client.addHistory).toHaveBeenCalledWith({
-        role: 'user',
-        parts: [
-          ...cancelledToolCall1.response.responseParts,
-          ...cancelledToolCall2.response.responseParts,
-        ],
-      });
+      // Instead, history should be rolled back to pre-model length (1)
+      expect(client.getHistory().length).toBe(1);
 
       // No message should be sent back to the API for a turn with only cancellations
-      expect(mockSendMessageStream).not.toHaveBeenCalled();
+      expect(mockSendMessageStream).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1307,7 +1866,7 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    const { result, rerender } = renderHookWithProviders(() =>
+    const { result, rerender } = await renderHookWithProviders(() =>
       useGeminiStream(
         new MockedGeminiClientClass(mockConfig),
         [],
@@ -1370,7 +1929,6 @@ describe('useGeminiStream', () => {
         expect.any(AbortSignal),
         'prompt-id-4',
         undefined,
-        false,
         toolCallResponseParts,
       );
     });
@@ -1408,7 +1966,7 @@ describe('useGeminiStream', () => {
       })();
       mockSendMessageStream.mockReturnValue(mockStream);
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       // Start a query
       await act(async () => {
@@ -1445,7 +2003,7 @@ describe('useGeminiStream', () => {
       })();
       mockSendMessageStream.mockReturnValue(mockStream);
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           mockConfig.getGeminiClient(),
           [],
@@ -1475,7 +2033,7 @@ describe('useGeminiStream', () => {
 
       simulateEscapeKeyPress();
 
-      expect(cancelSubmitSpy).toHaveBeenCalledWith(false);
+      expect(cancelSubmitSpy).toHaveBeenCalledWith(false, false);
     });
 
     it('should call setShellInputFocused(false) when escape is pressed', async () => {
@@ -1486,7 +2044,7 @@ describe('useGeminiStream', () => {
       })();
       mockSendMessageStream.mockReturnValue(mockStream);
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           mockConfig.getGeminiClient(),
           [],
@@ -1519,8 +2077,8 @@ describe('useGeminiStream', () => {
       expect(setShellInputFocusedSpy).toHaveBeenCalledWith(false);
     });
 
-    it('should not do anything if escape is pressed when not responding', () => {
-      const { result } = renderTestHook();
+    it('should not do anything if escape is pressed when not responding', async () => {
+      const { result } = await renderTestHook();
 
       expect(result.current.streamingState).toBe(StreamingState.Idle);
 
@@ -1533,6 +2091,54 @@ describe('useGeminiStream', () => {
           text: 'Request cancelled.',
         }),
       );
+    });
+
+    it('should not cancel an ongoing stream on escape when isEditorDialogOpen is true', async () => {
+      const cancelSubmitSpy = vi.fn();
+      const mockStream = (async function* () {
+        yield { type: 'content', value: 'Part 1' };
+        await new Promise(() => {});
+      })();
+      mockSendMessageStream.mockReturnValue(mockStream);
+
+      const { result } = await renderHookWithProviders(() =>
+        useGeminiStream(
+          mockConfig.getGeminiClient(),
+          [],
+          mockAddItem,
+          mockConfig,
+          mockLoadedSettings,
+          mockOnDebugMessage,
+          mockHandleSlashCommand,
+          false,
+          () => 'vscode' as EditorType,
+          () => {},
+          () => Promise.resolve(),
+          false,
+          () => {},
+          cancelSubmitSpy,
+          () => {},
+          80,
+          24,
+          false,
+          undefined,
+          true, // isEditorDialogOpen = true
+        ),
+      );
+
+      await act(async () => {
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        result.current.submitQuery('test query');
+      });
+
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      simulateEscapeKeyPress();
+
+      expect(cancelSubmitSpy).not.toHaveBeenCalled();
+      expect(result.current.streamingState).toBe(StreamingState.Responding);
     });
 
     it('should prevent further processing after cancellation', async () => {
@@ -1548,7 +2154,7 @@ describe('useGeminiStream', () => {
       })();
       mockSendMessageStream.mockReturnValue(mockStream);
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         // eslint-disable-next-line @typescript-eslint/no-floating-promises
@@ -1600,7 +2206,7 @@ describe('useGeminiStream', () => {
         } as TrackedExecutingToolCall,
       ];
 
-      const { result } = renderTestHook(toolCalls);
+      const { result } = await renderTestHook(toolCalls);
 
       // State is `Responding` because a tool is running
       expect(result.current.streamingState).toBe(StreamingState.Responding);
@@ -1610,6 +2216,120 @@ describe('useGeminiStream', () => {
 
       // The cancel function should be called
       expect(mockCancelAllToolCalls).toHaveBeenCalled();
+    });
+
+    it('should transition to Idle state when cancelled while a tool call is in progress and completes', async () => {
+      const toolCalls: TrackedToolCall[] = [
+        {
+          request: { callId: 'call1', name: 'tool1', args: {} },
+          status: CoreToolCallStatus.Executing,
+          responseSubmittedToGemini: false,
+          tool: {
+            name: 'tool1',
+            description: 'desc1',
+            build: vi.fn().mockImplementation((_) => ({
+              getDescription: () => `Mock description`,
+            })),
+          } as any,
+          invocation: {
+            getDescription: () => `Mock description`,
+          },
+          startTime: Date.now(),
+          liveOutput: '...',
+        } as TrackedExecutingToolCall,
+      ];
+
+      const { result } = await renderTestHook(toolCalls);
+
+      // State is `Responding` because a tool is running
+      expect(result.current.streamingState).toBe(StreamingState.Responding);
+
+      // Try to cancel
+      simulateEscapeKeyPress();
+
+      // Trigger the onComplete callback with the cancelled tool call
+      await act(async () => {
+        if (capturedOnComplete) {
+          await capturedOnComplete([
+            {
+              ...toolCalls[0],
+              status: CoreToolCallStatus.Cancelled,
+              response: {
+                callId: 'call1',
+                responseParts: [],
+              },
+            } as any,
+          ]);
+        }
+      });
+
+      // The final state should be idle because the cancelled tool call was marked as submitted
+      expect(result.current.streamingState).toBe(StreamingState.Idle);
+    });
+
+    it('should append cancelled tool responses to history when cancelled while a tool call is in progress and completes with response parts', async () => {
+      const toolCalls: TrackedToolCall[] = [
+        {
+          request: { callId: 'call1', name: 'tool1', args: {} },
+          status: CoreToolCallStatus.Executing,
+          responseSubmittedToGemini: false,
+          tool: {
+            name: 'tool1',
+            description: 'desc1',
+            build: vi.fn().mockImplementation((_) => ({
+              getDescription: () => `Mock description`,
+            })),
+          } as any,
+          invocation: {
+            getDescription: () => `Mock description`,
+          },
+          startTime: Date.now(),
+          liveOutput: '...',
+        } as TrackedExecutingToolCall,
+      ];
+
+      const { result, client } = await renderTestHook(toolCalls);
+
+      // State is `Responding` because a tool is running
+      expect(result.current.streamingState).toBe(StreamingState.Responding);
+
+      // Try to cancel
+      simulateEscapeKeyPress();
+
+      const expectedResponseParts = [
+        {
+          functionResponse: {
+            name: 'tool1',
+            id: 'call1',
+            response: { error: 'cancelled' },
+          },
+        },
+      ];
+
+      // Trigger the onComplete callback with the cancelled tool call having non-empty response parts
+      await act(async () => {
+        if (capturedOnComplete) {
+          await capturedOnComplete([
+            {
+              ...toolCalls[0],
+              status: CoreToolCallStatus.Cancelled,
+              response: {
+                callId: 'call1',
+                responseParts: expectedResponseParts,
+              },
+            } as any,
+          ]);
+        }
+      });
+
+      // Assert that addHistory was called with the combined response parts
+      expect(client.addHistory).toHaveBeenCalledWith({
+        role: 'user',
+        parts: expectedResponseParts,
+      });
+
+      // The final state should be idle because the cancelled tool call was marked as submitted
+      expect(result.current.streamingState).toBe(StreamingState.Idle);
     });
 
     it('should cancel a request when a tool is awaiting confirmation', async () => {
@@ -1648,7 +2368,7 @@ describe('useGeminiStream', () => {
         } as TrackedWaitingToolCall,
       ];
 
-      const { result } = renderTestHook(toolCalls);
+      const { result } = await renderTestHook(toolCalls);
 
       // State is `WaitingForConfirmation` because a tool is awaiting approval
       expect(result.current.streamingState).toBe(
@@ -1673,11 +2393,237 @@ describe('useGeminiStream', () => {
       // The final state should be idle
       expect(result.current.streamingState).toBe(StreamingState.Idle);
     });
+
+    it('should not auto-nudge or schedule follow-up tools when cancelled during a continuation stream', async () => {
+      // Simulate real GeminiClient.sendMessageStream behavior when aborted:
+      // Turn 1 (initial user prompt): requests SearchText tools
+      // Turn 2 (continuation with SearchText results): waits for model, then when signal aborts, yields UserCancelled and ends
+      // Turn 3 (erroneous auto-nudge after cancellation): model emits Shell tool calls (git status, git worktree list)
+      let turnNumber = 0;
+      mockSendMessageStream.mockImplementation(
+        (_query: PartListUnion, signal: AbortSignal) => {
+          turnNumber += 1;
+          const currentTurn = turnNumber;
+          return (async function* () {
+            if (currentTurn === 1) {
+              yield {
+                type: ServerGeminiEventType.ToolCallRequest,
+                value: {
+                  callId: 'search-1',
+                  name: 'grep_search',
+                  args: { pattern: '@tools', dir_path: 'docs' },
+                  isClientInitiated: false,
+                  prompt_id: 'prompt-1',
+                },
+              };
+              yield {
+                type: ServerGeminiEventType.ToolCallRequest,
+                value: {
+                  callId: 'search-2',
+                  name: 'grep_search',
+                  args: { pattern: 'tools', dir_path: 'packages/cli/src' },
+                  isClientInitiated: false,
+                  prompt_id: 'prompt-1',
+                },
+              };
+              return;
+            }
+
+            if (currentTurn === 2) {
+              // Wait until the user presses Escape (which aborts `signal`)
+              await new Promise<void>((resolve) => {
+                if (signal.aborted) {
+                  resolve();
+                  return;
+                }
+                signal.addEventListener('abort', () => resolve(), {
+                  once: true,
+                });
+              });
+              // Real Turn.run yields UserCancelled and terminates when signal is aborted
+              yield { type: ServerGeminiEventType.UserCancelled };
+              return;
+            }
+
+            // Turn 3+: if auto-nudge erroneously fires after cancellation, model schedules Shell git status / git worktree list
+            yield {
+              type: ServerGeminiEventType.ToolCallRequest,
+              value: {
+                callId: 'shell-1',
+                name: 'run_shell_command',
+                args: { command: 'git status' },
+                isClientInitiated: false,
+                prompt_id: 'prompt-1',
+              },
+            };
+            yield {
+              type: ServerGeminiEventType.ToolCallRequest,
+              value: {
+                callId: 'shell-2',
+                name: 'run_shell_command',
+                args: { command: 'git worktree list' },
+                isClientInitiated: false,
+                prompt_id: 'prompt-1',
+              },
+            };
+          })();
+        },
+      );
+
+      handleAtCommandSpy.mockResolvedValue({
+        processedQuery: [
+          {
+            text: 'explain @tools',
+          },
+        ],
+      });
+
+      const { result } = await renderTestHook();
+
+      // 1. User submits `explain @tools/`
+      await act(async () => {
+        await result.current.submitQuery('explain @tools/');
+      });
+
+      expect(mockScheduleToolCalls).toHaveBeenCalledTimes(1);
+
+      // 2. The two SearchText tools complete and trigger continuation turn (Turn 2)
+      const completedSearchTools: TrackedCompletedToolCall[] = [
+        {
+          request: {
+            callId: 'search-1',
+            name: 'grep_search',
+            args: { pattern: '@tools', dir_path: 'docs' },
+            isClientInitiated: false,
+            prompt_id: 'prompt-1',
+          },
+          status: CoreToolCallStatus.Success,
+          responseSubmittedToGemini: false,
+          response: {
+            callId: 'search-1',
+            responseParts: [{ text: 'No matches found' }],
+            resultDisplay: 'No matches found',
+            error: undefined,
+            errorType: undefined,
+          },
+          tool: {
+            name: 'grep_search',
+            displayName: 'SearchText',
+          } as any,
+          invocation: {
+            getDescription: () => "'@tools' within docs",
+          } as any,
+        },
+        {
+          request: {
+            callId: 'search-2',
+            name: 'grep_search',
+            args: { pattern: 'tools', dir_path: 'packages/cli/src' },
+            isClientInitiated: false,
+            prompt_id: 'prompt-1',
+          },
+          status: CoreToolCallStatus.Success,
+          responseSubmittedToGemini: false,
+          response: {
+            callId: 'search-2',
+            responseParts: [{ text: 'Found 100 matches (limited)' }],
+            resultDisplay: 'Found 100 matches (limited)',
+            error: undefined,
+            errorType: undefined,
+          },
+          tool: {
+            name: 'grep_search',
+            displayName: 'SearchText',
+          } as any,
+          invocation: {
+            getDescription: () => "'tools' in *.ts* within packages/cli/src",
+          } as any,
+        },
+      ];
+
+      await act(async () => {
+        if (capturedOnComplete) {
+          void capturedOnComplete(completedSearchTools);
+        }
+      });
+
+      await waitFor(() => {
+        expect(mockSendMessageStream).toHaveBeenCalledTimes(2);
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      // 3. User presses Escape while Turn 2 continuation stream is in flight
+      simulateEscapeKeyPress();
+
+      // Let microtasks settle
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      // Verify "Request cancelled." was added to history
+      expect(mockAddItem).toHaveBeenCalledWith({
+        type: MessageType.INFO,
+        text: 'Request cancelled.',
+      });
+
+      // Assert that cancellation actually stopped execution:
+      // Turn 3 (auto-nudge) must NOT have been sent, and Shell tools must NOT have been scheduled!
+      expect(mockSendMessageStream).toHaveBeenCalledTimes(2);
+      expect(mockScheduleToolCalls).toHaveBeenCalledTimes(1);
+      expect(result.current.streamingState).toBe(StreamingState.Idle);
+    });
+
+    it('should not schedule queued tool calls when stream is cancelled after yielding ToolCallRequest', async () => {
+      mockSendMessageStream.mockImplementation(
+        (_query: PartListUnion, signal: AbortSignal) =>
+          (async function* () {
+            yield {
+              type: ServerGeminiEventType.ToolCallRequest,
+              value: {
+                callId: 'queued-shell-1',
+                name: 'run_shell_command',
+                args: { command: 'git status' },
+                isClientInitiated: false,
+                prompt_id: 'prompt-cancel-after-tool-req',
+              },
+            };
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) {
+                resolve();
+                return;
+              }
+              signal.addEventListener('abort', () => resolve(), {
+                once: true,
+              });
+            });
+            yield { type: ServerGeminiEventType.UserCancelled };
+          })(),
+      );
+
+      const { result } = await renderTestHook();
+
+      await act(async () => {
+        void result.current.submitQuery('run git status');
+      });
+
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      simulateEscapeKeyPress();
+
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+
+      expect(mockScheduleToolCalls).not.toHaveBeenCalled();
+      expect(result.current.streamingState).toBe(StreamingState.Idle);
+    });
   });
 
   describe('Retry Handling', () => {
-    it('should update retryStatus when CoreEvent.RetryAttempt is emitted', async () => {
-      const { result } = renderHookWithDefaults();
+    it('should ignore retryStatus updates when not responding', async () => {
+      const { result } = await renderHookWithDefaults();
 
       const retryPayload = {
         model: 'gemini-2.5-pro',
@@ -1690,17 +2636,19 @@ describe('useGeminiStream', () => {
         coreEvents.emit(CoreEvent.RetryAttempt, retryPayload);
       });
 
-      expect(result.current.retryStatus).toEqual(retryPayload);
+      expect(result.current.retryStatus).toBeNull();
     });
 
     it('should reset retryStatus when isResponding becomes false', async () => {
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       const retryPayload = {
         model: 'gemini-2.5-pro',
         attempt: 2,
         maxAttempts: 3,
         delayMs: 1000,
+        role: LlmRole.MAIN,
+        promptId: 'test-session-id########5',
       };
 
       // Start a query to make isResponding true
@@ -1711,8 +2659,7 @@ describe('useGeminiStream', () => {
       mockSendMessageStream.mockReturnValue(mockStream);
 
       await act(async () => {
-        // eslint-disable-next-line @typescript-eslint/no-floating-promises
-        result.current.submitQuery('test query');
+        void result.current.submitQuery('test query');
       });
 
       await waitFor(() => {
@@ -1728,9 +2675,232 @@ describe('useGeminiStream', () => {
 
       // Cancel to make isResponding false
       await act(async () => {
-        result.current.cancelOngoingRequest();
+        await result.current.cancelOngoingRequest();
       });
 
+      expect(result.current.retryStatus).toBeNull();
+    });
+
+    it('should ignore late retry events after cancellation', async () => {
+      const { result } = await renderTestHook();
+      const retryPayload = {
+        model: 'gemini-2.5-pro',
+        attempt: 2,
+        maxAttempts: 3,
+        delayMs: 1000,
+        role: LlmRole.MAIN,
+        promptId: 'test-session-id########5',
+      };
+      const lateRetryPayload = {
+        model: 'gemini-2.5-pro',
+        attempt: 3,
+        maxAttempts: 3,
+        delayMs: 2000,
+        role: LlmRole.MAIN,
+        promptId: 'test-session-id########5',
+      };
+
+      const mockStream = (async function* () {
+        yield { type: ServerGeminiEventType.Content, value: 'Part 1' };
+        await new Promise(() => {}); // Keep stream open
+      })();
+      mockSendMessageStream.mockReturnValue(mockStream);
+
+      await act(async () => {
+        void result.current.submitQuery('test query');
+      });
+
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, retryPayload);
+      });
+
+      expect(result.current.retryStatus).toEqual(retryPayload);
+
+      await act(async () => {
+        await result.current.cancelOngoingRequest();
+      });
+
+      await waitFor(() => {
+        expect(result.current.retryStatus).toBeNull();
+      });
+
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, lateRetryPayload);
+      });
+
+      expect(result.current.retryStatus).toBeNull();
+    });
+
+    it('should ignore background subagent/utility retries and stale-prompt retries while accepting active main prompt retries', async () => {
+      const { result } = await renderTestHook();
+
+      let resolvePromptA!: () => void;
+      const streamA = (async function* () {
+        yield { type: ServerGeminiEventType.Content, value: 'Prompt A start' };
+        await new Promise<void>((resolve) => {
+          resolvePromptA = resolve;
+        });
+      })();
+      mockSendMessageStream.mockReturnValueOnce(streamA);
+
+      await act(async () => {
+        void result.current.submitQuery('prompt A', undefined, 'prompt-A');
+      });
+
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      // 1. Background subagent retry during Prompt A should be ignored
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, {
+          model: 'gemini-2.5-flash',
+          attempt: 1,
+          maxAttempts: 5,
+          delayMs: 1000,
+          role: LlmRole.SUBAGENT,
+          promptId: 'prompt-A',
+        });
+      });
+      expect(result.current.retryStatus).toBeNull();
+
+      // 2. Utility router retry sharing Prompt A's promptId should be ignored
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, {
+          model: 'gemini-2.5-flash-lite',
+          attempt: 1,
+          maxAttempts: 2,
+          delayMs: 1000,
+          role: LlmRole.UTILITY_ROUTER,
+          promptId: 'prompt-A',
+        });
+      });
+      expect(result.current.retryStatus).toBeNull();
+
+      // 3. Active MAIN retry for Prompt A is accepted
+      const activeMainRetryA = {
+        model: 'gemini-2.5-pro',
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 1000,
+        role: LlmRole.MAIN,
+        promptId: 'prompt-A',
+      };
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, activeMainRetryA);
+      });
+      expect(result.current.retryStatus).toEqual(activeMainRetryA);
+
+      // Finish Prompt A and start Prompt B
+      await act(async () => {
+        resolvePromptA();
+      });
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Idle);
+      });
+
+      const streamB = (async function* () {
+        yield { type: ServerGeminiEventType.Content, value: 'Prompt B start' };
+        await new Promise(() => {});
+      })();
+      mockSendMessageStream.mockReturnValueOnce(streamB);
+
+      await act(async () => {
+        void result.current.submitQuery('prompt B', undefined, 'prompt-B');
+      });
+
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      // 4. Late MAIN retry callback from Prompt A delivered while Prompt B is active should be ignored
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, {
+          model: 'gemini-2.5-pro',
+          attempt: 2,
+          maxAttempts: 3,
+          delayMs: 2000,
+          role: LlmRole.MAIN,
+          promptId: 'prompt-A',
+        });
+      });
+      expect(result.current.retryStatus).toBeNull();
+    });
+
+    it('should clear stale retryStatus on successful Thought and ToolCallRequest activity before any Content event', async () => {
+      const { result } = await renderTestHook();
+
+      let yieldThought!: () => void;
+      let yieldToolCall!: () => void;
+      const mockStream = (async function* () {
+        await new Promise<void>((resolve) => {
+          yieldThought = resolve;
+        });
+        yield {
+          type: ServerGeminiEventType.Thought,
+          value: { subject: 'Planning', description: 'Thinking...' },
+        };
+        await new Promise<void>((resolve) => {
+          yieldToolCall = resolve;
+        });
+        yield {
+          type: ServerGeminiEventType.ToolCallRequest,
+          value: {
+            callId: 'call-1',
+            name: 'read_file',
+            args: { file_path: 'test.txt' },
+            isClientInitiated: false,
+            prompt_id: 'prompt-A',
+          },
+        };
+        await new Promise(() => {});
+      })();
+      mockSendMessageStream.mockReturnValue(mockStream);
+
+      await act(async () => {
+        void result.current.submitQuery('test query', undefined, 'prompt-A');
+      });
+
+      await waitFor(() => {
+        expect(result.current.streamingState).toBe(StreamingState.Responding);
+      });
+
+      const activeRetry = {
+        model: 'gemini-2.5-pro',
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 1000,
+        role: LlmRole.MAIN,
+        promptId: 'prompt-A',
+      };
+
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, activeRetry);
+      });
+      expect(result.current.retryStatus).toEqual(activeRetry);
+
+      // Model succeeds and emits a Thought chunk -> should clear retryStatus
+      await act(async () => {
+        yieldThought();
+      });
+      await waitFor(() => {
+        expect(result.current.thought?.subject).toBe('Planning');
+      });
+      expect(result.current.retryStatus).toBeNull();
+
+      // Re-emit retry and then emit ToolCallRequest -> should also clear retryStatus
+      await act(async () => {
+        coreEvents.emit(CoreEvent.RetryAttempt, activeRetry);
+      });
+      expect(result.current.retryStatus).toEqual(activeRetry);
+
+      await act(async () => {
+        yieldToolCall();
+      });
       expect(result.current.retryStatus).toBeNull();
     });
   });
@@ -1739,23 +2909,23 @@ describe('useGeminiStream', () => {
     it('should schedule a tool call when the command processor returns a schedule_tool action', async () => {
       const clientToolRequest: SlashCommandProcessorResult = {
         type: 'schedule_tool',
-        toolName: 'save_memory',
-        toolArgs: { fact: 'test fact' },
+        toolName: 'activate_skill',
+        toolArgs: { name: 'test-skill' },
       };
       mockHandleSlashCommand.mockResolvedValue(clientToolRequest);
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
-        await result.current.submitQuery('/memory add "test fact"');
+        await result.current.submitQuery('/memory show');
       });
 
       await waitFor(() => {
         expect(mockScheduleToolCalls).toHaveBeenCalledWith(
           [
             expect.objectContaining({
-              name: 'save_memory',
-              args: { fact: 'test fact' },
+              name: 'activate_skill',
+              args: { name: 'test-skill' },
               isClientInitiated: true,
             }),
           ],
@@ -1771,7 +2941,7 @@ describe('useGeminiStream', () => {
       };
       mockHandleSlashCommand.mockResolvedValue(uiOnlyCommandResult);
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('/help');
@@ -1792,7 +2962,7 @@ describe('useGeminiStream', () => {
       mockHandleSlashCommand.mockResolvedValue(customCommandResult);
 
       const { result, mockSendMessageStream: localMockSendMessageStream } =
-        renderTestHook();
+        await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('/my-custom-command');
@@ -1814,7 +2984,6 @@ describe('useGeminiStream', () => {
           expect.any(AbortSignal),
           expect.any(String),
           undefined,
-          false,
           '/my-custom-command',
         );
 
@@ -1830,7 +2999,7 @@ describe('useGeminiStream', () => {
       mockHandleSlashCommand.mockResolvedValue(emptyPromptResult);
 
       const { result, mockSendMessageStream: localMockSendMessageStream } =
-        renderTestHook();
+        await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('/emptycmd');
@@ -1843,7 +3012,6 @@ describe('useGeminiStream', () => {
           expect.any(AbortSignal),
           expect.any(String),
           undefined,
-          false,
           '/emptycmd',
         );
       });
@@ -1851,7 +3019,7 @@ describe('useGeminiStream', () => {
 
     it('should not call handleSlashCommand for line comments', async () => {
       const { result, mockSendMessageStream: localMockSendMessageStream } =
-        renderTestHook();
+        await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('// This is a line comment');
@@ -1864,7 +3032,6 @@ describe('useGeminiStream', () => {
           expect.any(AbortSignal),
           expect.any(String),
           undefined,
-          false,
           '// This is a line comment',
         );
       });
@@ -1872,7 +3039,7 @@ describe('useGeminiStream', () => {
 
     it('should not call handleSlashCommand for block comments', async () => {
       const { result, mockSendMessageStream: localMockSendMessageStream } =
-        renderTestHook();
+        await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('/* This is a block comment */');
@@ -1885,14 +3052,13 @@ describe('useGeminiStream', () => {
           expect.any(AbortSignal),
           expect.any(String),
           undefined,
-          false,
           '/* This is a block comment */',
         );
       });
     });
 
     it('should not call handleSlashCommand is shell mode is active', async () => {
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -1922,90 +3088,119 @@ describe('useGeminiStream', () => {
         expect(mockHandleSlashCommand).not.toHaveBeenCalled();
       });
     });
-  });
 
-  describe('Memory Refresh on save_memory', () => {
-    it('should call performMemoryRefresh when a save_memory tool call completes successfully', async () => {
-      const mockPerformMemoryRefresh = vi.fn();
-      const completedToolCall: TrackedCompletedToolCall = {
-        request: {
-          callId: 'save-mem-call-1',
-          name: 'save_memory',
-          args: { fact: 'test' },
-          isClientInitiated: true,
-          prompt_id: 'prompt-id-6',
-        },
-        status: CoreToolCallStatus.Success,
-        responseSubmittedToGemini: false,
-        response: {
-          callId: 'save-mem-call-1',
-          responseParts: [{ text: 'Memory saved' }],
-          resultDisplay: 'Success: Memory saved',
-          error: undefined,
-          errorType: undefined, // FIX: Added missing property
-        },
-        tool: {
-          name: 'save_memory',
-          displayName: 'save_memory',
-          description: 'Saves memory',
-          build: vi.fn(),
-        } as any,
-        invocation: {
-          getDescription: () => `Mock description`,
-        } as unknown as AnyToolInvocation,
-      };
+    it('should record client-initiated tool calls in GeminiChat history', async () => {
+      const { result, client: mockGeminiClient } = await renderTestHook();
 
-      // Capture the onComplete callback
-      let capturedOnComplete:
-        | ((completedTools: TrackedToolCall[]) => Promise<void>)
-        | null = null;
-
-      mockUseToolScheduler.mockImplementation((onComplete) => {
-        capturedOnComplete = onComplete;
-        return [
-          [],
-          mockScheduleToolCalls,
-          mockMarkToolsAsSubmitted,
-          vi.fn(),
-          mockCancelAllToolCalls,
-          0,
-        ];
+      mockHandleSlashCommand.mockResolvedValue({
+        type: 'schedule_tool',
+        toolName: 'activate_skill',
+        toolArgs: { name: 'test-skill' },
       });
 
-      renderHookWithProviders(() =>
-        useGeminiStream(
-          new MockedGeminiClientClass(mockConfig),
-          [],
-          mockAddItem,
-          mockConfig,
-          mockLoadedSettings,
-          mockOnDebugMessage,
-          mockHandleSlashCommand,
-          false,
-          () => 'vscode' as EditorType,
-          () => {},
-          mockPerformMemoryRefresh,
-          false,
-          () => {},
-          () => {},
-          () => {},
-          80,
-          24,
-        ),
-      );
+      await act(async () => {
+        await result.current.submitQuery('/test-skill');
+      });
 
-      // Trigger the onComplete callback with the completed save_memory tool
+      // Simulate tool completion
+      const completedTool = {
+        request: {
+          callId: 'test-call-id',
+          name: 'activate_skill',
+          args: { name: 'test-skill' },
+          isClientInitiated: true,
+        },
+        status: CoreToolCallStatus.Success,
+        invocation: {
+          getDescription: () => 'Activating skill test-skill',
+        },
+        tool: {
+          isOutputMarkdown: true,
+        },
+        response: {
+          responseParts: [
+            {
+              functionResponse: {
+                name: 'activate_skill',
+                response: { content: 'skill instructions' },
+              },
+            },
+          ],
+        },
+      } as unknown as TrackedCompletedToolCall;
+
       await act(async () => {
         if (capturedOnComplete) {
-          // Wait a tick for refs to be set up
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          await capturedOnComplete([completedToolCall]);
+          await capturedOnComplete([completedTool]);
         }
       });
 
-      await waitFor(() => {
-        expect(mockPerformMemoryRefresh).toHaveBeenCalledTimes(1);
+      // Verify that the tool call and response were added to GeminiChat history
+      expect(mockGeminiClient.addHistory).toHaveBeenCalledWith({
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              name: 'activate_skill',
+              args: { name: 'test-skill' },
+            },
+          },
+        ],
       });
+      expect(mockGeminiClient.addHistory).toHaveBeenCalledWith({
+        role: 'user',
+        parts: completedTool.response.responseParts,
+      });
+    });
+
+    it('should NOT record other client-initiated tool calls in history', async () => {
+      const { result, client: mockGeminiClient } = await renderTestHook();
+
+      mockHandleSlashCommand.mockResolvedValue({
+        type: 'schedule_tool',
+        toolName: 'write_todos',
+        toolArgs: { todos: [] },
+      });
+
+      await act(async () => {
+        await result.current.submitQuery('/todos');
+      });
+
+      // Simulate tool completion
+      const completedTool = {
+        request: {
+          callId: 'test-call-id',
+          name: 'write_todos',
+          args: { todos: [] },
+          isClientInitiated: true,
+        },
+        status: CoreToolCallStatus.Success,
+        invocation: {
+          getDescription: () => 'Saving memory',
+        },
+        tool: {
+          isOutputMarkdown: true,
+        },
+        response: {
+          responseParts: [
+            {
+              functionResponse: {
+                name: 'write_todos',
+                response: { success: true },
+              },
+            },
+          ],
+        },
+      } as unknown as TrackedCompletedToolCall;
+
+      await act(async () => {
+        if (capturedOnComplete) {
+          await capturedOnComplete([completedTool]);
+        }
+      });
+
+      // Verify that addHistory was NOT called
+      expect(mockGeminiClient.addHistory).not.toHaveBeenCalled();
     });
   });
 
@@ -2023,6 +3218,7 @@ describe('useGeminiStream', () => {
       );
 
       const testConfig = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...mockConfig,
         getContentGenerator: vi.fn(),
         getContentGeneratorConfig: vi.fn(() => ({
@@ -2031,7 +3227,7 @@ describe('useGeminiStream', () => {
         getModel: vi.fn(() => 'gemini-2.5-pro'),
       } as unknown as Config;
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(testConfig),
           [],
@@ -2065,7 +3261,69 @@ describe('useGeminiStream', () => {
           mockAuthType,
           undefined,
           'gemini-2.5-pro',
-          'gemini-2.5-flash',
+          DEFAULT_GEMINI_FLASH_MODEL,
+        );
+      });
+    });
+
+    it('should use TRUE_EMPTY_RESPONSE_MESSAGE when receiving an invalid stream event of type NO_RESPONSE_TEXT', async () => {
+      mockSendMessageStream.mockClear();
+      mockSendMessageStream.mockReturnValue(
+        (async function* () {
+          yield {
+            type: ServerGeminiEventType.InvalidStream,
+            value: {
+              type: 'NO_RESPONSE_TEXT',
+              message: 'empty response text',
+            },
+          };
+        })(),
+      );
+
+      const { result } = await renderTestHook();
+
+      await act(async () => {
+        await result.current.submitQuery('test query');
+      });
+
+      await waitFor(() => {
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: MessageType.ERROR,
+            text: TRUE_EMPTY_RESPONSE_MESSAGE,
+          }),
+          expect.any(Number),
+        );
+      });
+    });
+
+    it('should use the event message when receiving a non-NO_RESPONSE_TEXT invalid stream event', async () => {
+      mockSendMessageStream.mockClear();
+      mockSendMessageStream.mockReturnValue(
+        (async function* () {
+          yield {
+            type: ServerGeminiEventType.InvalidStream,
+            value: {
+              type: 'MALFORMED_FUNCTION_CALL',
+              message: 'Custom malformed function call message',
+            },
+          };
+        })(),
+      );
+
+      const { result } = await renderTestHook();
+
+      await act(async () => {
+        await result.current.submitQuery('test query');
+      });
+
+      await waitFor(() => {
+        expect(mockAddItem).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: MessageType.ERROR,
+            text: 'Custom malformed function call message',
+          }),
+          expect.any(Number),
         );
       });
     });
@@ -2078,7 +3336,7 @@ describe('useGeminiStream', () => {
         createMockToolCall('read_file', 'call2', 'info'),
       ];
 
-      const { result } = renderTestHook(awaitingApprovalToolCalls);
+      const { result } = await renderTestHook(awaitingApprovalToolCalls);
 
       await act(async () => {
         await result.current.handleApprovalModeChange(ApprovalMode.YOLO);
@@ -2108,7 +3366,7 @@ describe('useGeminiStream', () => {
         createMockToolCall('read_file', 'call3', 'info'),
       ];
 
-      const { result } = renderTestHook(awaitingApprovalToolCalls);
+      const { result } = await renderTestHook(awaitingApprovalToolCalls);
 
       await act(async () => {
         await result.current.handleApprovalModeChange(ApprovalMode.AUTO_EDIT);
@@ -2127,12 +3385,50 @@ describe('useGeminiStream', () => {
       );
     });
 
+    it('should auto-approve shell commands with redirection when switching to AUTO_EDIT mode', async () => {
+      const shellCall = createMockToolCall(
+        SHELL_TOOL_NAME,
+        'call-shell',
+        'info',
+      );
+      shellCall.request.args = { command: 'ls > files.txt' };
+
+      const { result } = await renderTestHook([shellCall]);
+
+      await act(async () => {
+        await result.current.handleApprovalModeChange(ApprovalMode.AUTO_EDIT);
+      });
+
+      // Shell command with redirection should be auto-approved
+      expect(mockMessageBus.publish).toHaveBeenCalledWith(
+        expect.objectContaining({ correlationId: 'corr-call-shell' }),
+      );
+    });
+
+    it('should NOT auto-approve shell commands without redirection when switching to AUTO_EDIT mode', async () => {
+      const shellCall = createMockToolCall(
+        SHELL_TOOL_NAME,
+        'call-shell',
+        'info',
+      );
+      shellCall.request.args = { command: 'ls -la' };
+
+      const { result } = await renderTestHook([shellCall]);
+
+      await act(async () => {
+        await result.current.handleApprovalModeChange(ApprovalMode.AUTO_EDIT);
+      });
+
+      // Regular shell command should NOT be auto-approved
+      expect(mockMessageBus.publish).not.toHaveBeenCalled();
+    });
+
     it('should not auto-approve any tools when switching to REQUIRE_CONFIRMATION mode', async () => {
       const awaitingApprovalToolCalls: TrackedToolCall[] = [
         createMockToolCall('replace', 'call1', 'edit'),
       ];
 
-      const { result } = renderTestHook(awaitingApprovalToolCalls);
+      const { result } = await renderTestHook(awaitingApprovalToolCalls);
 
       await act(async () => {
         await result.current.handleApprovalModeChange(ApprovalMode.DEFAULT);
@@ -2154,7 +3450,7 @@ describe('useGeminiStream', () => {
         createMockToolCall('write_file', 'call2', 'edit'),
       ];
 
-      const { result } = renderTestHook(awaitingApprovalToolCalls);
+      const { result } = await renderTestHook(awaitingApprovalToolCalls);
 
       await act(async () => {
         await result.current.handleApprovalModeChange(ApprovalMode.YOLO);
@@ -2188,7 +3484,7 @@ describe('useGeminiStream', () => {
             displayName: 'replace',
             description: 'Replace text',
             build: vi.fn(),
-          } as any,
+          } as unknown as AnyDeclarativeTool,
           invocation: {
             getDescription: () => 'Mock description',
           } as unknown as AnyToolInvocation,
@@ -2196,7 +3492,7 @@ describe('useGeminiStream', () => {
         } as unknown as TrackedWaitingToolCall,
       ];
 
-      const { result } = renderTestHook(awaitingApprovalToolCalls);
+      const { result } = await renderTestHook(awaitingApprovalToolCalls);
 
       // Should not throw an error
       await act(async () => {
@@ -2229,7 +3525,7 @@ describe('useGeminiStream', () => {
             displayName: 'write_file',
             description: 'Write file',
             build: vi.fn(),
-          } as any,
+          } as unknown as AnyDeclarativeTool,
           invocation: {
             getDescription: () => 'Mock description',
           } as unknown as AnyToolInvocation,
@@ -2239,7 +3535,7 @@ describe('useGeminiStream', () => {
         } as TrackedExecutingToolCall,
       ];
 
-      const { result } = renderTestHook(mixedStatusToolCalls);
+      const { result } = await renderTestHook(mixedStatusToolCalls);
 
       await act(async () => {
         await result.current.handleApprovalModeChange(ApprovalMode.YOLO);
@@ -2260,7 +3556,7 @@ describe('useGeminiStream', () => {
       (mockConfig.getApprovalMode as Mock).mockReturnValue(ApprovalMode.PLAN);
 
       // Render the hook, which will initialize the previousApprovalModeRef with PLAN
-      const { result, client } = renderTestHook([]);
+      const { result, client } = await renderTestHook([]);
 
       // Update mockConfig to return DEFAULT mode (new mode)
       (mockConfig.getApprovalMode as Mock).mockReturnValue(
@@ -2300,7 +3596,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -2374,7 +3670,7 @@ describe('useGeminiStream', () => {
             })(),
           );
 
-          const { result } = renderHookWithDefaults();
+          const { result } = await renderHookWithDefaults();
 
           await act(async () => {
             await result.current.submitQuery('Test overflow');
@@ -2405,7 +3701,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -2454,7 +3750,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithDefaults();
+      const { result } = await renderHookWithDefaults();
 
       // Submit a query
       await act(async () => {
@@ -2541,7 +3837,7 @@ describe('useGeminiStream', () => {
           })(),
         );
 
-        const { result } = renderHookWithDefaults();
+        const { result } = await renderHookWithDefaults();
 
         await act(async () => {
           await result.current.submitQuery(`Test ${reason}`);
@@ -2574,14 +3870,14 @@ describe('useGeminiStream', () => {
 
   it('should flush pending text rationale before scheduling tool calls to ensure correct history order', async () => {
     const addItemOrder: string[] = [];
-    let capturedOnComplete: any;
+    let capturedOnComplete: (tools: CompletedToolCall[]) => Promise<void>;
 
     const mockScheduleToolCalls = vi.fn(async (requests) => {
       addItemOrder.push('scheduleToolCalls_START');
       // Simulate tools completing and triggering onComplete immediately.
       // This mimics the behavior that caused the regression where tool results
       // were added to history during the await scheduleToolCalls(...) block.
-      const tools = requests.map((r: any) => ({
+      const tools = requests.map((r: ToolCallRequestInfo) => ({
         request: r,
         status: CoreToolCallStatus.Success,
         tool: { displayName: r.name, name: r.name },
@@ -2596,7 +3892,7 @@ describe('useGeminiStream', () => {
       addItemOrder.push('scheduleToolCalls_END');
     });
 
-    mockAddItem.mockImplementation((item: any) => {
+    mockAddItem.mockImplementation((item: HistoryItemWithoutId) => {
       addItemOrder.push(`addItem:${item.type}`);
     });
 
@@ -2613,7 +3909,7 @@ describe('useGeminiStream', () => {
       ];
     });
 
-    const { result } = renderHookWithProviders(() =>
+    const { result } = await renderHookWithProviders(() =>
       useGeminiStream(
         new MockedGeminiClientClass(mockConfig),
         [],
@@ -2684,7 +3980,7 @@ describe('useGeminiStream', () => {
       shouldProceed: true,
     });
 
-    const { result } = renderHookWithProviders(() =>
+    const { result } = await renderHookWithProviders(() =>
       useGeminiStream(
         mockConfig.getGeminiClient(),
         [],
@@ -2730,7 +4026,6 @@ describe('useGeminiStream', () => {
       expect.any(AbortSignal), // Argument 2: An AbortSignal
       expect.any(String), // Argument 3: The prompt_id string
       undefined,
-      false,
       rawQuery,
     );
   });
@@ -2777,7 +4072,7 @@ describe('useGeminiStream', () => {
       })(),
     );
 
-    const { result } = renderTestHook();
+    const { result } = await renderTestHook();
 
     await act(async () => {
       await result.current.submitQuery(userQuery);
@@ -2826,6 +4121,7 @@ describe('useGeminiStream', () => {
   describe('Thought Reset', () => {
     it('should keep full thinking entries in history when mode is full', async () => {
       const fullThinkingSettings: LoadedSettings = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...mockLoadedSettings,
         merged: {
           ...mockLoadedSettings.merged,
@@ -2849,7 +4145,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -2904,7 +4200,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('Test query');
@@ -2949,7 +4245,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -3021,7 +4317,7 @@ describe('useGeminiStream', () => {
       });
     });
 
-    it('should memoize pendingHistoryItems', () => {
+    it('should memoize pendingHistoryItems', async () => {
       mockUseToolScheduler.mockReturnValue([
         [],
         mockScheduleToolCalls,
@@ -3031,7 +4327,7 @@ describe('useGeminiStream', () => {
         0,
       ]);
 
-      const { result, rerender } = renderHookWithProviders(() =>
+      const { result, rerender } = await renderHookWithProviders(() =>
         useGeminiStream(
           mockConfig.getGeminiClient(),
           [],
@@ -3102,7 +4398,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -3159,7 +4455,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -3202,7 +4498,7 @@ describe('useGeminiStream', () => {
         expect.any(String),
         undefined,
         'gemini-2.5-pro',
-        'gemini-2.5-flash',
+        DEFAULT_GEMINI_FLASH_MODEL,
       );
     });
 
@@ -3227,7 +4523,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderHookWithProviders(() =>
+      const { result } = await renderHookWithProviders(() =>
         useGeminiStream(
           new MockedGeminiClientClass(mockConfig),
           [],
@@ -3248,6 +4544,11 @@ describe('useGeminiStream', () => {
           24,
         ),
       );
+
+      // Reset fake timers to startTime because the asynchronous render lifecycle
+      // (via waitUntilReady) advances the mock clock while waiting for initial
+      // components to settle.
+      vi.setSystemTime(startTime);
 
       // Submit query
       await act(async () => {
@@ -3287,7 +4588,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test query');
@@ -3334,7 +4635,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test query');
@@ -3375,7 +4676,6 @@ describe('useGeminiStream', () => {
           expect.any(AbortSignal),
           expect.any(String),
           undefined,
-          false,
           'test query',
         );
       });
@@ -3399,7 +4699,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test query');
@@ -3434,7 +4734,7 @@ describe('useGeminiStream', () => {
     });
 
     it('should handle multiple loop detection events properly', async () => {
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       // First loop detection - set up fresh mock for first call
       mockSendMessageStream.mockReturnValueOnce(
@@ -3525,7 +4825,6 @@ describe('useGeminiStream', () => {
           expect.any(AbortSignal),
           expect.any(String),
           undefined,
-          false,
           'second query',
         );
       });
@@ -3544,7 +4843,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test query');
@@ -3581,7 +4880,7 @@ describe('useGeminiStream', () => {
           })(),
         );
 
-        const { result } = renderTestHook();
+        const { result } = await renderTestHook();
 
         // Start first query without awaiting (fire-and-forget, like existing tests)
         await act(async () => {
@@ -3637,7 +4936,7 @@ describe('useGeminiStream', () => {
           })(),
         );
 
-        const { result } = renderTestHook();
+        const { result } = await renderTestHook();
 
         await act(async () => {
           await result.current.submitQuery('test query');
@@ -3670,7 +4969,6 @@ describe('useGeminiStream', () => {
             expect.any(AbortSignal),
             expect.any(String),
             undefined,
-            false,
             'test query',
           );
         });
@@ -3692,7 +4990,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test stop');
@@ -3720,7 +5018,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test stop');
@@ -3751,7 +5049,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test block');
@@ -3778,7 +5076,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('test block');
@@ -3796,6 +5094,182 @@ describe('useGeminiStream', () => {
     });
   });
 
+  describe('Grouped Tool Calls', () => {
+    const createToolCall = (
+      callId: string,
+      {
+        status = CoreToolCallStatus.Success,
+        kind = Kind.Agent,
+        groupId,
+      }: { status?: CoreToolCallStatus; kind?: Kind; groupId?: string } = {},
+    ): TrackedToolCall =>
+      ({
+        request: {
+          callId,
+          name: `tool-${callId}`,
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-1',
+          groupId,
+        },
+        status,
+        responseSubmittedToGemini: false,
+        response: {
+          callId,
+          responseParts: [],
+          resultDisplay: `result of ${callId}`,
+          error: undefined,
+          errorType: undefined,
+        },
+        tool: {
+          name: `tool-${callId}`,
+          displayName: `tool-${callId}`,
+          description: `description of ${callId}`,
+          kind,
+          build: vi.fn(),
+        },
+        invocation: {
+          getDescription: () => `Mock description of ${callId}`,
+        },
+      }) as unknown as TrackedToolCall;
+
+    const setToolCalls = (toolCalls: TrackedToolCall[]) => {
+      mockUseToolScheduler.mockReturnValue([
+        toolCalls,
+        mockScheduleToolCalls,
+        mockMarkToolsAsSubmitted,
+        vi.fn(),
+        mockCancelAllToolCalls,
+        0,
+      ]);
+    };
+
+    const renderWithToolCalls = async (toolCalls: TrackedToolCall[]) => {
+      setToolCalls(toolCalls);
+      return renderHookWithProviders(() =>
+        useGeminiStream(
+          mockConfig.getGeminiClient(),
+          [],
+          mockAddItem,
+          mockConfig,
+          mockLoadedSettings,
+          mockOnDebugMessage,
+          mockHandleSlashCommand,
+          false,
+          () => 'vscode' as EditorType,
+          () => {},
+          () => Promise.resolve(),
+          false,
+          () => {},
+          () => {},
+          () => {},
+          80,
+          24,
+        ),
+      );
+    };
+
+    // The call IDs of every tool group pushed to history. `useStateAndRef` is
+    // mocked in this file, so the effect that pushes finished tools starts from
+    // scratch on every render. The assertions below therefore check which
+    // groups were pushed rather than how many times `addItem` was called.
+    const getPushedGroups = (): string[][] =>
+      mockAddItem.mock.calls
+        .map(([item]) => item)
+        .filter((item) => item.type === 'tool_group')
+        .map((item) =>
+          item.tools.map((tool: { callId: string }) => tool.callId),
+        );
+
+    it('should hold back a group until every call in it has finished', async () => {
+      const { rerender } = await renderWithToolCalls([
+        createToolCall('agent-1', { groupId: 'agent-1' }),
+        createToolCall('agent-2', {
+          status: CoreToolCallStatus.Executing,
+          groupId: 'agent-1',
+        }),
+      ]);
+
+      expect(getPushedGroups()).toEqual([]);
+
+      setToolCalls([
+        createToolCall('agent-1', { groupId: 'agent-1' }),
+        createToolCall('agent-2', { groupId: 'agent-1' }),
+      ]);
+      rerender();
+
+      expect(getPushedGroups()).toContainEqual(['agent-1', 'agent-2']);
+    });
+
+    it('should treat failed and cancelled calls as finished', async () => {
+      await renderWithToolCalls([
+        createToolCall('agent-1', { groupId: 'agent-1' }),
+        createToolCall('agent-2', {
+          status: CoreToolCallStatus.Error,
+          groupId: 'agent-1',
+        }),
+        createToolCall('agent-3', {
+          status: CoreToolCallStatus.Cancelled,
+          groupId: 'agent-1',
+        }),
+      ]);
+
+      expect(getPushedGroups()).toContainEqual([
+        'agent-1',
+        'agent-2',
+        'agent-3',
+      ]);
+    });
+
+    it('should group by group ID rather than by tool kind', async () => {
+      const { rerender } = await renderWithToolCalls([
+        createToolCall('read-1', { kind: Kind.Read, groupId: 'read-1' }),
+        createToolCall('read-2', {
+          kind: Kind.Read,
+          status: CoreToolCallStatus.Executing,
+          groupId: 'read-1',
+        }),
+      ]);
+
+      expect(getPushedGroups()).toEqual([]);
+
+      setToolCalls([
+        createToolCall('read-1', { kind: Kind.Read, groupId: 'read-1' }),
+        createToolCall('read-2', { kind: Kind.Read, groupId: 'read-1' }),
+      ]);
+      rerender();
+
+      expect(getPushedGroups()).toContainEqual(['read-1', 'read-2']);
+    });
+
+    it('should push calls without a group ID individually, whatever their kind', async () => {
+      await renderWithToolCalls([
+        createToolCall('agent-1'),
+        createToolCall('agent-2'),
+      ]);
+
+      const groups = getPushedGroups();
+      expect(groups).toContainEqual(['agent-1']);
+      expect(groups).toContainEqual(['agent-2']);
+      expect(groups).not.toContainEqual(['agent-1', 'agent-2']);
+    });
+
+    it('should push finished calls ahead of a group that is still running', async () => {
+      await renderWithToolCalls([
+        createToolCall('read-1', { kind: Kind.Read }),
+        createToolCall('agent-1', { groupId: 'agent-1' }),
+        createToolCall('agent-2', {
+          status: CoreToolCallStatus.Executing,
+          groupId: 'agent-1',
+        }),
+      ]);
+
+      const groups = getPushedGroups();
+      expect(groups).toContainEqual(['read-1']);
+      expect(groups.flat()).not.toContain('agent-1');
+    });
+  });
+
   describe('Stream Splitting', () => {
     it('should not add empty history item when splitting message results in empty or whitespace-only beforeText', async () => {
       // Mock split point to always be 0, causing beforeText to be empty
@@ -3807,7 +5281,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('user query');
@@ -3855,7 +5329,7 @@ describe('useGeminiStream', () => {
         })(),
       );
 
-      const { result } = renderTestHook();
+      const { result } = await renderTestHook();
 
       await act(async () => {
         await result.current.submitQuery('user query');
@@ -3881,7 +5355,7 @@ describe('useGeminiStream', () => {
   });
 
   it('should trace UserPrompt telemetry on submitQuery', async () => {
-    const { result } = renderTestHook();
+    const { result } = await renderTestHook();
 
     mockSendMessageStream.mockReturnValue(
       (async function* () {
@@ -3902,8 +5376,152 @@ describe('useGeminiStream', () => {
 
     const spanMetadata = {} as SpanMetadata;
     await act(async () => {
-      await userPromptCall![1]({ metadata: spanMetadata, endSpan: vi.fn() });
+      await userPromptCall![1]({ metadata: spanMetadata });
     });
     expect(spanMetadata.input).toBe('telemetry test query');
+  });
+
+  describe('cancelOngoingRequest session log harmonization & timeout bound', () => {
+    it('immediately synthesizes and records filler functionResponse via recordCompletedToolCalls when cancelling active tools', async () => {
+      const executingToolCall: TrackedExecutingToolCall = {
+        request: {
+          callId: 'call-abc',
+          name: 'run_shell_command',
+          args: { command: 'sleep 30' },
+          isClientInitiated: false,
+          prompt_id: 'prompt-1',
+        },
+        status: CoreToolCallStatus.Executing,
+        tool: {
+          name: 'run_shell_command',
+          displayName: 'Shell',
+        } as unknown as AnyDeclarativeTool,
+        invocation: {
+          getDescription: () => 'sleep 30',
+        } as unknown as AnyToolInvocation,
+      };
+
+      const { result, client } = await renderTestHook([executingToolCall]);
+      const mockRecordCompletedToolCalls =
+        client.getChat().recordCompletedToolCalls;
+
+      await act(async () => {
+        await result.current.cancelOngoingRequest();
+      });
+
+      expect(mockCancelAllToolCalls).toHaveBeenCalledTimes(1);
+      expect(mockRecordCompletedToolCalls).toHaveBeenCalledTimes(1);
+      expect(mockRecordCompletedToolCalls).toHaveBeenCalledWith(
+        expect.any(String),
+        [
+          expect.objectContaining({
+            status: CoreToolCallStatus.Cancelled,
+            request: executingToolCall.request,
+            response: expect.objectContaining({
+              callId: 'call-abc',
+              responseParts: [
+                {
+                  functionResponse: {
+                    id: 'call-abc',
+                    name: 'run_shell_command',
+                    response: {
+                      error:
+                        '[Operation Cancelled] Reason: User cancelled operation',
+                    },
+                  },
+                },
+              ],
+            }),
+          }),
+        ],
+      );
+    });
+
+    it('bounds waiting on an unresponsive tool schedule promise at 1000ms', async () => {
+      vi.useFakeTimers();
+      try {
+        mockScheduleToolCalls.mockImplementation(
+          () => new Promise<CompletedToolCall[]>(() => {}),
+        );
+
+        mockSendMessageStream.mockReturnValue(
+          (async function* () {
+            yield {
+              type: ServerGeminiEventType.ToolCallRequest,
+              value: {
+                callId: 'call-hang',
+                name: 'hanging_tool',
+                args: {},
+                isClientInitiated: false,
+                prompt_id: 'prompt-hang',
+              },
+            };
+          })(),
+        );
+
+        const { result, client } = await renderTestHook();
+        const mockRecordCompletedToolCalls =
+          client.getChat().recordCompletedToolCalls;
+
+        act(() => {
+          void result.current.submitQuery('run hanging tool');
+        });
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(10);
+        });
+
+        expect(mockScheduleToolCalls).toHaveBeenCalledTimes(1);
+
+        let cancelResolved = false;
+        let cancelPromise!: Promise<void>;
+        act(() => {
+          cancelPromise = result.current.cancelOngoingRequest().then(() => {
+            cancelResolved = true;
+          });
+        });
+
+        expect(mockRecordCompletedToolCalls).toHaveBeenCalledWith(
+          expect.any(String),
+          [
+            expect.objectContaining({
+              status: CoreToolCallStatus.Cancelled,
+              request: expect.objectContaining({
+                callId: 'call-hang',
+                name: 'hanging_tool',
+              }),
+            }),
+          ],
+        );
+        expect(cancelResolved).toBe(false);
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+          await cancelPromise;
+        });
+
+        expect(cancelResolved).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('shellModeActive query isolation', () => {
+    it('should never fall through to sending an LLM query when shellModeActive is true', async () => {
+      const { result } = await renderHookWithDefaults({
+        shellModeActive: true,
+      });
+
+      await act(async () => {
+        await result.current.submitQuery('gemini');
+      });
+
+      expect(mockSendMessageStream).not.toHaveBeenCalled();
+      expect(mockAddItem).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: MessageType.USER, text: 'gemini' }),
+        expect.any(Number),
+      );
+    });
   });
 });

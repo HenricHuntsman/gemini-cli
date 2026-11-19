@@ -88,8 +88,7 @@ exports[`<MarkdownDisplay /> > with 'Unix' line endings > renders ordered lists 
 `;
 
 exports[`<MarkdownDisplay /> > with 'Unix' line endings > renders tables correctly 1`] = `
-"
-┌──────────┬──────────┐
+"┌──────────┬──────────┐
 │ Header 1 │ Header 2 │
 ├──────────┼──────────┤
 │ Cell 1   │ Cell 2   │
@@ -168,6 +167,14 @@ Header 4
 "
 `;
 
+exports[`<MarkdownDisplay /> > with 'Windows' line endings > renders headers with correct levels 2`] = `
+"Header 1
+Header 2
+Header 3
+Header 4
+"
+`;
+
 exports[`<MarkdownDisplay /> > with 'Windows' line endings > renders horizontal rules 1`] = `
 "Hello
 ---
@@ -191,8 +198,7 @@ exports[`<MarkdownDisplay /> > with 'Windows' line endings > renders ordered lis
 `;
 
 exports[`<MarkdownDisplay /> > with 'Windows' line endings > renders tables correctly 1`] = `
-"
-┌──────────┬──────────┐
+"┌──────────┬──────────┐
 │ Header 1 │ Header 2 │
 ├──────────┼──────────┤
 │ Cell 1   │ Cell 2   │

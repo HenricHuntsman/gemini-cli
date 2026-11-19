@@ -8,13 +8,77 @@ import {
   type ToolCall,
   type SerializableConfirmationDetails,
   type ToolResultDisplay,
+  type FileDiff,
   debugLogger,
   CoreToolCallStatus,
+  type SubagentActivityItem,
+  isFileDiff,
+  hasSummary,
 } from '@google/gemini-cli-core';
 import {
   type HistoryItemToolGroup,
   type IndividualToolCallDisplay,
 } from '../types.js';
+
+export interface PayloadResult {
+  summary: string;
+  payload: string;
+}
+
+export function hasPayloadResult(res: unknown): res is PayloadResult {
+  if (!hasSummary(res) || !('payload' in res)) {
+    return false;
+  }
+  return typeof res.payload === 'string';
+}
+
+/**
+ * Extracts unified `FileDiff` data from a tool call's resultDisplay or
+ * edit confirmationDetails.
+ */
+export function getToolFileDiff(
+  tool: Pick<
+    IndividualToolCallDisplay,
+    'resultDisplay' | 'confirmationDetails'
+  >,
+): FileDiff | undefined {
+  if (isFileDiff(tool.resultDisplay)) {
+    return tool.resultDisplay;
+  }
+  if (tool.confirmationDetails?.type === 'edit') {
+    const details = tool.confirmationDetails;
+    return {
+      fileName: details.fileName,
+      fileDiff: details.fileDiff,
+      filePath: details.filePath,
+      originalContent: details.originalContent,
+      newContent: details.newContent,
+      diffStat: details.diffStat,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Identifies whether a compact tool call has a dense payload (e.g., diff,
+ * outputFile, or structured summary/payload result).
+ */
+export function hasDensePayload(
+  tool: Pick<
+    IndividualToolCallDisplay,
+    'outputFile' | 'resultDisplay' | 'confirmationDetails'
+  >,
+): boolean {
+  if (tool.outputFile) return true;
+  if (getToolFileDiff(tool) !== undefined) return true;
+  return hasPayloadResult(tool.resultDisplay);
+}
+
+function hasSubagentHistory(
+  call: ToolCall,
+): call is ToolCall & { subagentHistory: SubagentActivityItem[] } {
+  return 'subagentHistory' in call && call.subagentHistory !== undefined;
+}
 
 /**
  * Transforms `ToolCall` objects into `HistoryItemToolGroup` objects for UI
@@ -50,6 +114,7 @@ export function mapToDisplay(
       callId: call.request.callId,
       parentCallId: call.request.parentCallId,
       name: displayName,
+      args: call.request.args,
       description,
       renderOutputAsMarkdown,
     };
@@ -107,6 +172,11 @@ export function mapToDisplay(
       resultDisplay,
       confirmationDetails,
       outputFile,
+      hasDensePayload: hasDensePayload({
+        outputFile,
+        resultDisplay,
+        confirmationDetails,
+      }),
       ptyId,
       correlationId,
       progressMessage,
@@ -114,6 +184,9 @@ export function mapToDisplay(
       progressTotal,
       approvalMode: call.approvalMode,
       originalRequestName: call.request.originalRequestName,
+      subagentHistory: hasSubagentHistory(call)
+        ? call.subagentHistory
+        : undefined,
     };
   });
 

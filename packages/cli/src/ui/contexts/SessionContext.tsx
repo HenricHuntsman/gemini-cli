@@ -13,13 +13,13 @@ import {
   useMemo,
   useEffect,
 } from 'react';
-
 import type {
   SessionMetrics,
   ModelMetrics,
+  RoleMetrics,
   ToolCallStats,
 } from '@google/gemini-cli-core';
-import { uiTelemetryService, sessionId } from '@google/gemini-cli-core';
+import { uiTelemetryService } from '@google/gemini-cli-core';
 
 export enum ToolCallDecision {
   ACCEPT = 'accept',
@@ -35,6 +35,18 @@ function areModelMetricsEqual(a: ModelMetrics, b: ModelMetrics): boolean {
     a.api.totalLatencyMs !== b.api.totalLatencyMs
   ) {
     return false;
+  }
+  const errorsA = a.api.errorsByType || {};
+  const errorsB = b.api.errorsByType || {};
+  const keysA = Object.keys(errorsA);
+  const keysB = Object.keys(errorsB);
+  if (keysA.length !== keysB.length) {
+    return false;
+  }
+  for (const key of keysA) {
+    if (errorsA[key] !== errorsB[key]) {
+      return false;
+    }
   }
   if (
     a.tokens.input !== b.tokens.input ||
@@ -139,7 +151,7 @@ function areMetricsEqual(a: SessionMetrics, b: SessionMetrics): boolean {
   return true;
 }
 
-export type { SessionMetrics, ModelMetrics };
+export type { SessionMetrics, ModelMetrics, RoleMetrics };
 
 export interface SessionStatsState {
   sessionId: string;
@@ -182,9 +194,10 @@ const SessionStatsContext = createContext<SessionStatsContextValue | undefined>(
 
 // --- Provider Component ---
 
-export const SessionStatsProvider: React.FC<{ children: React.ReactNode }> = ({
-  children,
-}) => {
+export const SessionStatsProvider: React.FC<{
+  children: React.ReactNode;
+  sessionId: string;
+}> = ({ children, sessionId }) => {
   const [stats, setStats] = useState<SessionStatsState>({
     sessionId,
     sessionStartTime: new Date(),

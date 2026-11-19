@@ -50,6 +50,7 @@ vi.mock('../utils/terminalCapabilityManager.js', () => ({
   cleanupTerminalOnExit: vi.fn(),
   terminalCapabilityManager: {
     enableSupportedModes: vi.fn(),
+    areAmbiguousCharactersWide: vi.fn(() => false),
   },
 }));
 
@@ -80,20 +81,16 @@ describe('useSuspend', () => {
     setPlatform(originalPlatform);
   });
 
-  it('cleans terminal state on suspend and restores/repaints on resume in alternate screen mode', () => {
+  it('cleans terminal state on suspend and restores/repaints on resume in alternate screen mode', async () => {
     const handleWarning = vi.fn();
     const setRawMode = vi.fn();
-    const refreshStatic = vi.fn();
-    const setForceRerenderKey = vi.fn();
     const enableSupportedModes =
       terminalCapabilityManager.enableSupportedModes as unknown as Mock;
 
-    const { result, unmount } = renderHook(() =>
+    const { result, unmount } = await renderHook(() =>
       useSuspend({
         handleWarning,
         setRawMode,
-        refreshStatic,
-        setForceRerenderKey,
         shouldUseAlternateScreen: true,
       }),
     );
@@ -131,24 +128,18 @@ describe('useSuspend', () => {
     expect(enableSupportedModes).toHaveBeenCalledTimes(1);
     expect(enableMouseEvents).toHaveBeenCalledTimes(1);
     expect(setRawMode).toHaveBeenCalledWith(true);
-    expect(refreshStatic).toHaveBeenCalledTimes(1);
-    expect(setForceRerenderKey).toHaveBeenCalledTimes(1);
 
     unmount();
   });
 
-  it('does not toggle alternate screen or mouse restore when alternate screen mode is disabled', () => {
+  it('does not toggle alternate screen or mouse restore when alternate screen mode is disabled', async () => {
     const handleWarning = vi.fn();
     const setRawMode = vi.fn();
-    const refreshStatic = vi.fn();
-    const setForceRerenderKey = vi.fn();
 
-    const { result, unmount } = renderHook(() =>
+    const { result, unmount } = await renderHook(() =>
       useSuspend({
         handleWarning,
         setRawMode,
-        refreshStatic,
-        setForceRerenderKey,
         shouldUseAlternateScreen: false,
       }),
     );
@@ -169,20 +160,52 @@ describe('useSuspend', () => {
     unmount();
   });
 
-  it('warns and skips suspension on windows', () => {
+  it('restores auto-wrap for the shell on suspend and disables it again on resume when the terminal renders ambiguous-width characters as wide', async () => {
+    vi.mocked(
+      terminalCapabilityManager.areAmbiguousCharactersWide,
+    ).mockReturnValue(true);
+    const handleWarning = vi.fn();
+    const setRawMode = vi.fn();
+
+    const { result, unmount } = await renderHook(() =>
+      useSuspend({
+        handleWarning,
+        setRawMode,
+        shouldUseAlternateScreen: false,
+      }),
+    );
+
+    act(() => {
+      result.current.handleSuspend();
+      result.current.handleSuspend();
+    });
+
+    expect(enableLineWrapping).toHaveBeenCalledTimes(1);
+    expect(disableLineWrapping).not.toHaveBeenCalled();
+    expect(exitAlternateScreen).not.toHaveBeenCalled();
+
+    act(() => {
+      process.emit('SIGCONT');
+      vi.runAllTimers();
+    });
+
+    expect(disableLineWrapping).toHaveBeenCalledTimes(1);
+    expect(enterAlternateScreen).not.toHaveBeenCalled();
+    expect(enableMouseEvents).not.toHaveBeenCalled();
+
+    unmount();
+  });
+
+  it('warns and skips suspension on windows', async () => {
     setPlatform('win32');
 
     const handleWarning = vi.fn();
     const setRawMode = vi.fn();
-    const refreshStatic = vi.fn();
-    const setForceRerenderKey = vi.fn();
 
-    const { result, unmount } = renderHook(() =>
+    const { result, unmount } = await renderHook(() =>
       useSuspend({
         handleWarning,
         setRawMode,
-        refreshStatic,
-        setForceRerenderKey,
         shouldUseAlternateScreen: true,
       }),
     );

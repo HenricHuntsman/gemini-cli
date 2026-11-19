@@ -5,9 +5,11 @@ and managing Gemini CLI in an enterprise environment. By leveraging system-level
 settings, administrators can enforce security policies, manage tool access, and
 ensure a consistent experience for all users.
 
-> **A note on security:** The patterns described in this document are intended
-> to help administrators create a more controlled and secure environment for
-> using Gemini CLI. However, they should not be considered a foolproof security
+<!-- prettier-ignore -->
+> [!WARNING]
+> The patterns described in this document are intended to help
+> administrators create a more controlled and secure environment for using
+> Gemini CLI. However, they should not be considered a foolproof security
 > boundary. A determined user with sufficient privileges on their local machine
 > may still be able to circumvent these configurations. These measures are
 > designed to prevent accidental misuse and enforce corporate policy in a
@@ -173,8 +175,8 @@ the enterprise settings are always loaded with the highest precedence.
 **Example wrapper script:**
 
 Administrators can create a script named `gemini` and place it in a directory
-that appears earlier in the user's `PATH` than the actual Gemini CLI binary
-(e.g., `/usr/local/bin/gemini`).
+that appears earlier in the user's `PATH` than the actual Gemini CLI binary (for
+example, `/usr/local/bin/gemini`).
 
 ```bash
 #!/bin/bash
@@ -280,10 +282,12 @@ environment to a blocklist.
 }
 ```
 
-**Security note:** Blocklisting with `excludeTools` is less secure than
-allowlisting with `coreTools`, as it relies on blocking known-bad commands, and
-clever users may find ways to bypass simple string-based blocks. **Allowlisting
-is the recommended approach.**
+<!-- prettier-ignore -->
+> [!WARNING]
+> Blocklisting with `excludeTools` is less secure than
+> allowlisting with `tools.core`, as it relies on blocking known-bad commands,
+> and clever users may find ways to bypass simple string-based blocks.
+> **Allowlisting is the recommended approach.**
 
 ### Disabling YOLO mode
 
@@ -321,9 +325,9 @@ User. When it comes to the `mcpServers` object, these configurations are
 1.  **Merging:** The lists of servers from all three levels are combined into a
     single list.
 2.  **Precedence:** If a server with the **same name** is defined at multiple
-    levels (e.g., a server named `corp-api` exists in both system and user
-    settings), the definition from the highest-precedence level is used. The
-    order of precedence is: **System > Workspace > User**.
+    levels (for example, a server named `corp-api` exists in both system and
+    user settings), the definition from the highest-precedence level is used.
+    The order of precedence is: **System > Workspace > User**.
 
 This means a user **cannot** override the definition of a server that is already
 defined in the system-level settings. However, they **can** add new servers with
@@ -339,8 +343,8 @@ canonical servers and adding their names to an allowlist.
 For even greater security, especially when dealing with third-party MCP servers,
 you can restrict which specific tools from a server are exposed to the model.
 This is done using the `includeTools` and `excludeTools` properties within a
-server's definition. This allows you to use a subset of tools from a server
-without allowing potentially dangerous ones.
+server's definition. This lets you use a subset of tools from a server without
+allowing potentially dangerous ones.
 
 Following the principle of least privilege, it is highly recommended to use
 `includeTools` to create an allowlist of only the necessary tools.
@@ -365,16 +369,22 @@ third-party MCP server, even if the server offers other tools like
 
 #### More secure pattern: Define and add to allowlist in system settings
 
-To create a secure, centrally-managed catalog of tools, the system administrator
-**must** do both of the following in the system-level `settings.json` file:
+To create a secure, centrally-managed catalog of tools, you **must** complete
+all of the following steps when configuring the system-level `settings.json`
+file:
 
 1.  **Define the full configuration** for every approved server in the
     `mcpServers` object. This ensures that even if a user defines a server with
-    the same name, the secure system-level definition will take precedence.
+    the same name, the secure system-level definition takes precedence.
 2.  **Add the names** of those servers to an allowlist using the `mcp.allowed`
     setting. This is a critical security step that prevents users from running
-    any servers that are not on this list. If this setting is omitted, the CLI
-    will merge and allow any server defined by the user.
+    any servers that aren't on this list. If you omit this setting, Gemini CLI
+    merges and runs any server defined by the user.
+3.  **Lock down executable and directory permissions** for every local command
+    referenced in `mcpServers`. Each executable script or binary, its parent
+    directories, and any scripts or dependencies it invokes **must** be owned by
+    `root` (or `SYSTEM` or `Administrators` on Windows) and **must not** be
+    writable by non-administrative users or shared user groups.
 
 **Example system `settings.json`:**
 
@@ -404,6 +414,18 @@ This pattern is more secure because it uses both definition and an allowlist.
 Any server a user defines will either be overridden by the system definition (if
 it has the same name) or blocked because its name is not in the `mcp.allowed`
 list.
+
+<!-- prettier-ignore -->
+> [!WARNING]
+> Gemini CLI skips system-configured MCP servers whose local command or script
+> path fails ownership or write-permission checks and logs a startup security
+> warning. Ensure any secondary scripts, binaries, and dependencies invoked
+> inside wrapper scripts are also locked down. Because `mcp.allowed`
+> automatically approves tool calls from listed servers, we recommend
+> restricting exposed tools with `includeTools`, pinning absolute binary paths
+> inside wrapper scripts, or enforcing remote (`sse` or `http`) server
+> allowlists with
+> [Enterprise Admin Controls](../admin/enterprise-controls.md).
 
 ### Less secure pattern: Omitting the allowlist
 
@@ -477,9 +499,8 @@ an environment variable, but it can also be enforced for custom tools via the
 ## Telemetry and auditing
 
 For auditing and monitoring purposes, you can configure Gemini CLI to send
-telemetry data to a central location. This allows you to track tool usage and
-other events. For more information, see the
-[telemetry documentation](./telemetry.md).
+telemetry data to a central location. This lets you track tool usage and other
+events. For more information, see the [telemetry documentation](./telemetry.md).
 
 **Example:** Enable telemetry and send it to a local OTLP collector. If
 `otlpEndpoint` is not specified, it defaults to `http://localhost:4317`.
@@ -494,21 +515,27 @@ other events. For more information, see the
 }
 ```
 
-**Note:** Ensure that `logPrompts` is set to `false` in an enterprise setting to
-avoid collecting potentially sensitive information from user prompts.
+<!-- prettier-ignore -->
+> [!NOTE]
+> Ensure that `logPrompts` is set to `false` in an enterprise setting to
+> avoid collecting potentially sensitive information from user prompts.
 
 ## Authentication
 
 You can enforce a specific authentication method for all users by setting the
-`enforcedAuthType` in the system-level `settings.json` file. This prevents users
-from choosing a different authentication method. See the
-[Authentication docs](../get-started/authentication.md) for more details.
+`security.auth.enforcedType` in the system-level `settings.json` file. This
+prevents users from choosing a different authentication method. See the
+[Authentication docs](../get-started/authentication.mdx) for more details.
 
 **Example:** Enforce the use of Google login for all users.
 
 ```json
 {
-  "enforcedAuthType": "oauth-personal"
+  "security": {
+    "auth": {
+      "enforcedType": "oauth-personal"
+    }
+  }
 }
 ```
 

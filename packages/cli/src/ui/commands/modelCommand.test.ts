@@ -37,8 +37,11 @@ describe('modelCommand', () => {
     }
 
     const mockRefreshUserQuota = vi.fn();
-    mockContext.services.config = {
+    mockContext.services.agentContext = {
       refreshUserQuota: mockRefreshUserQuota,
+      get config() {
+        return this;
+      },
     } as unknown as Config;
 
     await modelCommand.action(mockContext, '');
@@ -66,8 +69,11 @@ describe('modelCommand', () => {
         (c) => c.name === 'manage',
       );
       const mockRefreshUserQuota = vi.fn();
-      mockContext.services.config = {
+      mockContext.services.agentContext = {
         refreshUserQuota: mockRefreshUserQuota,
+        get config() {
+          return this;
+        },
       } as unknown as Config;
 
       await manageCommand!.action!(mockContext, '');
@@ -84,7 +90,7 @@ describe('modelCommand', () => {
       expect(setCommand).toBeDefined();
 
       const mockSetModel = vi.fn();
-      mockContext.services.config = {
+      mockContext.services.agentContext = {
         setModel: mockSetModel,
         getHasAccessToPreviewModel: vi.fn().mockReturnValue(true),
         getUserId: vi.fn().mockReturnValue('test-user'),
@@ -98,15 +104,18 @@ describe('modelCommand', () => {
         getPolicyEngine: vi.fn().mockReturnValue({
           getApprovalMode: vi.fn().mockReturnValue('auto'),
         }),
+        get config() {
+          return this;
+        },
       } as unknown as Config;
 
-      await setCommand!.action!(mockContext, 'gemini-pro');
+      await setCommand!.action!(mockContext, 'gemini-2.5-pro');
 
-      expect(mockSetModel).toHaveBeenCalledWith('gemini-pro', true);
+      expect(mockSetModel).toHaveBeenCalledWith('gemini-2.5-pro', true);
       expect(mockContext.ui.addItem).toHaveBeenCalledWith(
         expect.objectContaining({
           type: MessageType.INFO,
-          text: expect.stringContaining('Model set to gemini-pro'),
+          text: expect.stringContaining('Model set to gemini-2.5-pro'),
         }),
       );
     });
@@ -116,7 +125,7 @@ describe('modelCommand', () => {
         (c) => c.name === 'set',
       );
       const mockSetModel = vi.fn();
-      mockContext.services.config = {
+      mockContext.services.agentContext = {
         setModel: mockSetModel,
         getHasAccessToPreviewModel: vi.fn().mockReturnValue(true),
         getUserId: vi.fn().mockReturnValue('test-user'),
@@ -130,15 +139,20 @@ describe('modelCommand', () => {
         getPolicyEngine: vi.fn().mockReturnValue({
           getApprovalMode: vi.fn().mockReturnValue('auto'),
         }),
+        get config() {
+          return this;
+        },
       } as unknown as Config;
 
-      await setCommand!.action!(mockContext, 'gemini-pro --persist');
+      await setCommand!.action!(mockContext, 'gemini-2.5-pro --persist');
 
-      expect(mockSetModel).toHaveBeenCalledWith('gemini-pro', false);
+      expect(mockSetModel).toHaveBeenCalledWith('gemini-2.5-pro', false);
       expect(mockContext.ui.addItem).toHaveBeenCalledWith(
         expect.objectContaining({
           type: MessageType.INFO,
-          text: expect.stringContaining('Model set to gemini-pro (persisted)'),
+          text: expect.stringContaining(
+            'Model set to gemini-2.5-pro (persisted)',
+          ),
         }),
       );
     });
@@ -156,6 +170,139 @@ describe('modelCommand', () => {
         }),
       );
     });
+
+    it('should show usage error if only --persist flag is provided without a model name', async () => {
+      const setCommand = modelCommand.subCommands?.find(
+        (c) => c.name === 'set',
+      );
+      const mockSetModel = vi.fn();
+      mockContext.services.agentContext = {
+        setModel: mockSetModel,
+        get config() {
+          return this;
+        },
+      } as unknown as Config;
+
+      await setCommand?.action?.(mockContext, '--persist');
+
+      expect(mockSetModel).not.toHaveBeenCalled();
+      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: MessageType.ERROR,
+          text: expect.stringContaining('Usage: /model set <model-name>'),
+        }),
+      );
+    });
+
+    it('should reject invalid model names and not update the configured model', async () => {
+      const setCommand = modelCommand.subCommands?.find(
+        (c) => c.name === 'set',
+      );
+      const mockSetModel = vi.fn();
+      mockContext.services.agentContext = {
+        setModel: mockSetModel,
+        get config() {
+          return this;
+        },
+      } as unknown as Config;
+
+      await setCommand?.action?.(mockContext, 'nonexistent-model-name');
+
+      expect(mockSetModel).not.toHaveBeenCalled();
+      expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: MessageType.ERROR,
+          text: expect.stringContaining(
+            'Invalid model "nonexistent-model-name"',
+          ),
+        }),
+      );
+    });
+
+    it('should accept custom model aliases configured in settings', async () => {
+      const setCommand = modelCommand.subCommands?.find(
+        (c) => c.name === 'set',
+      );
+      const mockSetModel = vi.fn();
+      mockContext.services.agentContext = {
+        setModel: mockSetModel,
+        getHasAccessToPreviewModel: vi.fn().mockReturnValue(true),
+        getUserId: vi.fn().mockReturnValue('test-user'),
+        getUsageStatisticsEnabled: vi.fn().mockReturnValue(true),
+        getSessionId: vi.fn().mockReturnValue('test-session'),
+        getContentGeneratorConfig: vi
+          .fn()
+          .mockReturnValue({ authType: 'test-auth' }),
+        isInteractive: vi.fn().mockReturnValue(true),
+        getExperiments: vi.fn().mockReturnValue({ experimentIds: [] }),
+        getPolicyEngine: vi.fn().mockReturnValue({
+          getApprovalMode: vi.fn().mockReturnValue('auto'),
+        }),
+        get config() {
+          return this;
+        },
+      } as unknown as Config;
+      mockContext.services.settings.merged.modelConfigs = {
+        ...mockContext.services.settings.merged.modelConfigs,
+        customAliases: {
+          'my-custom-alias': {
+            modelConfig: { model: 'gemini-2.5-flash' },
+          },
+        },
+      };
+
+      await setCommand?.action?.(mockContext, 'my-custom-alias');
+
+      expect(mockSetModel).toHaveBeenCalledWith('my-custom-alias', true);
+    });
+
+    it('should provide completion suggestions matching partial model names', async () => {
+      const setCommand = modelCommand.subCommands?.find(
+        (c) => c.name === 'set',
+      );
+      expect(setCommand?.completion).toBeDefined();
+
+      const suggestions = await setCommand?.completion?.(
+        mockContext,
+        'gemini-2.5',
+      );
+      expect(suggestions).toBeDefined();
+      expect(suggestions).toContain('gemini-2.5-pro');
+      expect(suggestions).toContain('gemini-2.5-flash');
+      expect(suggestions?.every((s) => s.startsWith('gemini-2.5'))).toBe(true);
+    });
+  });
+
+  it('should forward arguments directly on /model <model-name> to set subcommand', async () => {
+    const mockSetModel = vi.fn();
+    mockContext.services.agentContext = {
+      setModel: mockSetModel,
+      getHasAccessToPreviewModel: vi.fn().mockReturnValue(true),
+      getUserId: vi.fn().mockReturnValue('test-user'),
+      getUsageStatisticsEnabled: vi.fn().mockReturnValue(true),
+      getSessionId: vi.fn().mockReturnValue('test-session'),
+      getContentGeneratorConfig: vi
+        .fn()
+        .mockReturnValue({ authType: 'test-auth' }),
+      isInteractive: vi.fn().mockReturnValue(true),
+      getExperiments: vi.fn().mockReturnValue({ experimentIds: [] }),
+      getPolicyEngine: vi.fn().mockReturnValue({
+        getApprovalMode: vi.fn().mockReturnValue('auto'),
+      }),
+      get config() {
+        return this;
+      },
+    } as unknown as Config;
+
+    await modelCommand.action?.(mockContext, 'gemini-2.5-flash');
+
+    expect(mockSetModel).toHaveBeenCalledWith('gemini-2.5-flash', true);
+    expect(mockContext.ui.addItem).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: MessageType.INFO,
+        text: expect.stringContaining('Model set to gemini-2.5-flash'),
+      }),
+    );
   });
 
   it('should have the correct name and description', () => {

@@ -20,6 +20,8 @@ import {
   type PolicyLoadResult,
 } from './toml-loader.js';
 import { PolicyEngine } from './policy-engine.js';
+import { SafeRegExp } from './safe-regex.js';
+import { stableStringify } from './stable-stringify.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,11 +96,15 @@ priority = 100
       expect(result.rules[0].toolName).toBe('run_shell_command');
       expect(result.rules[1].toolName).toBe('run_shell_command');
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git status"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git status' }),
+        ),
       ).toBe(true);
-      expect(result.rules[1].argsPattern?.test('{"command":"git log"}')).toBe(
-        true,
-      );
+      expect(
+        result.rules[1].argsPattern?.test(
+          stableStringify({ command: 'git log' }),
+        ),
+      ).toBe(true);
       expect(result.errors).toHaveLength(0);
     });
 
@@ -123,6 +129,7 @@ priority = 70
     it('should transform mcpName = "*" to wildcard toolName', async () => {
       const result = await runLoadPoliciesFromToml(`
 [[rule]]
+toolName = "*"
 mcpName = "*"
 decision = "ask_user"
 priority = 10
@@ -159,15 +166,53 @@ priority = 100
 
       expect(result.rules).toHaveLength(1);
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git status"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git status' }),
+        ),
       ).toBe(true);
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git log --all"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git log --all' }),
+        ),
       ).toBe(true);
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git branch"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git branch' }),
+        ),
       ).toBe(false);
       expect(result.errors).toHaveLength(0);
+    });
+
+    it('should load a commandRegex that contains a quantified group', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = "npm run (test|lint)?"
+decision = "allow"
+priority = 100
+`);
+
+      expect(result.errors).toHaveLength(0);
+      expect(result.rules).toHaveLength(1);
+      expect(
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'npm run test' }),
+        ),
+      ).toBe(true);
+    });
+
+    it('should still reject a commandRegex with nested quantifiers', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+commandRegex = "(a+)+"
+decision = "allow"
+priority = 100
+`);
+
+      expect(result.rules).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('regex_compilation');
     });
 
     it('should NOT match if ^ is used in commandRegex because it matches against full JSON', async () => {
@@ -180,10 +225,12 @@ priority = 100
 `);
 
       expect(result.rules).toHaveLength(1);
-      // The generated pattern is "command":"^git status
-      // This will NOT match '{"command":"git status"}' because of the '{"' at the start.
+      // The generated pattern is \x00"command":"(?:^git status)
+      // This will NOT match because ^ only matches at the start of the full JSON.
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git status"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git status' }),
+        ),
       ).toBe(false);
       expect(result.errors).toHaveLength(0);
     });
@@ -263,6 +310,43 @@ allow_redirection = true
       expect(result.errors).toHaveLength(0);
     });
 
+    it('should parse and transform allowRedirection property (camelCase)', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = "echo"
+decision = "allow"
+priority = 100
+allowRedirection = true
+`);
+
+      expect(result.rules).toHaveLength(1);
+      expect(result.rules[0].allowRedirection).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+
+    it('should parse and transform allowCommandSubstitution and allow_command_substitution', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = "echo"
+decision = "allow"
+priority = 100
+allowCommandSubstitution = true
+
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = "git"
+decision = "allow"
+priority = 100
+allow_command_substitution = false
+`);
+
+      expect(result.rules).toHaveLength(2);
+      expect(result.rules[0].allowCommandSubstitution).toBe(true);
+      expect(result.rules[1].allowCommandSubstitution).toBe(false);
+      expect(result.errors).toHaveLength(0);
+    });
     it('should parse deny_message property', async () => {
       const result = await runLoadPoliciesFromToml(`
 [[rule]]
@@ -273,7 +357,21 @@ deny_message = "Deletion is permanent"
 `);
 
       expect(result.rules).toHaveLength(1);
-      expect(result.rules[0].toolName).toBe('rm');
+      expect(result.rules[0].decision).toBe(PolicyDecision.DENY);
+      expect(result.rules[0].denyMessage).toBe('Deletion is permanent');
+      expect(getErrors(result)).toHaveLength(0);
+    });
+
+    it('should parse denyMessage property (camelCase)', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "rm"
+decision = "deny"
+priority = 100
+denyMessage = "Deletion is permanent"
+`);
+
+      expect(result.rules).toHaveLength(1);
       expect(result.rules[0].decision).toBe(PolicyDecision.DENY);
       expect(result.rules[0].denyMessage).toBe('Deletion is permanent');
       expect(getErrors(result)).toHaveLength(0);
@@ -392,10 +490,14 @@ priority = 100
       expect(result.rules).toHaveLength(1);
       // The regex should have escaped the * and .
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git log file.txt"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git log file.txt' }),
+        ),
       ).toBe(false);
       expect(
-        result.rules[0].argsPattern?.test('{"command":"git log *.txt"}'),
+        result.rules[0].argsPattern?.test(
+          stableStringify({ command: 'git log *.txt' }),
+        ),
       ).toBe(true);
       expect(result.errors).toHaveLength(0);
     });
@@ -445,9 +547,244 @@ name = "allowed-path"
       expect(result.checkers[0].priority).toBe(1.1); // tier 1 + 100/1000
       expect(result.checkers[0].source).toBe('Default: test.toml');
     });
+
+    it('should load AllowedPathChecker from default write.toml policy file for write and replace tools', async () => {
+      const defaultWritePolicyPath = path.join(
+        __dirname,
+        'policies',
+        'write.toml',
+      );
+      const result = await loadPoliciesFromToml(
+        [defaultWritePolicyPath],
+        (_dir) => 1,
+      );
+
+      const writeCheckers = result.checkers.filter(
+        (c) => c.toolName === 'write_file' || c.toolName === 'replace',
+      );
+
+      expect(writeCheckers).toHaveLength(2);
+      expect(writeCheckers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            toolName: 'replace',
+            priority: 1.015,
+            modes: ['autoEdit'],
+            checker: expect.objectContaining({
+              name: 'allowed-path',
+              type: 'in-process',
+            }),
+          }),
+          expect.objectContaining({
+            toolName: 'write_file',
+            priority: 1.015,
+            modes: ['autoEdit'],
+            checker: expect.objectContaining({
+              name: 'allowed-path',
+              type: 'in-process',
+            }),
+          }),
+        ]),
+      );
+      expect(getErrors(result)).toHaveLength(0);
+    });
+  });
+
+  describe('Linear-time regex engine', () => {
+    it('should compile argsPattern into a SafeRegExp', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+argsPattern = '"command":"(git|npm)'
+decision = "allow"
+priority = 100
+`);
+
+      expect(getErrors(result)).toHaveLength(0);
+      expect(result.rules).toHaveLength(1);
+      expect(result.rules[0].argsPattern).toBeInstanceOf(SafeRegExp);
+      expect(result.rules[0].argsPattern?.source).toBe('"command":"(git|npm)');
+    });
+
+    it('should evaluate an alternation pattern with overlapping branches in linear time', async () => {
+      // This pattern passes the nested-quantifier check, so it loads.
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+argsPattern = '(a|aa)+$'
+decision = "deny"
+priority = 100
+`);
+
+      expect(getErrors(result)).toHaveLength(0);
+      expect(result.rules).toHaveLength(1);
+      const argsPattern = result.rules[0].argsPattern!;
+      argsPattern.test('warm-up');
+
+      // The smaller size is checked first so that a slowdown is reported by
+      // an assertion on a short input rather than by a long-running test.
+      for (const size of [38, 50]) {
+        const input = 'a'.repeat(size) + '!';
+        const start = performance.now();
+        const matched = argsPattern.test(input);
+        const elapsed = performance.now() - start;
+
+        expect(matched).toBe(false);
+        expect(elapsed).toBeLessThan(50);
+      }
+    });
+
+    it('should still reject a nested-quantifier pattern at load time', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+argsPattern = '(a+)+$'
+decision = "deny"
+priority = 100
+`);
+
+      const errors = getErrors(result);
+      expect(result.rules).toHaveLength(0);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].errorType).toBe('regex_compilation');
+      expect(errors[0].details).toBe('Pattern: (a+)+$');
+      expect(errors[0].suggestion).toBe(
+        'Avoid nested quantifiers or extremely long patterns',
+      );
+    });
+
+    it('should report a pattern that compiles beyond the size limit', async () => {
+      const largePattern = '"command":".{1000}.{1000}';
+      const compiledSize = SafeRegExp.compile(largePattern).programSize;
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+argsPattern = '${largePattern}'
+decision = "deny"
+priority = 200
+
+[[rule]]
+toolName = "run_shell_command"
+argsPattern = '"command":".{1000}'
+decision = "deny"
+priority = 100
+
+[[safety_checker]]
+toolName = "write_file"
+argsPattern = '.{1000}.{1000}'
+priority = 100
+[safety_checker.checker]
+type = "in-process"
+name = "allowed-path"
+`);
+
+      const errors = getErrors(result);
+      expect(compiledSize).toBeGreaterThan(2000);
+      expect(errors).toHaveLength(2);
+      expect(errors[0].errorType).toBe('regex_compilation');
+      expect(errors[0].message).toBe('Regex pattern exceeds the size limit');
+      expect(errors[0].details).toBe(
+        `Pattern: ${largePattern}\nCompiled size: ${compiledSize} (limit: 2000)`,
+      );
+      expect(errors[0].suggestion).toContain('smaller repetition counts');
+      expect(errors[1].message).toBe(
+        'Regex pattern in safety checker exceeds the size limit',
+      );
+      // The pattern within the limit loads. The other two are skipped.
+      expect(result.rules).toHaveLength(1);
+      expect(result.rules[0].argsPattern?.source).toBe('"command":".{1000}');
+      expect(result.checkers).toHaveLength(0);
+    });
+
+    it.each([
+      ['lookahead', '"command":"git (?!push)'],
+      ['lookbehind', '(?<=git )status'],
+      ['a backreference', '(a)\\1'],
+    ])(
+      'should report %s as a validation error and keep loading other rules',
+      async (_name, pattern) => {
+        const result = await runLoadPoliciesFromToml(`
+[[rule]]
+toolName = "run_shell_command"
+argsPattern = '${pattern}'
+decision = "deny"
+priority = 200
+
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = "git status"
+decision = "allow"
+priority = 100
+`);
+
+        const errors = getErrors(result);
+        expect(errors).toHaveLength(1);
+        expect(errors[0].errorType).toBe('regex_compilation');
+        expect(errors[0].message).toBe('Invalid regex pattern');
+        expect(errors[0].details).toContain(pattern);
+        expect(errors[0].suggestion).toContain('RE2 syntax');
+        // The rule with the unsupported pattern is skipped. The valid one loads.
+        expect(result.rules).toHaveLength(1);
+        expect(result.rules[0].decision).toBe(PolicyDecision.ALLOW);
+      },
+    );
+
+    it('should report an unsupported pattern in a safety checker', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[safety_checker]]
+toolName = "write_file"
+argsPattern = '(?!tmp)'
+priority = 100
+[safety_checker.checker]
+type = "in-process"
+name = "allowed-path"
+`);
+
+      const errors = getErrors(result);
+      expect(result.checkers).toHaveLength(0);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].errorType).toBe('regex_compilation');
+      expect(errors[0].message).toBe('Invalid regex pattern in safety checker');
+      expect(errors[0].suggestion).toContain('RE2 syntax');
+    });
+
+    it('should load every built-in policy file without regex errors', async () => {
+      const result = await loadPoliciesFromToml(
+        [path.join(__dirname, 'policies')],
+        (_dir) => 1,
+      );
+
+      const regexErrors = result.errors.filter(
+        (error) => error.errorType === 'regex_compilation',
+      );
+      const rulesWithPattern = result.rules.filter((rule) => rule.argsPattern);
+
+      expect(regexErrors).toEqual([]);
+      expect(rulesWithPattern.length).toBeGreaterThan(0);
+      expect(
+        rulesWithPattern.every(
+          (rule) => rule.argsPattern instanceof SafeRegExp,
+        ),
+      ).toBe(true);
+    });
   });
 
   describe('Negative Tests', () => {
+    it('should return a schema_validation error if toolName is missing in safety_checker', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[safety_checker]]
+priority = 100
+[safety_checker.checker]
+type = "in-process"
+name = "allowed-path"
+`);
+      expect(result.errors).toHaveLength(1);
+      const error = result.errors[0];
+      expect(error.errorType).toBe('schema_validation');
+      expect(error.details).toContain('toolName');
+      expect(error.details).toContain('Invalid input');
+    });
+
     it('should return a schema_validation error if priority is missing', async () => {
       const result = await runLoadPoliciesFromToml(`
 [[rule]]
@@ -541,6 +878,19 @@ priority = 100
       const error = result.errors[0];
       expect(error.errorType).toBe('schema_validation');
       expect(error.details).toContain('decision');
+    });
+
+    it('should return a schema_validation error if toolName is missing', async () => {
+      const result = await runLoadPoliciesFromToml(`
+[[rule]]
+decision = "allow"
+priority = 100
+`);
+      expect(result.errors).toHaveLength(1);
+      const error = result.errors[0];
+      expect(error.errorType).toBe('schema_validation');
+      expect(error.details).toContain('toolName');
+      expect(error.details).toContain('Invalid input');
     });
 
     it('should return a schema_validation error if toolName is not a string or array', async () => {
@@ -767,9 +1117,10 @@ priority = 100
       expect(result.rules).toHaveLength(2);
     });
 
-    it('should not warn for catch-all rules (no toolName)', async () => {
+    it('should not warn for catch-all rules (toolName = "*")', async () => {
       const result = await runLoadPoliciesFromToml(`
 [[rule]]
+toolName = "*"
 decision = "deny"
 priority = 100
 `);
@@ -827,26 +1178,27 @@ priority = 100
           'Should have loaded a rule with toolAnnotations',
         ).toBeDefined();
         expect(annotationRule!.toolName).toBe('mcp_*');
+        expect(annotationRule!.mcpName).toBe('*');
         expect(annotationRule!.toolAnnotations).toEqual({
           readOnlyHint: true,
         });
         expect(annotationRule!.decision).toBe(PolicyDecision.ASK_USER);
-        // Priority 70 in tier 1 => 1.070
-        expect(annotationRule!.priority).toBe(1.07);
+        // Priority 50 in tier 1 => 1.050
+        expect(annotationRule!.priority).toBe(1.05);
 
         // Verify deny rule was loaded correctly
         const denyRule = result.rules.find(
           (r) =>
             r.decision === PolicyDecision.DENY &&
-            r.toolName === undefined &&
+            r.toolName === '*' &&
             r.denyMessage?.includes('Plan Mode'),
         );
         expect(
           denyRule,
           'Should have loaded the catch-all deny rule',
         ).toBeDefined();
-        // Priority 60 in tier 1 => 1.060
-        expect(denyRule!.priority).toBe(1.06);
+        // Priority 40 in tier 1 => 1.040
+        expect(denyRule!.priority).toBe(1.04);
 
         // 2. Initialize Policy Engine in Plan Mode
         const engine = new PolicyEngine({
@@ -915,12 +1267,23 @@ priority = 100
 
     it('should override default subagent rules when in Plan Mode for unknown subagents', async () => {
       const planTomlPath = path.resolve(__dirname, 'policies', 'plan.toml');
-      const fileContent = await fs.readFile(planTomlPath, 'utf-8');
+      const readOnlyTomlPath = path.resolve(
+        __dirname,
+        'policies',
+        'read-only.toml',
+      );
+      const planContent = await fs.readFile(planTomlPath, 'utf-8');
+      const readOnlyContent = await fs.readFile(readOnlyTomlPath, 'utf-8');
+
       const tempPolicyDir = await fs.mkdtemp(
         path.join(os.tmpdir(), 'plan-policy-test-'),
       );
       try {
-        await fs.writeFile(path.join(tempPolicyDir, 'plan.toml'), fileContent);
+        await fs.writeFile(path.join(tempPolicyDir, 'plan.toml'), planContent);
+        await fs.writeFile(
+          path.join(tempPolicyDir, 'read-only.toml'),
+          readOnlyContent,
+        );
         const getPolicyTier = () => 1; // Default tier
 
         // 1. Load the actual Plan Mode policies
@@ -937,7 +1300,10 @@ priority = 100
 
         // 3. Simulate an unknown Subagent being registered (Dynamic Rule)
         engine.addRule({
-          toolName: 'unknown_subagent',
+          toolName: 'invoke_agent',
+          argsPattern: SafeRegExp.compile(
+            /"agent_name":\s*"unknown_subagent"/.source,
+          ),
           decision: PolicyDecision.ALLOW,
           priority: PRIORITY_SUBAGENT_TOOL,
           source: 'AgentRegistry (Dynamic)',
@@ -945,8 +1311,9 @@ priority = 100
 
         // 4. Verify Behavior:
         // The Plan Mode "Catch-All Deny" (from plan.toml) should override the Subagent Allow
+        // Plan Mode Deny (1.04) > Subagent Allow (1.03)
         const checkResult = await engine.check(
-          { name: 'unknown_subagent' },
+          { name: 'invoke_agent', args: { agent_name: 'unknown_subagent' } },
           undefined,
         );
 
@@ -956,7 +1323,7 @@ priority = 100
         ).toBe(PolicyDecision.DENY);
 
         // 5. Verify Explicit Allows still work
-        // e.g. 'read_file' should be allowed because its priority in plan.toml (70) is higher than the deny (60)
+        // e.g. 'read_file' should be allowed because its priority in read-only.toml (50) is higher than the deny (40)
         const readResult = await engine.check({ name: 'read_file' }, undefined);
         expect(
           readResult.decision,
@@ -964,8 +1331,12 @@ priority = 100
         ).toBe(PolicyDecision.ALLOW);
 
         // 6. Verify Built-in Research Subagents are ALLOWED
+        // codebase_investigator is priority 50 in read-only.toml
         const codebaseResult = await engine.check(
-          { name: 'codebase_investigator' },
+          {
+            name: 'invoke_agent',
+            args: { agent_name: 'codebase_investigator' },
+          },
           undefined,
         );
         expect(
@@ -974,12 +1345,31 @@ priority = 100
         ).toBe(PolicyDecision.ALLOW);
 
         const cliHelpResult = await engine.check(
-          { name: 'cli_help' },
+          { name: 'invoke_agent', args: { agent_name: 'cli_help' } },
           undefined,
         );
         expect(
           cliHelpResult.decision,
           'cli_help should be ALLOWED in Plan Mode',
+        ).toBe(PolicyDecision.ALLOW);
+
+        // 7. Verify MCP resource tools are ALLOWED
+        const listMcpResult = await engine.check(
+          { name: 'list_mcp_resources' },
+          undefined,
+        );
+        expect(
+          listMcpResult.decision,
+          'list_mcp_resources should be ALLOWED in Plan Mode',
+        ).toBe(PolicyDecision.ALLOW);
+
+        const readMcpResult = await engine.check(
+          { name: 'read_mcp_resource', args: { uri: 'test://resource' } },
+          undefined,
+        );
+        expect(
+          readMcpResult.decision,
+          'read_mcp_resource should be ALLOWED in Plan Mode',
         ).toBe(PolicyDecision.ALLOW);
       } finally {
         await fs.rm(tempPolicyDir, { recursive: true, force: true });
@@ -1061,13 +1451,12 @@ priority = 100
       expect(warnings).toHaveLength(0);
     });
 
-    it('should skip rules without toolName', () => {
+    it('should skip wildcard rules (matching all tools)', () => {
       const warnings = validateMcpPolicyToolNames(
         'my-server',
         ['tool1'],
-        [{ toolName: undefined }],
+        [{ toolName: '*', mcpName: 'my-server' }],
       );
-
       expect(warnings).toHaveLength(0);
     });
 

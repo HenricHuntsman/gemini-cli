@@ -12,7 +12,11 @@ import {
   type SafetyCheckerRule,
   InProcessCheckerType,
 } from './types.js';
-import { buildArgsPatterns, isSafeRegExp } from './utils.js';
+import {
+  buildArgsPatterns,
+  compileArgsPattern,
+  MAX_PROGRAM_SIZE,
+} from './utils.js';
 import {
   isValidToolName,
   ALL_BUILTIN_TOOL_NAMES,
@@ -34,10 +38,26 @@ import { MCP_TOOL_PREFIX, formatMcpToolName } from '../tools/mcp-tool.js';
 const MAX_TYPO_DISTANCE = 3;
 
 /**
+ * Shown when a pattern does not compile. Patterns are compiled by a
+ * linear-time engine that uses RE2 syntax, so some constructs that a
+ * JavaScript `RegExp` accepts are rejected.
+ */
+const REGEX_SYNTAX_SUGGESTION =
+  'Check regex syntax for errors like unmatched brackets or invalid escape sequences. ' +
+  'Patterns use RE2 syntax: lookahead, lookbehind, and backreferences are not supported.';
+
+/**
+ * Shown when a pattern compiles to more instructions than the size limit
+ * allows. Repetition counts are the usual cause.
+ */
+const REGEX_SIZE_SUGGESTION =
+  'Use smaller repetition counts, such as {100} instead of {1000}, or split the rule into simpler patterns.';
+
+/**
  * Schema for a single policy rule in the TOML file (before transformation).
  */
 const PolicyRuleSchema = z.object({
-  toolName: z.union([z.string(), z.array(z.string())]).optional(),
+  toolName: z.union([z.string(), z.array(z.string())]),
   subagent: z.string().optional(),
   mcpName: z.string().optional(),
   argsPattern: z.string().optional(),
@@ -61,16 +81,21 @@ const PolicyRuleSchema = z.object({
         'priority must be <= 999 to prevent tier overflow. Priorities >= 1000 would jump to the next tier.',
     }),
   modes: z.array(z.nativeEnum(ApprovalMode)).optional(),
+  interactive: z.boolean().optional(),
   toolAnnotations: z.record(z.any()).optional(),
-  allow_redirection: z.boolean().optional(),
-  deny_message: z.string().optional(),
+  allowRedirection: z.boolean().optional(),
+  allow_redirection: z.boolean().optional(), // deprecated snake_case for backward compatibility
+  allowCommandSubstitution: z.boolean().optional(),
+  allow_command_substitution: z.boolean().optional(), // snake_case for compatibility
+  denyMessage: z.string().optional(),
+  deny_message: z.string().optional(), // deprecated snake_case for backward compatibility
 });
 
 /**
  * Schema for a single safety checker rule in the TOML file.
  */
 const SafetyCheckerRuleSchema = z.object({
-  toolName: z.union([z.string(), z.array(z.string())]).optional(),
+  toolName: z.union([z.string(), z.array(z.string())]),
   mcpName: z.string().optional(),
   argsPattern: z.string().optional(),
   commandPrefix: z.union([z.string(), z.array(z.string())]).optional(),
@@ -408,14 +433,28 @@ export async function loadPoliciesFromToml(
         // Validate tool names in rules
         for (let i = 0; i < tomlRules.length; i++) {
           const rule = tomlRules[i];
+
+          const toolNamesRaw: string[] = Array.isArray(rule.toolName)
+            ? rule.toolName
+            : [rule.toolName];
+
+          if (toolNamesRaw.some((name) => name === '')) {
+            errors.push({
+              filePath,
+              fileName: file,
+              tier: tierName,
+              ruleIndex: i,
+              errorType: 'rule_validation',
+              message: 'Invalid policy rule: toolName cannot be empty string',
+              details: `Rule #${i + 1} contains an empty toolName string. Use "*" to match all tools.`,
+            });
+            continue;
+          }
+
           // We no longer skip MCP-scoped rules because we need to specifically
           // warn users if they use deprecated "__" syntax for MCP tool names
 
-          const toolNames: string[] = rule.toolName
-            ? Array.isArray(rule.toolName)
-              ? rule.toolName
-              : [rule.toolName]
-            : [];
+          const toolNames: string[] = toolNamesRaw;
 
           for (const name of toolNames) {
             const warning = validateToolName(name, i);
@@ -445,15 +484,13 @@ export async function loadPoliciesFromToml(
 
             // For each argsPattern, expand toolName arrays
             return argsPatterns.flatMap((argsPattern) => {
-              const toolNames: Array<string | undefined> = rule.toolName
-                ? Array.isArray(rule.toolName)
-                  ? rule.toolName
-                  : [rule.toolName]
-                : [undefined];
+              const toolNames: string[] = Array.isArray(rule.toolName)
+                ? rule.toolName
+                : [rule.toolName];
 
               // Create a policy rule for each tool name
               return toolNames.map((toolName) => {
-                let effectiveToolName: string | undefined = toolName;
+                let effectiveToolName: string = toolName;
                 const mcpName = rule.mcpName;
 
                 if (mcpName) {
@@ -475,33 +512,51 @@ export async function loadPoliciesFromToml(
                   decision: rule.decision,
                   priority: transformPriority(rule.priority, tier),
                   modes: rule.modes,
+                  interactive: rule.interactive,
                   toolAnnotations: rule.toolAnnotations,
-                  allowRedirection: rule.allow_redirection,
+                  allowRedirection:
+                    rule.allowRedirection ?? rule.allow_redirection,
+                  allowCommandSubstitution:
+                    rule.allowCommandSubstitution ??
+                    rule.allow_command_substitution,
                   source: `${tierName.charAt(0).toUpperCase() + tierName.slice(1)}: ${file}`,
-                  denyMessage: rule.deny_message,
+                  denyMessage: rule.denyMessage ?? rule.deny_message,
                 };
 
-                // Compile regex pattern
+                // Compile with the linear-time engine. A policy pattern is
+                // never turned into a native RegExp.
                 if (argsPattern) {
-                  try {
-                    new RegExp(argsPattern);
-                  } catch (e) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-                    const error = e as Error;
+                  const compiled = compileArgsPattern(
+                    argsPattern,
+                    rule.commandRegex ?? argsPattern,
+                  );
+                  if (!compiled.ok && compiled.reason === 'invalid') {
                     errors.push({
                       filePath,
                       fileName: file,
                       tier: tierName,
                       errorType: 'regex_compilation',
                       message: 'Invalid regex pattern',
-                      details: `Pattern: ${argsPattern}\nError: ${error.message}`,
-                      suggestion:
-                        'Check regex syntax for errors like unmatched brackets or invalid escape sequences',
+                      details: `Pattern: ${argsPattern}\nError: ${compiled.error}`,
+                      suggestion: REGEX_SYNTAX_SUGGESTION,
                     });
                     return null;
                   }
 
-                  if (!isSafeRegExp(argsPattern)) {
+                  if (!compiled.ok && compiled.reason === 'too_large') {
+                    errors.push({
+                      filePath,
+                      fileName: file,
+                      tier: tierName,
+                      errorType: 'regex_compilation',
+                      message: 'Regex pattern exceeds the size limit',
+                      details: `Pattern: ${argsPattern}\nCompiled size: ${compiled.programSize} (limit: ${MAX_PROGRAM_SIZE})`,
+                      suggestion: REGEX_SIZE_SUGGESTION,
+                    });
+                    return null;
+                  }
+
+                  if (!compiled.ok) {
                     errors.push({
                       filePath,
                       fileName: file,
@@ -515,7 +570,7 @@ export async function loadPoliciesFromToml(
                     return null;
                   }
 
-                  policyRule.argsPattern = new RegExp(argsPattern);
+                  policyRule.argsPattern = compiled.regex;
                 }
 
                 return policyRule;
@@ -530,13 +585,28 @@ export async function loadPoliciesFromToml(
         const tomlCheckerRules = validationResult.data.safety_checker ?? [];
         for (let i = 0; i < tomlCheckerRules.length; i++) {
           const checker = tomlCheckerRules[i];
+
+          const checkerToolNamesRaw: string[] = Array.isArray(checker.toolName)
+            ? checker.toolName
+            : [checker.toolName];
+
+          if (checkerToolNamesRaw.some((name) => name === '')) {
+            errors.push({
+              filePath,
+              fileName: file,
+              tier: tierName,
+              ruleIndex: i,
+              errorType: 'rule_validation',
+              message:
+                'Invalid safety checker rule: toolName cannot be empty string',
+              details: `Checker #${i + 1} contains an empty toolName string. Use "*" to match all tools.`,
+            });
+            continue;
+          }
+
           if (checker.mcpName) continue;
 
-          const checkerToolNames: string[] = checker.toolName
-            ? Array.isArray(checker.toolName)
-              ? checker.toolName
-              : [checker.toolName]
-            : [];
+          const checkerToolNames: string[] = checkerToolNamesRaw;
 
           for (const name of checkerToolNames) {
             const warning = validateToolName(name, i);
@@ -567,15 +637,13 @@ export async function loadPoliciesFromToml(
             );
 
             return argsPatterns.flatMap((argsPattern) => {
-              const toolNames: Array<string | undefined> = checker.toolName
-                ? Array.isArray(checker.toolName)
-                  ? checker.toolName
-                  : [checker.toolName]
-                : [undefined];
+              const toolNames: string[] = Array.isArray(checker.toolName)
+                ? checker.toolName
+                : [checker.toolName];
 
               return toolNames.map((toolName) => {
-                let effectiveToolName: string | undefined;
-                if (checker.mcpName && toolName) {
+                let effectiveToolName: string;
+                if (checker.mcpName && toolName !== '*') {
                   effectiveToolName = `${MCP_TOOL_PREFIX}${checker.mcpName}_${toolName}`;
                 } else if (checker.mcpName) {
                   effectiveToolName = `${MCP_TOOL_PREFIX}${checker.mcpName}_*`;
@@ -595,23 +663,38 @@ export async function loadPoliciesFromToml(
                 };
 
                 if (argsPattern) {
-                  try {
-                    new RegExp(argsPattern);
-                  } catch (e) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-                    const error = e as Error;
+                  const compiled = compileArgsPattern(
+                    argsPattern,
+                    checker.commandRegex ?? argsPattern,
+                  );
+                  if (!compiled.ok && compiled.reason === 'invalid') {
                     errors.push({
                       filePath,
                       fileName: file,
                       tier: tierName,
                       errorType: 'regex_compilation',
                       message: 'Invalid regex pattern in safety checker',
-                      details: `Pattern: ${argsPattern}\nError: ${error.message}`,
+                      details: `Pattern: ${argsPattern}\nError: ${compiled.error}`,
+                      suggestion: REGEX_SYNTAX_SUGGESTION,
                     });
                     return null;
                   }
 
-                  if (!isSafeRegExp(argsPattern)) {
+                  if (!compiled.ok && compiled.reason === 'too_large') {
+                    errors.push({
+                      filePath,
+                      fileName: file,
+                      tier: tierName,
+                      errorType: 'regex_compilation',
+                      message:
+                        'Regex pattern in safety checker exceeds the size limit',
+                      details: `Pattern: ${argsPattern}\nCompiled size: ${compiled.programSize} (limit: ${MAX_PROGRAM_SIZE})`,
+                      suggestion: REGEX_SIZE_SUGGESTION,
+                    });
+                    return null;
+                  }
+
+                  if (!compiled.ok) {
                     errors.push({
                       filePath,
                       fileName: file,
@@ -624,7 +707,7 @@ export async function loadPoliciesFromToml(
                     return null;
                   }
 
-                  safetyCheckerRule.argsPattern = new RegExp(argsPattern);
+                  safetyCheckerRule.argsPattern = compiled.regex;
                 }
 
                 return safetyCheckerRule;
@@ -670,7 +753,7 @@ export function validateMcpPolicyToolNames(
   serverName: string,
   discoveredToolNames: string[],
   policyRules: ReadonlyArray<{
-    toolName?: string;
+    toolName: string;
     mcpName?: string;
     source?: string;
   }>,
@@ -702,7 +785,7 @@ export function validateMcpPolicyToolNames(
     if (discoveredToolNames.length === 0) continue;
 
     const minDistance = Math.min(
-      ...discoveredToolNames.map((n) => levenshtein.get(toolPart, n)),
+      ...discoveredToolNames.map((n) => levenshtein.get(toolPart ?? '', n)),
     );
 
     if (minDistance > MAX_TYPO_DISTANCE) continue;

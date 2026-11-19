@@ -57,6 +57,8 @@ import {
   type ToolOutputMaskingEvent,
   type KeychainAvailabilityEvent,
   type TokenStorageInitializationEvent,
+  type OnboardingStartEvent,
+  type OnboardingSuccessEvent,
 } from './types.js';
 import {
   recordApiErrorMetrics,
@@ -79,6 +81,12 @@ import {
   recordKeychainAvailability,
   recordTokenStorageInitialization,
   recordInvalidChunk,
+  recordOnboardingStart,
+  recordOnboardingSuccess,
+  recordBrowserAgentConnection,
+  recordBrowserAgentVisionStatus,
+  recordBrowserAgentTaskOutcome,
+  recordBrowserAgentCleanup,
 } from './metrics.js';
 import { bufferTelemetryEvent } from './sdk.js';
 import { uiTelemetryService, type UiEvent } from './uiTelemetry.js';
@@ -112,7 +120,7 @@ export function logCliConfiguration(
       .catch((e: unknown) => {
         debugLogger.error('Failed to log telemetry event', e);
       });
-  });
+  }, config);
 }
 
 export function logUserPrompt(config: Config, event: UserPromptEvent): void {
@@ -125,12 +133,13 @@ export function logUserPrompt(config: Config, event: UserPromptEvent): void {
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logToolCall(config: Config, event: ToolCallEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_TOOL_CALL,
     'event.timestamp': new Date().toISOString(),
@@ -167,7 +176,7 @@ export function logToolCall(config: Config, event: ToolCallEvent): void {
         });
       }
     }
-  });
+  }, config);
 }
 
 export function logToolOutputTruncated(
@@ -182,7 +191,7 @@ export function logToolOutputTruncated(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logToolOutputMasking(
@@ -197,7 +206,7 @@ export function logToolOutputMasking(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logFileOperation(
@@ -220,7 +229,7 @@ export function logFileOperation(
       extension: event.extension,
       programming_language: event.programming_language,
     });
-  });
+  }, config);
 }
 
 export function logApiRequest(config: Config, event: ApiRequestEvent): void {
@@ -229,7 +238,7 @@ export function logApiRequest(config: Config, event: ApiRequestEvent): void {
     const logger = logs.getLogger(SERVICE_NAME);
     logger.emit(event.toLogRecord(config));
     logger.emit(event.toSemanticLogRecord(config));
-  });
+  }, config);
 }
 
 export function logFlashFallback(
@@ -244,7 +253,7 @@ export function logFlashFallback(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logRipgrepFallback(
@@ -259,12 +268,13 @@ export function logRipgrepFallback(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logApiError(config: Config, event: ApiErrorEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_API_ERROR,
     'event.timestamp': new Date().toISOString(),
@@ -291,12 +301,13 @@ export function logApiError(config: Config, event: ApiErrorEvent): void {
         'error.type': event.error_type || 'unknown',
       },
     });
-  });
+  }, config);
 }
 
 export function logApiResponse(config: Config, event: ApiResponseEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_API_RESPONSE,
     'event.timestamp': new Date().toISOString(),
@@ -331,7 +342,7 @@ export function logApiResponse(config: Config, event: ApiResponseEvent): void {
         genAiAttributes: conventionAttributes,
       });
     }
-  });
+  }, config);
 }
 
 export function logLoopDetected(
@@ -346,7 +357,7 @@ export function logLoopDetected(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logLoopDetectionDisabled(
@@ -361,7 +372,7 @@ export function logLoopDetectionDisabled(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logNextSpeakerCheck(
@@ -376,7 +387,7 @@ export function logNextSpeakerCheck(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logSlashCommand(
@@ -391,12 +402,13 @@ export function logSlashCommand(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logRewind(config: Config, event: RewindEvent): void {
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
   const uiEvent = {
+    // eslint-disable-next-line @typescript-eslint/no-misused-spread
     ...event,
     'event.name': EVENT_REWIND,
     'event.timestamp': new Date().toISOString(),
@@ -410,7 +422,7 @@ export function logRewind(config: Config, event: RewindEvent): void {
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logIdeConnection(
@@ -425,7 +437,7 @@ export function logIdeConnection(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logConversationFinishedEvent(
@@ -440,7 +452,7 @@ export function logConversationFinishedEvent(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logChatCompression(
@@ -474,7 +486,7 @@ export function logMalformedJsonResponse(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logInvalidChunk(
@@ -490,7 +502,7 @@ export function logInvalidChunk(
     };
     logger.emit(logRecord);
     recordInvalidChunk(config);
-  });
+  }, config);
 }
 
 export function logNetworkRetryAttempt(
@@ -509,7 +521,7 @@ export function logNetworkRetryAttempt(
       model: event.model,
       attempt: event.attempt,
     });
-  });
+  }, config);
 }
 
 export function logContentRetry(
@@ -525,7 +537,7 @@ export function logContentRetry(
     };
     logger.emit(logRecord);
     recordContentRetry(config);
-  });
+  }, config);
 }
 
 export function logContentRetryFailure(
@@ -541,7 +553,7 @@ export function logContentRetryFailure(
     };
     logger.emit(logRecord);
     recordContentRetryFailure(config);
-  });
+  }, config);
 }
 
 export function logModelRouting(
@@ -557,7 +569,7 @@ export function logModelRouting(
     };
     logger.emit(logRecord);
     recordModelRoutingMetrics(config, event);
-  });
+  }, config);
 }
 
 export function logModelSlashCommand(
@@ -573,7 +585,7 @@ export function logModelSlashCommand(
     };
     logger.emit(logRecord);
     recordModelSlashCommand(config, event);
-  });
+  }, config);
 }
 
 export async function logExtensionInstallEvent(
@@ -588,7 +600,7 @@ export async function logExtensionInstallEvent(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export async function logExtensionUninstall(
@@ -603,7 +615,7 @@ export async function logExtensionUninstall(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export async function logExtensionUpdateEvent(
@@ -618,7 +630,7 @@ export async function logExtensionUpdateEvent(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export async function logExtensionEnable(
@@ -633,7 +645,7 @@ export async function logExtensionEnable(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export async function logExtensionDisable(
@@ -648,7 +660,7 @@ export async function logExtensionDisable(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logEditStrategy(
@@ -663,7 +675,7 @@ export function logEditStrategy(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logEditCorrectionEvent(
@@ -678,7 +690,7 @@ export function logEditCorrectionEvent(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logAgentStart(config: Config, event: AgentStartEvent): void {
@@ -690,7 +702,7 @@ export function logAgentStart(config: Config, event: AgentStartEvent): void {
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logAgentFinish(config: Config, event: AgentFinishEvent): void {
@@ -704,7 +716,7 @@ export function logAgentFinish(config: Config, event: AgentFinishEvent): void {
     logger.emit(logRecord);
 
     recordAgentRunMetrics(config, event);
-  });
+  }, config);
 }
 
 export function logRecoveryAttempt(
@@ -721,7 +733,7 @@ export function logRecoveryAttempt(
     logger.emit(logRecord);
 
     recordRecoveryAttemptMetrics(config, event);
-  });
+  }, config);
 }
 
 export function logWebFetchFallbackAttempt(
@@ -736,7 +748,7 @@ export function logWebFetchFallbackAttempt(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logLlmLoopCheck(
@@ -751,7 +763,7 @@ export function logLlmLoopCheck(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 }
 
 export function logApprovalModeSwitch(
@@ -764,7 +776,7 @@ export function logApprovalModeSwitch(
       body: event.toLogBody(),
       attributes: event.toOpenTelemetryAttributes(config),
     });
-  });
+  }, config);
 }
 
 export function logApprovalModeDuration(
@@ -777,7 +789,7 @@ export function logApprovalModeDuration(
       body: event.toLogBody(),
       attributes: event.toOpenTelemetryAttributes(config),
     });
-  });
+  }, config);
 }
 
 export function logPlanExecution(config: Config, event: PlanExecutionEvent) {
@@ -791,7 +803,7 @@ export function logPlanExecution(config: Config, event: PlanExecutionEvent) {
     recordPlanExecution(config, {
       approval_mode: event.approval_mode,
     });
-  });
+  }, config);
 }
 
 export function logHookCall(config: Config, event: HookCallEvent): void {
@@ -811,7 +823,7 @@ export function logHookCall(config: Config, event: HookCallEvent): void {
       event.duration_ms,
       event.success,
     );
-  });
+  }, config);
 }
 
 export function logStartupStats(
@@ -834,7 +846,7 @@ export function logStartupStats(
       .catch((e: unknown) => {
         debugLogger.error('Failed to log telemetry event', e);
       });
-  });
+  }, config);
 }
 
 export function logKeychainAvailability(
@@ -851,7 +863,7 @@ export function logKeychainAvailability(
     logger.emit(logRecord);
 
     recordKeychainAvailability(config, event);
-  });
+  }, config);
 }
 
 export function logTokenStorageInitialization(
@@ -868,7 +880,41 @@ export function logTokenStorageInitialization(
     logger.emit(logRecord);
 
     recordTokenStorageInitialization(config, event);
-  });
+  }, config);
+}
+
+export function logOnboardingStart(
+  config: Config,
+  event: OnboardingStartEvent,
+): void {
+  ClearcutLogger.getInstance(config)?.logOnboardingStartEvent(event);
+  bufferTelemetryEvent(() => {
+    const logger = logs.getLogger(SERVICE_NAME);
+    const logRecord: LogRecord = {
+      body: event.toLogBody(),
+      attributes: event.toOpenTelemetryAttributes(config),
+    };
+    logger.emit(logRecord);
+
+    recordOnboardingStart(config);
+  }, config);
+}
+
+export function logOnboardingSuccess(
+  config: Config,
+  event: OnboardingSuccessEvent,
+): void {
+  ClearcutLogger.getInstance(config)?.logOnboardingSuccessEvent(event);
+  bufferTelemetryEvent(() => {
+    const logger = logs.getLogger(SERVICE_NAME);
+    const logRecord: LogRecord = {
+      body: event.toLogBody(),
+      attributes: event.toOpenTelemetryAttributes(config),
+    };
+    logger.emit(logRecord);
+
+    recordOnboardingSuccess(config, event.userTier, event.duration_ms);
+  }, config);
 }
 
 export function logBillingEvent(
@@ -882,7 +928,7 @@ export function logBillingEvent(
       attributes: event.toOpenTelemetryAttributes(config),
     };
     logger.emit(logRecord);
-  });
+  }, config);
 
   const cc = ClearcutLogger.getInstance(config);
   if (cc) {
@@ -896,4 +942,91 @@ export function logBillingEvent(
       cc.logCreditPurchaseClickEvent(event);
     }
   }
+}
+
+// ==========================================================================
+// Browser Agent Events
+// ==========================================================================
+
+export function logBrowserAgentConnection(
+  config: Config,
+  durationMs: number,
+  attributes: {
+    session_mode: 'persistent' | 'isolated' | 'existing';
+    headless: boolean;
+    success: boolean;
+    error_type?:
+      | 'profile_locked'
+      | 'timeout'
+      | 'connection_refused'
+      | 'unknown';
+    tool_count?: number;
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentConnectionEvent({
+    session_mode: attributes.session_mode,
+    headless: attributes.headless,
+    success: attributes.success,
+    duration_ms: durationMs,
+    error_type: attributes.error_type,
+    tool_count: attributes.tool_count,
+  });
+
+  recordBrowserAgentConnection(config, durationMs, attributes);
+}
+
+export function logBrowserAgentVisionStatus(
+  config: Config,
+  attributes: {
+    enabled: boolean;
+    disabled_reason?:
+      | 'no_visual_model'
+      | 'missing_visual_tools'
+      | 'blocked_auth_type';
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentVisionStatusEvent({
+    enabled: attributes.enabled,
+    disabled_reason: attributes.disabled_reason,
+  });
+
+  recordBrowserAgentVisionStatus(config, attributes);
+}
+
+export function logBrowserAgentTaskOutcome(
+  config: Config,
+  attributes: {
+    success: boolean;
+    session_mode: 'persistent' | 'isolated' | 'existing';
+    vision_enabled: boolean;
+    headless: boolean;
+    duration_ms: number;
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentTaskOutcomeEvent({
+    success: attributes.success,
+    session_mode: attributes.session_mode,
+    vision_enabled: attributes.vision_enabled,
+    headless: attributes.headless,
+    duration_ms: attributes.duration_ms,
+  });
+
+  recordBrowserAgentTaskOutcome(config, attributes);
+}
+
+export function logBrowserAgentCleanup(
+  config: Config,
+  durationMs: number,
+  attributes: {
+    session_mode: 'persistent' | 'isolated' | 'existing';
+    success: boolean;
+  },
+): void {
+  ClearcutLogger.getInstance(config)?.logBrowserAgentCleanupEvent({
+    session_mode: attributes.session_mode,
+    success: attributes.success,
+    duration_ms: durationMs,
+  });
+
+  recordBrowserAgentCleanup(config, durationMs, attributes);
 }

@@ -30,7 +30,7 @@ export const CliHelpAgent = (
   kind: 'local',
   displayName: 'CLI Help Agent',
   description:
-    'Specialized in answering questions about how users use you, (Gemini CLI): features, documentation, and current runtime configuration.',
+    'Specialized agent for answering questions about the Gemini CLI application. Invoke this agent for questions regarding CLI features, configuration schemas (e.g., policies), or instructions on how to create custom subagents. It queries internal documentation to provide accurate usage guidance.',
   inputConfig: {
     inputSchema: {
       type: 'object',
@@ -49,7 +49,24 @@ export const CliHelpAgent = (
     schema: CliHelpReportSchema,
   },
 
-  processOutput: (output) => JSON.stringify(output, null, 2),
+  processOutput: (output) => {
+    if (!output) {
+      return '';
+    }
+    const answer = output.answer?.trim() ?? '';
+    const uniqueSources = Array.from(
+      new Set(
+        (output.sources ?? [])
+          .map((s) => s?.trim())
+          .filter((s) => s && s.length > 0),
+      ),
+    );
+
+    if (uniqueSources.length > 0) {
+      return `${answer}\n\n**Sources:**\n${uniqueSources.map((s) => `- ${s}`).join('\n')}`;
+    }
+    return answer;
+  },
 
   modelConfig: {
     model: GEMINI_MODEL_ALIAS_FLASH,

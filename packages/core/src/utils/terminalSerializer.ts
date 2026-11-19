@@ -12,6 +12,7 @@ export interface AnsiToken {
   underline: boolean;
   dim: boolean;
   inverse: boolean;
+  isUninitialized: boolean;
   fg: string;
   bg: string;
 }
@@ -126,18 +127,32 @@ class Cell {
     return this.cell?.getChars() || ' ';
   }
 
+  isUninitialized(): boolean {
+    return this.cell
+      ? this.cell.getCode() === 0 && this.cell.isAttributeDefault()
+      : true;
+  }
+
   isAttribute(attribute: Attribute): boolean {
     return (this.attributes & attribute) !== 0;
   }
 
-  equals(other: Cell): boolean {
+  equals(other: Cell, includeColor = true): boolean {
+    if (
+      this.attributes !== other.attributes ||
+      this.isCursor() !== other.isCursor() ||
+      this.isUninitialized() !== other.isUninitialized()
+    ) {
+      return false;
+    }
+    if (!includeColor) {
+      return true;
+    }
     return (
-      this.attributes === other.attributes &&
       this.fg === other.fg &&
       this.bg === other.bg &&
       this.fgColorMode === other.fgColorMode &&
-      this.bgColorMode === other.bgColorMode &&
-      this.isCursor() === other.isCursor()
+      this.bgColorMode === other.bgColorMode
     );
   }
 }
@@ -146,21 +161,24 @@ export function serializeTerminalToObject(
   terminal: Terminal,
   startLine?: number,
   endLine?: number,
+  includeColor = true,
 ): AnsiOutput {
   const buffer = terminal.buffer.active;
   const cursorX = buffer.cursorX;
-  const cursorY = buffer.cursorY;
+  const absoluteCursorY = buffer.baseY + buffer.cursorY;
   const defaultFg = '';
   const defaultBg = '';
 
   const result: AnsiOutput = [];
 
   // Reuse cell instances
-  const lastCell = new Cell(null, -1, -1, cursorX, cursorY);
-  const currentCell = new Cell(null, -1, -1, cursorX, cursorY);
+  const lastCell = new Cell(null, -1, -1, cursorX, absoluteCursorY);
+  const currentCell = new Cell(null, -1, -1, cursorX, absoluteCursorY);
 
   const effectiveStart = startLine ?? buffer.viewportY;
   const effectiveEnd = endLine ?? buffer.viewportY + terminal.rows;
+
+  const cellBuffer = terminal.buffer.active.getNullCell();
 
   for (let y = effectiveStart; y < effectiveEnd; y++) {
     const line = buffer.getLine(y);
@@ -171,14 +189,14 @@ export function serializeTerminalToObject(
     }
 
     // Reset lastCell for new line
-    lastCell.update(null, -1, -1, cursorX, cursorY);
+    lastCell.update(null, -1, -1, cursorX, absoluteCursorY);
     let currentText = '';
 
     for (let x = 0; x < terminal.cols; x++) {
-      const cellData = line.getCell(x);
-      currentCell.update(cellData || null, x, y, cursorX, cursorY);
+      const cellData = line.getCell(x, cellBuffer);
+      currentCell.update(cellData || null, x, y, cursorX, absoluteCursorY);
 
-      if (x > 0 && !currentCell.equals(lastCell)) {
+      if (x > 0 && !currentCell.equals(lastCell, includeColor)) {
         if (currentText) {
           const token: AnsiToken = {
             text: currentText,
@@ -188,8 +206,13 @@ export function serializeTerminalToObject(
             dim: lastCell.isAttribute(Attribute.dim),
             inverse:
               lastCell.isAttribute(Attribute.inverse) || lastCell.isCursor(),
-            fg: convertColorToHex(lastCell.fg, lastCell.fgColorMode, defaultFg),
-            bg: convertColorToHex(lastCell.bg, lastCell.bgColorMode, defaultBg),
+            isUninitialized: lastCell.isUninitialized(),
+            fg: includeColor
+              ? convertColorToHex(lastCell.fg, lastCell.fgColorMode, defaultFg)
+              : '',
+            bg: includeColor
+              ? convertColorToHex(lastCell.bg, lastCell.bgColorMode, defaultBg)
+              : '',
           };
           currentLine.push(token);
         }
@@ -198,7 +221,7 @@ export function serializeTerminalToObject(
       currentText += currentCell.getChars();
       // Copy state from currentCell to lastCell. Since we can't easily deep copy
       // without allocating, we just update lastCell with the same data.
-      lastCell.update(cellData || null, x, y, cursorX, cursorY);
+      lastCell.update(cellData || null, x, y, cursorX, absoluteCursorY);
     }
 
     if (currentText) {
@@ -209,13 +232,35 @@ export function serializeTerminalToObject(
         underline: lastCell.isAttribute(Attribute.underline),
         dim: lastCell.isAttribute(Attribute.dim),
         inverse: lastCell.isAttribute(Attribute.inverse) || lastCell.isCursor(),
-        fg: convertColorToHex(lastCell.fg, lastCell.fgColorMode, defaultFg),
-        bg: convertColorToHex(lastCell.bg, lastCell.bgColorMode, defaultBg),
+        isUninitialized: lastCell.isUninitialized(),
+        fg: includeColor
+          ? convertColorToHex(lastCell.fg, lastCell.fgColorMode, defaultFg)
+          : '',
+        bg: includeColor
+          ? convertColorToHex(lastCell.bg, lastCell.bgColorMode, defaultBg)
+          : '',
       };
       currentLine.push(token);
     }
 
     result.push(currentLine);
+  }
+
+  // Remove trailing empty lines
+  while (result.length > 0) {
+    const lastLine = result[result.length - 1];
+    const lineY = effectiveStart + result.length - 1;
+
+    // A line is empty if all its tokens are marked as uninitialized and it has no cursor
+    const isEmpty =
+      lastLine.every((token) => token.isUninitialized && !token.inverse) &&
+      lineY !== absoluteCursorY;
+
+    if (isEmpty) {
+      result.pop();
+    } else {
+      break;
+    }
   }
 
   return result;

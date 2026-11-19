@@ -162,6 +162,10 @@ function shouldRedactEnvironmentVariable(
     }
   }
 
+  if (key.startsWith('GIT_CONFIG_')) {
+    return false;
+  }
+
   if (allowedSet?.has(key)) {
     return false;
   }
@@ -188,4 +192,85 @@ function shouldRedactEnvironmentVariable(
   }
 
   return false;
+}
+
+/**
+ * Merges a partial sanitization config with secure defaults and validates it.
+ * This ensures that sensitive environment variables cannot be bypassed by
+ * request-provided configurations.
+ */
+export function getSecureSanitizationConfig(
+  requestedConfig: Partial<EnvironmentSanitizationConfig> = {},
+  baseConfig?: EnvironmentSanitizationConfig,
+): EnvironmentSanitizationConfig {
+  const allowed = [
+    ...(baseConfig?.allowedEnvironmentVariables ?? []),
+    ...(requestedConfig.allowedEnvironmentVariables ?? []),
+  ].filter((key) => {
+    const upperKey = key.toUpperCase();
+    // Never allow variables that are explicitly forbidden by name
+    if (NEVER_ALLOWED_ENVIRONMENT_VARIABLES.has(upperKey)) {
+      return false;
+    }
+    // Never allow variables that match sensitive name patterns
+    for (const pattern of NEVER_ALLOWED_NAME_PATTERNS) {
+      if (pattern.test(upperKey)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  const blocked = [
+    ...(baseConfig?.blockedEnvironmentVariables ?? []),
+    ...(requestedConfig.blockedEnvironmentVariables ?? []),
+  ];
+
+  return {
+    allowedEnvironmentVariables: [...new Set(allowed)],
+    blockedEnvironmentVariables: [...new Set(blocked)],
+    // Redaction must be enabled for secure configurations
+    enableEnvironmentVariableRedaction:
+      requestedConfig.enableEnvironmentVariableRedaction ??
+      baseConfig?.enableEnvironmentVariableRedaction ??
+      false,
+  };
+}
+
+export const BLOCKED_EXECUTION_ENVS = new Set([
+  'NODE_OPTIONS',
+  'NODE_CLI_FLAGS',
+  '_FORCE_NODE_OPTIONS',
+  'NODE_PATH',
+  'ELECTRON_RUN_AS_NODE',
+  'PYTHONPATH',
+  'PYTHONSTARTUP',
+  'RUBYOPT',
+  'RUBYLIB',
+  'PERL5OPT',
+  'PERL5LIB',
+  'LD_PRELOAD',
+  'LD_AUDIT',
+  'LD_DEBUG',
+  'LD_PROFILE',
+  'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_FORCE_FLAT_NAMESPACE',
+  'DYLD_LIBRARY_PATH',
+  'DYLD_FRAMEWORK_PATH',
+  'DYLD_FALLBACK_LIBRARY_PATH',
+  'DYLD_FALLBACK_FRAMEWORK_PATH',
+  'BASH_ENV',
+  'ENV',
+  'PERL5DB',
+  'JAVA_TOOL_OPTIONS',
+  '_JAVA_OPTIONS',
+  'CLASSPATH',
+  'DOTNET_STARTUP_HOOKS',
+  'CORECLR_PROFILER_PATH',
+  'CORECLR_ENABLE_PROFILING',
+]);
+
+export function isDangerousExecutionEnvironmentVariable(key: string): boolean {
+  return BLOCKED_EXECUTION_ENVS.has(key.toUpperCase());
 }

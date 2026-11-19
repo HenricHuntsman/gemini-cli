@@ -21,6 +21,8 @@ export enum PackageManager {
   BUNX = 'bunx',
   HOMEBREW = 'homebrew',
   NPX = 'npx',
+  BINARY = 'binary',
+  VOLTA = 'volta',
   UNKNOWN = 'unknown',
 }
 
@@ -41,26 +43,23 @@ export function getInstallationInfo(
   }
 
   try {
-    // Normalize path separators to forward slashes for consistent matching.
-    const realPath = fs.realpathSync(cliPath).replace(/\\/g, '/');
-    const normalizedProjectRoot = projectRoot?.replace(/\\/g, '/');
-    const isGit = isGitRepository(process.cwd());
-
-    // Check for local git clone first
-    if (
-      isGit &&
-      normalizedProjectRoot &&
-      realPath.startsWith(normalizedProjectRoot) &&
-      !realPath.includes('/node_modules/')
-    ) {
+    // Check for standalone binary first
+    if (process.env['IS_BINARY'] === 'true') {
       return {
-        packageManager: PackageManager.UNKNOWN, // Not managed by a package manager in this sense
-        isGlobal: false,
+        packageManager: PackageManager.BINARY,
+        isGlobal: true,
         updateMessage:
-          'Running from a local git clone. Please update with "git pull".',
+          'Running as a standalone binary. Please update by downloading the latest version from GitHub.',
       };
     }
 
+    // Normalize path separators to forward slashes for consistent matching.
+    const realPath = fs.realpathSync(cliPath).replace(/\\/g, '/');
+    const normalizedProjectRoot = projectRoot?.replace(/\\/g, '/');
+
+    // Check explicit package manager cache/global paths before checking for a
+    // local git clone, so installs under an ancestor git repo (e.g. a dotfiles
+    // repo in $HOME/.git) are never misclassified as a local git clone.
     // Check for npx/pnpx
     if (realPath.includes('/.npm/_npx') || realPath.includes('/npm/_npx')) {
       return {
@@ -80,35 +79,25 @@ export function getInstallationInfo(
       };
     }
 
-    // Check for Homebrew
-    if (process.platform === 'darwin') {
-      try {
-        const brewPrefix = childProcess
-          .execSync('brew --prefix gemini-cli', {
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-          })
-          .trim();
-        const brewRealPath = fs.realpathSync(brewPrefix);
-
-        if (realPath.startsWith(brewRealPath)) {
-          return {
-            packageManager: PackageManager.HOMEBREW,
-            isGlobal: true,
-            updateMessage:
-              'Installed via Homebrew. Please update with "brew upgrade gemini-cli".',
-          };
-        }
-      } catch (_error) {
-        // Brew is not installed or gemini-cli is not installed via brew.
-        // Continue to the next check.
-      }
+    // Check for Volta
+    if (realPath.includes('/.volta/') || realPath.includes('/Volta/')) {
+      const updateCommand = 'volta install @google/gemini-cli@latest';
+      return {
+        packageManager: PackageManager.VOLTA,
+        isGlobal: true,
+        updateCommand,
+        updateMessage: isAutoUpdateEnabled
+          ? 'Installed with Volta. Attempting to automatically update now...'
+          : `Please run ${updateCommand} to update`,
+      };
     }
 
     // Check for pnpm
     if (
       realPath.includes('/.pnpm/global') ||
-      realPath.includes('/.local/share/pnpm')
+      realPath.includes('/.local/share/pnpm') ||
+      realPath.includes('/Library/pnpm/global/') ||
+      realPath.includes('/AppData/Local/pnpm/global/')
     ) {
       const updateCommand = 'pnpm add -g @google/gemini-cli@latest';
       return {
@@ -152,6 +141,50 @@ export function getInstallationInfo(
           ? 'Installed with bun. Attempting to automatically update now...'
           : `Please run ${updateCommand} to update`,
       };
+    }
+
+    // Check for local git clone using the CLI's own location rather than
+    // process.cwd(), so running a source checkout from another directory is not
+    // misclassified as a global npm install.
+    const isSourceCheckoutPath =
+      realPath.endsWith('/packages/cli') ||
+      /\/(?:packages\/cli(?:\/dist)?|bundle)\/[^/]+$/.test(realPath);
+    if (
+      !realPath.includes('/node_modules/') &&
+      isSourceCheckoutPath &&
+      isGitRepository(path.posix.dirname(realPath))
+    ) {
+      return {
+        packageManager: PackageManager.UNKNOWN, // Not managed by a package manager in this sense
+        isGlobal: false,
+        updateMessage:
+          'Running from a local git clone. Please update with "git pull".',
+      };
+    }
+
+    // Check for Homebrew
+    if (process.platform === 'darwin') {
+      try {
+        const brewPrefix = childProcess
+          .execSync('brew --prefix gemini-cli', {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+          })
+          .trim();
+        const brewRealPath = fs.realpathSync(brewPrefix);
+
+        if (realPath.startsWith(brewRealPath)) {
+          return {
+            packageManager: PackageManager.HOMEBREW,
+            isGlobal: true,
+            updateMessage:
+              'Installed via Homebrew. Please update with "brew upgrade gemini-cli".',
+          };
+        }
+      } catch {
+        // Brew is not installed or gemini-cli is not installed via brew.
+        // Continue to the next check.
+      }
     }
 
     // Check for local install

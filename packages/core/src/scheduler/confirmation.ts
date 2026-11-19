@@ -16,6 +16,7 @@ import {
   ToolConfirmationOutcome,
   type ToolConfirmationPayload,
   type ToolCallConfirmationDetails,
+  type ForcedToolDecision,
 } from '../tools/tools.js';
 import {
   type ValidatingToolCall,
@@ -45,6 +46,7 @@ export interface ConfirmationResult {
 export interface ResolutionResult {
   outcome: ToolConfirmationOutcome;
   lastDetails?: SerializableConfirmationDetails;
+  confirmedByUser?: boolean;
 }
 
 /**
@@ -116,17 +118,21 @@ export async function resolveConfirmation(
     getPreferredEditor: () => EditorType | undefined;
     schedulerId: string;
     onWaitingForConfirmation?: (waiting: boolean) => void;
+    systemMessage?: string;
+    forcedDecision?: ForcedToolDecision;
   },
 ): Promise<ResolutionResult> {
   const { state, onWaitingForConfirmation } = deps;
   const callId = toolCall.request.callId;
   let outcome = ToolConfirmationOutcome.ModifyWithEditor;
   let lastDetails: SerializableConfirmationDetails | undefined;
+  let confirmedByUser = false;
 
   // Loop exists to allow the user to modify the parameters and see the new
   // diff.
   while (outcome === ToolConfirmationOutcome.ModifyWithEditor) {
-    if (signal.aborted) throw new Error('Operation cancelled');
+    if (signal.aborted) throw new Error('Operation cancelled by user');
+    confirmedByUser = false;
 
     const currentCall = state.getToolCall(callId);
     if (!currentCall || !('invocation' in currentCall)) {
@@ -134,10 +140,17 @@ export async function resolveConfirmation(
     }
     const currentInvocation = currentCall.invocation;
 
-    const details = await currentInvocation.shouldConfirmExecute(signal);
+    const details = await currentInvocation.shouldConfirmExecute(
+      signal,
+      deps.forcedDecision,
+    );
     if (!details) {
       outcome = ToolConfirmationOutcome.ProceedOnce;
       break;
+    }
+
+    if (deps.systemMessage) {
+      details.systemMessage = deps.systemMessage;
     }
 
     await notifyHooks(deps, details);
@@ -179,13 +192,24 @@ export async function resolveConfirmation(
       if (modResult.error) {
         coreEvents.emitFeedback('error', modResult.error);
       }
-    } else if (response.payload && 'newContent' in response.payload) {
-      await handleInlineModification(deps, toolCall, response.payload, signal);
-      outcome = ToolConfirmationOutcome.ProceedOnce;
+    } else {
+      if (outcome !== ToolConfirmationOutcome.Cancel) {
+        confirmedByUser = true;
+      }
+      if (response.payload && 'newContent' in response.payload) {
+        await handleInlineModification(
+          deps,
+          toolCall,
+          response.payload,
+          signal,
+        );
+        outcome = ToolConfirmationOutcome.ProceedOnce;
+        confirmedByUser = true;
+      }
     }
   }
 
-  return { outcome, lastDetails };
+  return { outcome, lastDetails, confirmedByUser };
 }
 
 /**

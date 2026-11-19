@@ -35,6 +35,7 @@ import {
   removeMCPStatusChangeListener,
   MCPDiscoveryState,
   CoreToolCallStatus,
+  formatLocalDateKey,
 } from '@google/gemini-cli-core';
 import { useSessionStats } from '../contexts/SessionContext.js';
 import type {
@@ -72,6 +73,7 @@ interface SlashCommandProcessorActions {
   openSettingsDialog: () => void;
   openSessionBrowser: () => void;
   openModelDialog: () => void;
+  openVoiceModelDialog: () => void;
   openAgentConfigDialog: (
     name: string,
     displayName: string,
@@ -81,10 +83,11 @@ interface SlashCommandProcessorActions {
   quit: (messages: HistoryItem[]) => void;
   setDebugMessage: (message: string) => void;
   toggleCorgiMode: () => void;
+  toggleVoiceMode: () => void;
   toggleDebugProfiler: () => void;
   dispatchExtensionStateUpdate: (action: ExtensionUpdateAction) => void;
   addConfirmUpdateExtensionRequest: (request: ConfirmationRequest) => void;
-  toggleBackgroundShell: () => void;
+  toggleBackgroundTasks: () => void;
   toggleShortcutsHelp: () => void;
   setText: (text: string) => void;
 }
@@ -186,6 +189,17 @@ export const useSlashCommandProcessor = (
         historyItemContent = {
           type: 'tool_stats',
         };
+      } else if (message.type === MessageType.HEATMAP_STATS) {
+        historyItemContent = {
+          type: 'heatmap_stats',
+          dailyUsage: {},
+          totalWindowTokens: 0,
+          totalWindowSessions: 0,
+          totalWindowTurns: 0,
+          currentStreak: 0,
+          longestStreak: 0,
+          today: formatLocalDateKey(message.timestamp),
+        };
       } else if (message.type === MessageType.QUIT) {
         historyItemContent = {
           type: 'quit',
@@ -209,7 +223,7 @@ export const useSlashCommandProcessor = (
   const commandContext = useMemo(
     (): CommandContext => ({
       services: {
-        config,
+        agentContext: config,
         settings,
         git: gitService,
         logger,
@@ -232,6 +246,7 @@ export const useSlashCommandProcessor = (
         pendingItem,
         setPendingItem,
         toggleCorgiMode: actions.toggleCorgiMode,
+        toggleVoiceMode: actions.toggleVoiceMode,
         toggleDebugProfiler: actions.toggleDebugProfiler,
         toggleVimEnabled,
         reloadCommands,
@@ -242,7 +257,7 @@ export const useSlashCommandProcessor = (
           actions.addConfirmUpdateExtensionRequest,
         setConfirmationRequest,
         removeComponent: () => setCustomDialog(null),
-        toggleBackgroundShell: actions.toggleBackgroundShell,
+        toggleBackgroundTasks: actions.toggleBackgroundTasks,
         toggleShortcutsHelp: actions.toggleShortcutsHelp,
       },
       session: {
@@ -281,10 +296,16 @@ export const useSlashCommandProcessor = (
     const listener = () => {
       reloadCommands();
     };
+    let isActive = true;
+    let activeIdeClient: IdeClient | undefined;
 
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
     (async () => {
       const ideClient = await IdeClient.getInstance();
+      if (!isActive) {
+        return;
+      }
+      activeIdeClient = ideClient;
       ideClient.addStatusChangeListener(listener);
     })();
 
@@ -307,11 +328,8 @@ export const useSlashCommandProcessor = (
     coreEvents.on('extensionsStopping', extensionEventListener);
 
     return () => {
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      (async () => {
-        const ideClient = await IdeClient.getInstance();
-        ideClient.removeStatusChangeListener(listener);
-      })();
+      isActive = false;
+      activeIdeClient?.removeStatusChangeListener(listener);
       removeMCPStatusChangeListener(listener);
       coreEvents.off('extensionsStarting', extensionEventListener);
       coreEvents.off('extensionsStopping', extensionEventListener);
@@ -405,6 +423,7 @@ export const useSlashCommandProcessor = (
       }
 
       let hasError = false;
+      let shouldLogCompletion = true;
 
       const subcommand =
         resolvedCommandPath.length > 1
@@ -500,6 +519,9 @@ export const useSlashCommandProcessor = (
                     case 'model':
                       actions.openModelDialog();
                       return { type: 'handled' };
+                    case 'voice-model':
+                      actions.openVoiceModelDialog();
+                      return { type: 'handled' };
                     case 'agentConfig': {
                       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
                       const props = result.props as Record<string, unknown>;
@@ -548,6 +570,18 @@ export const useSlashCommandProcessor = (
                   return { type: 'handled' };
                 }
                 case 'quit':
+                  if (result.deleteSession) {
+                    try {
+                      const chatRecordingService = config
+                        ?.getGeminiClient()
+                        ?.getChatRecordingService();
+                      if (chatRecordingService) {
+                        await chatRecordingService.deleteCurrentSessionAsync();
+                      }
+                    } catch {
+                      // Don't let deletion errors prevent exit.
+                    }
+                  }
                   actions.quit(result.messages);
                   return { type: 'handled' };
 
@@ -620,6 +654,7 @@ export const useSlashCommandProcessor = (
                     );
                   }
 
+                  shouldLogCompletion = false;
                   return await handleSlashCommand(
                     result.originalInvocation.raw,
                     // Pass the approved commands as a one-time grant for this execution.
@@ -652,10 +687,12 @@ export const useSlashCommandProcessor = (
                     return { type: 'handled' };
                   }
 
+                  shouldLogCompletion = false;
                   return await handleSlashCommand(
                     result.originalInvocation.raw,
                     undefined,
                     true,
+                    false, // Do not add to history again
                   );
                 }
                 case 'custom_dialog': {
@@ -706,7 +743,12 @@ export const useSlashCommandProcessor = (
         );
         return { type: 'handled' };
       } finally {
-        if (config && resolvedCommandPath[0] && !hasError) {
+        if (
+          config &&
+          resolvedCommandPath[0] &&
+          !hasError &&
+          shouldLogCompletion
+        ) {
           const event = makeSlashCommandEvent({
             command: resolvedCommandPath[0],
             subcommand,

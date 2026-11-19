@@ -83,7 +83,7 @@ describe('useAtCompletion', () => {
       };
       testRootDir = await createTmpDir(structure);
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', mockConfig, testRootDir),
       );
 
@@ -114,7 +114,7 @@ describe('useAtCompletion', () => {
       };
       testRootDir = await createTmpDir(structure);
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, 'src/', mockConfig, testRootDir),
       );
 
@@ -137,7 +137,7 @@ describe('useAtCompletion', () => {
       };
       testRootDir = await createTmpDir(structure);
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', mockConfig, testRootDir),
       );
 
@@ -149,6 +149,29 @@ describe('useAtCompletion', () => {
         'dir/',
         'file.txt',
       ]);
+    });
+
+    it('should support autocomplete when pattern starts with a leading slash like @/ (Issue #29453)', async () => {
+      const structure: FileSystemStructure = {
+        'package.json': '',
+        'README.md': '',
+        src: {
+          'index.ts': '',
+        },
+      };
+      testRootDir = await createTmpDir(structure);
+
+      const { result } = await renderHook(() =>
+        useTestHarnessForAtCompletion(true, '/', mockConfig, testRootDir),
+      );
+
+      await waitFor(() => {
+        expect(result.current.suggestions.length).toBeGreaterThan(0);
+      });
+
+      expect(result.current.suggestions.map((s) => s.value)).toEqual(
+        expect.arrayContaining(['package.json', 'README.md', 'src/']),
+      );
     });
 
     it('should perform a case-insensitive search by lowercasing the pattern', async () => {
@@ -170,7 +193,7 @@ describe('useAtCompletion', () => {
 
       vi.spyOn(FileSearchFactory, 'create').mockReturnValue(fileSearch);
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(
           true,
           'CrAzYCaSe',
@@ -201,7 +224,7 @@ describe('useAtCompletion', () => {
         ],
       });
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, 'logs', mockConfig, '/tmp'),
       );
 
@@ -220,24 +243,31 @@ describe('useAtCompletion', () => {
     it('should be in a loading state during initial file system crawl', async () => {
       testRootDir = await createTmpDir({});
 
-      // Mock FileSearch to be slow to catch the loading state
+      let deferredInit: { resolve: (value?: unknown) => void };
+      // Mock FileSearch to control when initialization finishes
       const mockFileSearch = {
-        initialize: vi.fn().mockImplementation(async () => {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }),
+        initialize: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              deferredInit = { resolve };
+            }),
+        ),
         search: vi.fn().mockResolvedValue([]),
       };
       vi.spyOn(FileSearchFactory, 'create').mockReturnValue(
         mockFileSearch as unknown as FileSearch,
       );
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', mockConfig, testRootDir),
       );
 
-      // It's initially true because the effect runs synchronously.
-      await waitFor(() => {
-        expect(result.current.isLoadingSuggestions).toBe(true);
+      // It's true because the promise hasn't resolved yet
+      expect(result.current.isLoadingSuggestions).toBe(true);
+
+      // Resolve the initialization
+      await act(async () => {
+        deferredInit.resolve();
       });
 
       // Wait for the loading to complete.
@@ -246,11 +276,78 @@ describe('useAtCompletion', () => {
       });
     });
 
+    it('should resolve @/ autocomplete suggestions when an async action takes time before completion is used', async () => {
+      const structure: FileSystemStructure = {
+        'package.json': '',
+        'README.md': '',
+        src: {
+          'index.ts': '',
+        },
+      };
+      testRootDir = await createTmpDir(structure);
+
+      const realFileSearch = FileSearchFactory.create({
+        projectRoot: testRootDir,
+        ignoreDirs: [],
+        fileDiscoveryService: new FileDiscoveryService(testRootDir, {
+          respectGitIgnore: true,
+          respectGeminiIgnore: true,
+        }),
+        cache: false,
+        cacheTtl: 0,
+        enableRecursiveFileSearch: true,
+        enableFuzzySearch: true,
+      });
+
+      let resolveAsyncAction: () => void = () => {};
+      const asyncActionPromise = new Promise<void>((resolve) => {
+        resolveAsyncAction = resolve;
+      });
+
+      // Simulate an async action taking time during initialization
+      const mockFileSearch: FileSearch = {
+        initialize: vi.fn().mockImplementation(async () => {
+          await asyncActionPromise;
+          await realFileSearch.initialize();
+        }),
+        search: vi
+          .fn()
+          .mockImplementation(async (pattern, options) =>
+            realFileSearch.search(pattern, options),
+          ),
+      };
+      vi.spyOn(FileSearchFactory, 'create').mockReturnValue(mockFileSearch);
+
+      // User triggers autocomplete with '@/' while async action is in flight
+      const { result } = await renderHook(() =>
+        useTestHarnessForAtCompletion(true, '/', mockConfig, testRootDir),
+      );
+
+      // Verify that autocomplete indicates loading while async action is pending
+      expect(result.current.isLoadingSuggestions).toBe(true);
+      expect(result.current.suggestions).toEqual([]);
+
+      // Complete the async action
+      await act(async () => {
+        resolveAsyncAction();
+      });
+
+      // Verify that suggestions for '@/' resolve properly once the async action completes
+      await waitFor(() => {
+        expect(result.current.isLoadingSuggestions).toBe(false);
+        expect(result.current.suggestions.length).toBeGreaterThan(0);
+      });
+
+      expect(result.current.suggestions.map((s) => s.value)).toEqual(
+        expect.arrayContaining(['package.json', 'README.md', 'src/']),
+      );
+    });
+
     it('should NOT show a loading indicator for subsequent searches that complete under 200ms', async () => {
       const structure: FileSystemStructure = { 'a.txt': '', 'b.txt': '' };
       testRootDir = await createTmpDir(structure);
 
-      const { result, rerender } = renderHook(
+      const { result, rerender } = await renderHook(
         ({ pattern }) =>
           useTestHarnessForAtCompletion(true, pattern, mockConfig, testRootDir),
         { initialProps: { pattern: 'a' } },
@@ -294,8 +391,17 @@ describe('useAtCompletion', () => {
       await realFileSearch.initialize();
 
       // Mock that returns results immediately but we'll control timing with fake timers
+      let deferredInit: {
+        resolve: (value?: unknown) => void;
+        reject: (e: Error) => void;
+      };
       const mockFileSearch: FileSearch = {
-        initialize: vi.fn().mockResolvedValue(undefined),
+        initialize: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve, reject) => {
+              deferredInit = { resolve, reject };
+            }),
+        ),
         search: vi
           .fn()
           .mockImplementation(async (pattern, options) =>
@@ -304,11 +410,15 @@ describe('useAtCompletion', () => {
       };
       vi.spyOn(FileSearchFactory, 'create').mockReturnValue(mockFileSearch);
 
-      const { result, rerender } = renderHook(
+      const { result, rerender } = await renderHook(
         ({ pattern }) =>
           useTestHarnessForAtCompletion(true, pattern, mockConfig, testRootDir),
         { initialProps: { pattern: 'a' } },
       );
+
+      await act(async () => {
+        deferredInit.resolve();
+      });
 
       // Wait for the initial search to complete (using real timers)
       await waitFor(() => {
@@ -355,8 +465,17 @@ describe('useAtCompletion', () => {
       testRootDir = await createTmpDir(structure);
 
       const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
+      let deferredInit: {
+        resolve: (value?: unknown) => void;
+        reject: (e: Error) => void;
+      };
       const mockFileSearch: FileSearch = {
-        initialize: vi.fn().mockResolvedValue(undefined),
+        initialize: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve, reject) => {
+              deferredInit = { resolve, reject };
+            }),
+        ),
         search: vi.fn().mockImplementation(async (pattern: string) => {
           const delay = pattern === 'a' ? 500 : 50;
           await new Promise((resolve) => setTimeout(resolve, delay));
@@ -365,11 +484,15 @@ describe('useAtCompletion', () => {
       };
       vi.spyOn(FileSearchFactory, 'create').mockReturnValue(mockFileSearch);
 
-      const { result, rerender } = renderHook(
+      const { result, rerender } = await renderHook(
         ({ pattern }) =>
           useTestHarnessForAtCompletion(true, pattern, mockConfig, testRootDir),
         { initialProps: { pattern: 'a' } },
       );
+
+      await act(async () => {
+        deferredInit.resolve();
+      });
 
       // Wait for the hook to be ready (initialization is complete)
       await waitFor(() => {
@@ -408,7 +531,7 @@ describe('useAtCompletion', () => {
       const structure: FileSystemStructure = { 'a.txt': '' };
       testRootDir = await createTmpDir(structure);
 
-      const { result, rerender } = renderHook(
+      const { result, rerender } = await renderHook(
         ({ enabled }) =>
           useTestHarnessForAtCompletion(enabled, 'a', mockConfig, testRootDir),
         { initialProps: { enabled: true } },
@@ -431,20 +554,31 @@ describe('useAtCompletion', () => {
     it('should reset the state when disabled after being in an ERROR state', async () => {
       testRootDir = await createTmpDir({});
 
+      let deferredInit: {
+        resolve: (value?: unknown) => void;
+        reject: (e: Error) => void;
+      };
       // Force an error during initialization
       const mockFileSearch: FileSearch = {
-        initialize: vi
-          .fn()
-          .mockRejectedValue(new Error('Initialization failed')),
+        initialize: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve, reject) => {
+              deferredInit = { resolve, reject };
+            }),
+        ),
         search: vi.fn(),
       };
       vi.spyOn(FileSearchFactory, 'create').mockReturnValue(mockFileSearch);
 
-      const { result, rerender } = renderHook(
+      const { result, rerender } = await renderHook(
         ({ enabled }) =>
           useTestHarnessForAtCompletion(enabled, '', mockConfig, testRootDir),
         { initialProps: { enabled: true } },
       );
+
+      await act(async () => {
+        deferredInit.reject(new Error('Initialization failed'));
+      });
 
       // Wait for the hook to enter the error state
       await waitFor(() => {
@@ -474,7 +608,7 @@ describe('useAtCompletion', () => {
       };
       testRootDir = await createTmpDir(structure);
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', mockConfig, testRootDir),
       );
 
@@ -495,7 +629,7 @@ describe('useAtCompletion', () => {
       };
       testRootDir = await createTmpDir(structure);
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', undefined, testRootDir),
       );
 
@@ -509,13 +643,45 @@ describe('useAtCompletion', () => {
       ]);
     });
 
+    it('should pass enableFileWatcher flag into FileSearchFactory options', async () => {
+      const structure: FileSystemStructure = {
+        src: {
+          'index.ts': '',
+        },
+      };
+      testRootDir = await createTmpDir(structure);
+
+      const createSpy = vi.spyOn(FileSearchFactory, 'create');
+      const configWithWatcher = {
+        getFileFilteringOptions: vi.fn(() => ({
+          respectGitIgnore: true,
+          respectGeminiIgnore: true,
+          enableFileWatcher: true,
+        })),
+        getEnableRecursiveFileSearch: () => true,
+        getFileFilteringEnableFuzzySearch: () => true,
+      } as unknown as Config;
+
+      const { result } = await renderHook(() =>
+        useTestHarnessForAtCompletion(true, '', configWithWatcher, testRootDir),
+      );
+
+      await waitFor(() => {
+        expect(result.current.suggestions.length).toBeGreaterThan(0);
+      });
+
+      expect(createSpy).toHaveBeenCalled();
+      const firstCallArg = createSpy.mock.calls[0]?.[0];
+      expect(firstCallArg?.enableFileWatcher).toBe(true);
+    });
+
     it('should reset and re-initialize when the cwd changes', async () => {
       const structure1: FileSystemStructure = { 'file1.txt': '' };
       const rootDir1 = await createTmpDir(structure1);
       const structure2: FileSystemStructure = { 'file2.txt': '' };
       const rootDir2 = await createTmpDir(structure2);
 
-      const { result, rerender } = renderHook(
+      const { result, rerender } = await renderHook(
         ({ cwd, pattern }) =>
           useTestHarnessForAtCompletion(true, pattern, mockConfig, cwd),
         {
@@ -574,7 +740,21 @@ describe('useAtCompletion', () => {
         getFileFilteringEnableFuzzySearch: () => true,
       } as unknown as Config;
 
-      const { result } = renderHook(() =>
+      let deferredInit: { resolve: (value?: unknown) => void };
+      const mockFileSearch: FileSearch = {
+        initialize: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              deferredInit = { resolve };
+            }),
+        ),
+        search: vi.fn().mockResolvedValue(['src/', 'file.txt']),
+      };
+      vi.spyOn(FileSearchFactory, 'create').mockReturnValue(
+        mockFileSearch as unknown as FileSearch,
+      );
+
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(
           true,
           '',
@@ -582,6 +762,10 @@ describe('useAtCompletion', () => {
           testRootDir,
         ),
       );
+
+      await act(async () => {
+        deferredInit.resolve();
+      });
 
       await waitFor(() => {
         expect(result.current.suggestions.length).toBeGreaterThan(0);
@@ -612,6 +796,7 @@ describe('useAtCompletion', () => {
       multiDirTmpDirs.push(addedDir);
 
       const multiDirConfig = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...mockConfig,
         getWorkspaceContext: vi.fn().mockReturnValue({
           getDirectories: () => [cwdDir, addedDir],
@@ -619,7 +804,7 @@ describe('useAtCompletion', () => {
         }),
       } as unknown as Config;
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', multiDirConfig, cwdDir),
       );
 
@@ -644,6 +829,7 @@ describe('useAtCompletion', () => {
       const directories = [cwdDir];
 
       const dynamicConfig = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...mockConfig,
         getWorkspaceContext: vi.fn().mockReturnValue({
           getDirectories: () => [...directories],
@@ -656,7 +842,7 @@ describe('useAtCompletion', () => {
         }),
       } as unknown as Config;
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, '', dynamicConfig, cwdDir),
       );
 
@@ -688,6 +874,7 @@ describe('useAtCompletion', () => {
       multiDirTmpDirs.push(dir2);
 
       const multiDirConfig = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...mockConfig,
         getWorkspaceContext: vi.fn().mockReturnValue({
           getDirectories: () => [dir1, dir2],
@@ -695,7 +882,7 @@ describe('useAtCompletion', () => {
         }),
       } as unknown as Config;
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useTestHarnessForAtCompletion(true, 'readme', multiDirConfig, dir1),
       );
 

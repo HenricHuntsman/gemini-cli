@@ -37,7 +37,10 @@ describe('GlobTool', () => {
 
   beforeEach(async () => {
     // Create a unique root directory for each test run
-    tempRootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'glob-tool-root-'));
+    const rawTempRootDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'glob-tool-root-'),
+    );
+    tempRootDir = await fs.realpath(rawTempRootDir);
     await fs.writeFile(path.join(tempRootDir, '.git'), ''); // Fake git repo
 
     const rootDir = tempRootDir;
@@ -111,7 +114,7 @@ describe('GlobTool', () => {
     it('should find files matching a simple pattern in the root', async () => {
       const params: GlobToolParams = { pattern: '*.txt' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 2 file(s)');
       expect(result.llmContent).toContain(path.join(tempRootDir, 'fileA.txt'));
       expect(result.llmContent).toContain(path.join(tempRootDir, 'FileB.TXT'));
@@ -121,7 +124,7 @@ describe('GlobTool', () => {
     it('should find files case-sensitively when case_sensitive is true', async () => {
       const params: GlobToolParams = { pattern: '*.txt', case_sensitive: true };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain(path.join(tempRootDir, 'fileA.txt'));
       expect(result.llmContent).not.toContain(
@@ -133,7 +136,7 @@ describe('GlobTool', () => {
       const params: GlobToolParams = { pattern: '*.TXT' };
       const invocation = globTool.build(params);
 
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('fileA.txt');
       expect(result.llmContent).toContain('FileB.TXT');
@@ -145,7 +148,7 @@ describe('GlobTool', () => {
         case_sensitive: false,
       };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 2 file(s)');
       expect(result.llmContent).toContain(path.join(tempRootDir, 'fileA.txt'));
       expect(result.llmContent).toContain(path.join(tempRootDir, 'FileB.TXT'));
@@ -154,7 +157,7 @@ describe('GlobTool', () => {
     it('should find files using a pattern that includes a subdirectory', async () => {
       const params: GlobToolParams = { pattern: 'sub/*.md' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 2 file(s)');
       expect(result.llmContent).toContain(
         path.join(tempRootDir, 'sub', 'fileC.md'),
@@ -167,7 +170,7 @@ describe('GlobTool', () => {
     it('should find files in a specified relative path (relative to rootDir)', async () => {
       const params: GlobToolParams = { pattern: '*.md', dir_path: 'sub' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 2 file(s)');
       expect(result.llmContent).toContain(
         path.join(tempRootDir, 'sub', 'fileC.md'),
@@ -180,7 +183,7 @@ describe('GlobTool', () => {
     it('should find files using a deep globstar pattern (e.g., **/*.log)', async () => {
       const params: GlobToolParams = { pattern: '**/*.log' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain(
         path.join(tempRootDir, 'sub', 'deep', 'fileE.log'),
@@ -190,7 +193,7 @@ describe('GlobTool', () => {
     it('should return "No files found" message when pattern matches nothing', async () => {
       const params: GlobToolParams = { pattern: '*.nonexistent' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain(
         'No files found matching pattern "*.nonexistent"',
       );
@@ -201,7 +204,7 @@ describe('GlobTool', () => {
       await fs.writeFile(path.join(tempRootDir, 'file[1].txt'), 'content');
       const params: GlobToolParams = { pattern: 'file[1].txt' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain(
         path.join(tempRootDir, 'file[1].txt'),
@@ -220,7 +223,7 @@ describe('GlobTool', () => {
         pattern: 'src/app/[test]/(dashboard)/testing/components/code.tsx',
       };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain(filePath);
     }, 30000);
@@ -228,7 +231,7 @@ describe('GlobTool', () => {
     it('should correctly sort files by modification time (newest first)', async () => {
       const params: GlobToolParams = { pattern: '*.sortme' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       const llmContent = partListUnionToString(result.llmContent);
       const newerIndex = llmContent.indexOf('newer.sortme');
       const olderIndex = llmContent.indexOf('older.sortme');
@@ -244,7 +247,7 @@ describe('GlobTool', () => {
       vi.mocked(glob.glob).mockRejectedValue(new Error('Glob failed'));
       const params: GlobToolParams = { pattern: '*' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
       expect(result.error?.type).toBe(ToolErrorType.GLOB_EXECUTION_ERROR);
     }, 30000);
   });
@@ -383,7 +386,7 @@ describe('GlobTool', () => {
 
       const params: GlobToolParams = { pattern: '*_test.txt' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain('visible_test.txt');
@@ -403,7 +406,7 @@ describe('GlobTool', () => {
 
       const params: GlobToolParams = { pattern: 'visible_test.txt' };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain('visible_test.txt');
@@ -422,7 +425,7 @@ describe('GlobTool', () => {
         respect_git_ignore: false,
       };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain('ignored_test.txt');
@@ -443,12 +446,140 @@ describe('GlobTool', () => {
         respect_gemini_ignore: false,
       };
       const invocation = globTool.build(params);
-      const result = await invocation.execute(abortSignal);
+      const result = await invocation.execute({ abortSignal });
 
       expect(result.llmContent).toContain('Found 1 file(s)');
       expect(result.llmContent).toContain('gemini-ignored_test.txt');
     }, 30000);
   });
+
+  describe.skipIf(process.platform === 'win32')(
+    'symlink canonical path resolution',
+    () => {
+      it('should find files and return canonical paths when targetDir is a symlink to the workspace root', async () => {
+        const rawTempDir = await fs.mkdtemp(
+          path.join(os.tmpdir(), 'glob-tool-symlink-root-'),
+        );
+        const tempDir = await fs.realpath(rawTempDir);
+        try {
+          const realRootDir = path.join(tempDir, 'real-root');
+          const symlinkedRootDir = path.join(tempDir, 'symlinked-root');
+          await fs.mkdir(path.join(realRootDir, 'sub'), { recursive: true });
+          await fs.writeFile(
+            path.join(realRootDir, 'sub', 'fileA.txt'),
+            'contentA',
+          );
+          await fs.symlink(realRootDir, symlinkedRootDir, 'dir');
+
+          const workspaceContext = createMockWorkspaceContext(symlinkedRootDir);
+          const fileDiscovery = new FileDiscoveryService(realRootDir);
+          const symlinkConfig = {
+            getTargetDir: () => symlinkedRootDir,
+            getWorkspaceContext: () => workspaceContext,
+            getFileService: () => fileDiscovery,
+            getFileFilteringOptions: () => DEFAULT_FILE_FILTERING_OPTIONS,
+            getFileExclusions: () => ({ getGlobExcludes: () => [] }),
+            validatePathAccess: () => null,
+          } as unknown as Config;
+
+          const symlinkGlobTool = new GlobTool(
+            symlinkConfig,
+            createMockMessageBus(),
+          );
+          const invocation = symlinkGlobTool.build({ pattern: '**/*.txt' });
+          const result = await invocation.execute({ abortSignal });
+
+          expect(result.llmContent).toContain('Found 1 file(s)');
+          expect(result.llmContent).toContain(
+            path.join(realRootDir, 'sub', 'fileA.txt'),
+          );
+          expect(result.llmContent).not.toContain(symlinkedRootDir);
+        } finally {
+          await fs.rm(tempDir, { recursive: true, force: true });
+        }
+      }, 30000);
+
+      it('should resolve symlinked files inside the workspace to their canonical paths and deduplicate matches', async () => {
+        const realFile = path.join(tempRootDir, 'fileA.txt');
+        const linkedFile = path.join(tempRootDir, 'linkedFileA.txt');
+        await fs.symlink(realFile, linkedFile);
+
+        // Searching specifically for the symlinked filename should find it and return its canonical path
+        const singleInvocation = globTool.build({ pattern: 'linkedFileA.txt' });
+        const singleResult = await singleInvocation.execute({ abortSignal });
+        expect(singleResult.llmContent).toContain('Found 1 file(s)');
+        expect(singleResult.llmContent).toContain(realFile);
+        expect(singleResult.llmContent).not.toContain(linkedFile);
+
+        // Searching with a wildcard matching both the real file and its symlink should deduplicate canonical paths
+        const wildcardInvocation = globTool.build({
+          pattern: '*fileA.txt',
+          case_sensitive: false,
+        });
+        const wildcardResult = await wildcardInvocation.execute({
+          abortSignal,
+        });
+        expect(wildcardResult.llmContent).toContain('Found 1 file(s)');
+        expect(wildcardResult.llmContent).toContain(realFile);
+      }, 30000);
+
+      it('should filter out symlinked files whose canonical targets resolve outside the workspace', async () => {
+        const rawOutsideDir = await fs.mkdtemp(
+          path.join(os.tmpdir(), 'glob-tool-outside-'),
+        );
+        const outsideDir = await fs.realpath(rawOutsideDir);
+        try {
+          const outsideFile = path.join(outsideDir, 'secret.txt');
+          await fs.writeFile(outsideFile, 'secret');
+          await fs.symlink(
+            outsideFile,
+            path.join(tempRootDir, 'escaped_link.txt'),
+          );
+
+          const invocation = globTool.build({ pattern: 'escaped_link.txt' });
+          const result = await invocation.execute({ abortSignal });
+
+          expect(result.llmContent).toContain('No files found');
+          expect(result.llmContent).not.toContain('secret.txt');
+        } finally {
+          await fs.rm(outsideDir, { recursive: true, force: true });
+        }
+      }, 30000);
+
+      it('should resolve files inside symlinked directories to their canonical paths', async () => {
+        const linkedSubDir = path.join(tempRootDir, 'linked-sub');
+        await fs.symlink(path.join(tempRootDir, 'sub'), linkedSubDir, 'dir');
+
+        // Matching via pattern containing the symlinked directory name
+        const patternInvocation = globTool.build({
+          pattern: 'linked-sub/*.md',
+        });
+        const patternResult = await patternInvocation.execute({ abortSignal });
+        expect(patternResult.llmContent).toContain('Found 2 file(s)');
+        expect(patternResult.llmContent).toContain(
+          path.join(tempRootDir, 'sub', 'fileC.md'),
+        );
+        expect(patternResult.llmContent).toContain(
+          path.join(tempRootDir, 'sub', 'FileD.MD'),
+        );
+        expect(patternResult.llmContent).not.toContain(linkedSubDir);
+
+        // Matching via dir_path pointing to the symlinked directory
+        const dirPathInvocation = globTool.build({
+          pattern: '*.md',
+          dir_path: 'linked-sub',
+        });
+        const dirPathResult = await dirPathInvocation.execute({ abortSignal });
+        expect(dirPathResult.llmContent).toContain('Found 2 file(s)');
+        expect(dirPathResult.llmContent).toContain(
+          path.join(tempRootDir, 'sub', 'fileC.md'),
+        );
+        expect(dirPathResult.llmContent).toContain(
+          path.join(tempRootDir, 'sub', 'FileD.MD'),
+        );
+      }, 30000);
+    },
+  );
 });
 
 describe('sortFileEntries', () => {

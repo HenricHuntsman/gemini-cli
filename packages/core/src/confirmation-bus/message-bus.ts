@@ -13,12 +13,22 @@ import { safeJsonStringify } from '../utils/safeJsonStringify.js';
 import { debugLogger } from '../utils/debugLogger.js';
 
 export class MessageBus extends EventEmitter {
+  private listenerToAbortCleanup = new WeakMap<
+    object,
+    Map<string, () => void>
+  >();
+  // State of pending request() calls by correlationId, updated by publish().
+  private pendingRequests = new Map<
+    string,
+    { failed: boolean; error?: unknown }
+  >();
+
   constructor(
     private readonly policyEngine: PolicyEngine,
     private readonly debug = false,
+    private readonly isTrusted = true,
   ) {
     super();
-    this.debug = debug;
   }
 
   private isValidMessage(message: Message): boolean {
@@ -40,6 +50,53 @@ export class MessageBus extends EventEmitter {
     this.emit(message.type, message);
   }
 
+  /**
+   * Derives a child message bus scoped to a specific subagent.
+   * Derived buses are untrusted.
+   */
+  derive(subagentName: string): MessageBus {
+    const bus = new MessageBus(this.policyEngine, this.debug, false);
+
+    bus.publish = async (message: Message) => {
+      if (message.type === MessageBusType.TOOL_CONFIRMATION_REQUEST) {
+        // Sanitization for untrusted callers:
+        // 1. Remove forcedDecision to prevent policy bypass.
+        // 2. Remove metadata (serverName, toolAnnotations, details) to prevent spoofing.
+        // 3. Enforce subagent identity by prepending/setting the scope.
+        const {
+          forcedDecision: _forcedDecision,
+          subagent: _subagent,
+          serverName: _serverName,
+          toolAnnotations: _toolAnnotations,
+          details: _details,
+          ...otherFields
+        } = message;
+
+        return this.publish({
+          ...otherFields,
+          subagent: message.subagent
+            ? `${subagentName}/${message.subagent}`
+            : subagentName,
+        } as Message);
+      }
+      return this.publish(message);
+    };
+
+    // Delegate subscription methods to the parent bus
+    bus.subscribe = this.subscribe.bind(this);
+    bus.unsubscribe = this.unsubscribe.bind(this);
+    bus.on = this.on.bind(this);
+    bus.off = this.off.bind(this);
+    bus.emit = this.emit.bind(this);
+    bus.once = this.once.bind(this);
+    bus.removeListener = this.removeListener.bind(this);
+    bus.listenerCount = this.listenerCount.bind(this);
+    // Share pending request state so the parent's publish() can update it
+    bus.pendingRequests = this.pendingRequests;
+
+    return bus;
+  }
+
   async publish(message: Message): Promise<void> {
     if (this.debug) {
       debugLogger.debug(`[MESSAGE_BUS] publish: ${safeJsonStringify(message)}`);
@@ -52,12 +109,17 @@ export class MessageBus extends EventEmitter {
       }
 
       if (message.type === MessageBusType.TOOL_CONFIRMATION_REQUEST) {
-        const { decision } = await this.policyEngine.check(
+        const { decision: policyDecision } = await this.policyEngine.check(
           message.toolCall,
           message.serverName,
           message.toolAnnotations,
           message.subagent,
         );
+
+        // Only trust forcedDecision if it comes from a trusted bus
+        const decision =
+          (this.isTrusted ? message.forcedDecision : undefined) ??
+          policyDecision;
 
         switch (decision) {
           case PolicyDecision.ALLOW:
@@ -105,6 +167,18 @@ export class MessageBus extends EventEmitter {
         this.emitMessage(message);
       }
     } catch (error) {
+      // Record the failure for a pending request() with this correlationId
+      if (
+        message &&
+        typeof message === 'object' &&
+        'correlationId' in message
+      ) {
+        const pending = this.pendingRequests.get(message.correlationId);
+        if (pending) {
+          pending.failed = true;
+          pending.error = error;
+        }
+      }
       this.emit('error', error);
     }
   }
@@ -112,7 +186,36 @@ export class MessageBus extends EventEmitter {
   subscribe<T extends Message>(
     type: T['type'],
     listener: (message: T) => void,
+    options?: { signal?: AbortSignal },
   ): void {
+    if (options?.signal) {
+      const signal = options.signal;
+      if (signal.aborted) return;
+
+      if (this.listenerToAbortCleanup.get(listener)?.has(type)) return;
+
+      const abortHandler = () => {
+        this.off(type, listener);
+        const typeToCleanup = this.listenerToAbortCleanup.get(listener);
+        if (typeToCleanup) {
+          typeToCleanup.delete(type);
+          if (typeToCleanup.size === 0) {
+            this.listenerToAbortCleanup.delete(listener);
+          }
+        }
+      };
+      signal.addEventListener('abort', abortHandler, { once: true });
+
+      let typeToCleanup = this.listenerToAbortCleanup.get(listener);
+      if (!typeToCleanup) {
+        typeToCleanup = new Map<string, () => void>();
+        this.listenerToAbortCleanup.set(listener, typeToCleanup);
+      }
+      typeToCleanup.set(type, () => {
+        signal.removeEventListener('abort', abortHandler);
+      });
+    }
+
     this.on(type, listener);
   }
 
@@ -121,6 +224,17 @@ export class MessageBus extends EventEmitter {
     listener: (message: T) => void,
   ): void {
     this.off(type, listener);
+    const typeToCleanup = this.listenerToAbortCleanup.get(listener);
+    if (typeToCleanup) {
+      const cleanup = typeToCleanup.get(type);
+      if (cleanup) {
+        cleanup();
+        typeToCleanup.delete(type);
+      }
+      if (typeToCleanup.size === 0) {
+        this.listenerToAbortCleanup.delete(listener);
+      }
+    }
   }
 
   /**
@@ -144,6 +258,12 @@ export class MessageBus extends EventEmitter {
       const cleanup = () => {
         clearTimeout(timeoutId);
         this.unsubscribe(responseType, responseHandler);
+        this.pendingRequests.delete(correlationId);
+      };
+
+      const fail = (error: unknown) => {
+        cleanup();
+        reject(error);
       };
 
       const responseHandler = (response: TResponse) => {
@@ -160,9 +280,19 @@ export class MessageBus extends EventEmitter {
       // Subscribe to responses
       this.subscribe<TResponse>(responseType, responseHandler);
 
-      // Publish the request with correlation ID
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises, @typescript-eslint/no-unsafe-type-assertion
-      this.publish({ ...request, correlationId } as TRequest);
+      // Track the request so publish() can record a failure for it
+      this.pendingRequests.set(correlationId, { failed: false });
+
+      // Publish the request with correlation ID and reject if publishing fails
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        this.publish({ ...request, correlationId } as TRequest).then(() => {
+          const pending = this.pendingRequests.get(correlationId);
+          if (pending?.failed) fail(pending.error);
+        }, fail);
+      } catch (error) {
+        fail(error);
+      }
     });
   }
 }

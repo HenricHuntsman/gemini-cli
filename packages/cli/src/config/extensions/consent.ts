@@ -4,9 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { debugLogger, type SkillDefinition } from '@google/gemini-cli-core';
+import {
+  debugLogger,
+  type SkillDefinition,
+  type MCPServerConfig,
+} from '@google/gemini-cli-core';
 import chalk from 'chalk';
 
 import type { ConfirmationRequest } from '../../ui/types.js';
@@ -15,6 +20,10 @@ import type { ExtensionConfig } from '../extension.js';
 
 export const INSTALL_WARNING_MESSAGE = chalk.yellow(
   'The extension you are about to install may have been created by a third-party developer and sourced from a public repository. Google does not vet, endorse, or guarantee the functionality or security of extensions. Please carefully inspect any extension and its source code before installing to understand the permissions it requires and the actions it may perform.',
+);
+
+export const LINK_WARNING_MESSAGE = chalk.yellow(
+  '⚠️  Warning: Linking creates a live symbolic link to the target directory. Any future changes made to code, MCP servers, hooks, or prompts inside that directory will take effect automatically upon CLI startup without further warnings.',
 );
 
 export const SKILLS_WARNING_MESSAGE = chalk.yellow(
@@ -61,7 +70,8 @@ export async function requestConsentNonInteractive(
 ): Promise<boolean> {
   debugLogger.log(consentDescription);
   const result = await promptForConsentNonInteractive(
-    'Do you want to continue? [Y/n]: ',
+    'Do you want to continue? [y/N]: ',
+    false,
   );
   return result;
 }
@@ -78,10 +88,12 @@ export async function requestConsentNonInteractive(
 export async function requestConsentInteractive(
   consentDescription: string,
   addExtensionUpdateConfirmationRequest: (value: ConfirmationRequest) => void,
+  clearConfirmationRequest?: () => void,
 ): Promise<boolean> {
   return promptForConsentInteractive(
     consentDescription + '\n\nDo you want to continue?',
     addExtensionUpdateConfirmationRequest,
+    clearConfirmationRequest,
   );
 }
 
@@ -96,7 +108,7 @@ export async function requestConsentInteractive(
  */
 export async function promptForConsentNonInteractive(
   prompt: string,
-  defaultValue = true,
+  defaultValue = false,
 ): Promise<boolean> {
   const readline = await import('node:readline');
   const rl = readline.createInterface({
@@ -105,13 +117,26 @@ export async function promptForConsentNonInteractive(
   });
 
   return new Promise((resolve) => {
-    rl.question(prompt, (answer) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       rl.close();
+      resolve(value);
+    };
+
+    rl.on?.('close', () => {
+      finish(false);
+    });
+
+    rl.question(prompt, (answer) => {
       const trimmedAnswer = answer.trim().toLowerCase();
       if (trimmedAnswer === '') {
-        resolve(defaultValue);
+        finish(defaultValue);
       } else {
-        resolve(['y', 'yes'].includes(trimmedAnswer));
+        finish(['y', 'yes'].includes(trimmedAnswer));
       }
     });
   });
@@ -129,15 +154,50 @@ export async function promptForConsentNonInteractive(
 async function promptForConsentInteractive(
   prompt: string,
   addExtensionUpdateConfirmationRequest: (value: ConfirmationRequest) => void,
+  clearConfirmationRequest?: () => void,
 ): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     addExtensionUpdateConfirmationRequest({
       prompt,
       onConfirm: (resolvedConfirmed) => {
-        resolve(resolvedConfirmed);
+        clearConfirmationRequest?.();
+        setImmediate(() => resolve(resolvedConfirmed));
       },
     });
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Helper to generate a deterministic canonical hash of an MCPServerConfig object.
+ * Excludes circular or complex fields like extension.
+ */
+function getMcpServerConfigHash(mcpServer: MCPServerConfig): string {
+  const plainMcpServer: Record<string, unknown> = isRecord(mcpServer)
+    ? mcpServer
+    : {};
+  const copy = { ...plainMcpServer };
+  delete copy['extension'];
+
+  const canonicalString = JSON.stringify(copy, (key, value) => {
+    if (value instanceof RegExp) {
+      return value.toString();
+    }
+    if (isRecord(value)) {
+      return Object.keys(value)
+        .sort()
+        .reduce((result: Record<string, unknown>, k) => {
+          result[k] = value[k];
+          return result;
+        }, {});
+    }
+    return value as unknown;
+  });
+
+  return crypto.createHash('sha256').update(canonicalString).digest('hex');
 }
 
 /**
@@ -150,8 +210,12 @@ async function extensionConsentString(
   skills: SkillDefinition[] = [],
   previousName?: string,
   wasMigrated?: boolean,
+  linkedSourcePath?: string,
 ): Promise<string> {
   const sanitizedConfig = escapeAnsiCtrlCodes(extensionConfig);
+  const sanitizedLinkedPath = linkedSourcePath
+    ? escapeAnsiCtrlCodes(linkedSourcePath)
+    : undefined;
   const output: string[] = [];
   const mcpServerEntries = Object.entries(sanitizedConfig.mcpServers || {});
 
@@ -169,6 +233,10 @@ async function extensionConsentString(
     output.push(
       `Renaming extension "${previousName}" to "${sanitizedConfig.name}" and installing updates.`,
     );
+  } else if (sanitizedLinkedPath) {
+    output.push(
+      `Linking extension "${sanitizedConfig.name}" from canonical path "${sanitizedLinkedPath}".`,
+    );
   } else {
     output.push(`Installing extension "${sanitizedConfig.name}".`);
   }
@@ -181,6 +249,88 @@ async function extensionConsentString(
         mcpServer.httpUrl ??
         `${mcpServer.command || ''}${mcpServer.args ? ' ' + mcpServer.args.join(' ') : ''}`;
       output.push(`  * ${key} (${isLocal ? 'local' : 'remote'}): ${source}`);
+      if (mcpServer.cwd) {
+        output.push(`    Working directory: ${mcpServer.cwd}`);
+      }
+      if (mcpServer.env && Object.keys(mcpServer.env).length > 0) {
+        output.push('    Environment variables:');
+        const sortedEnv = Object.entries(mcpServer.env).sort(([a], [b]) =>
+          a.localeCompare(b),
+        );
+        for (const [envKey, envValue] of sortedEnv) {
+          const isSensitive =
+            /token|secret|password|passwd|key|auth|credential|creds|private|cert/i.test(
+              envKey,
+            );
+          const displayValue =
+            isSensitive && envValue ? '********' : (envValue ?? '');
+          output.push(`      - ${envKey}: ${displayValue}`);
+        }
+      }
+      if (mcpServer.headers && Object.keys(mcpServer.headers).length > 0) {
+        output.push('    Headers:');
+        const sortedHeaders = Object.entries(mcpServer.headers).sort(
+          ([a], [b]) => a.localeCompare(b),
+        );
+        for (const [headerKey, headerValue] of sortedHeaders) {
+          const isSensitive = /authorization|key|cookie|token|secret/i.test(
+            headerKey,
+          );
+          const displayValue =
+            isSensitive && headerValue ? '********' : (headerValue ?? '');
+          output.push(`      - ${headerKey}: ${displayValue}`);
+        }
+      }
+      if (mcpServer.url) {
+        output.push(`    URL: ${mcpServer.url}`);
+      }
+      if (mcpServer.tcp) {
+        output.push(`    TCP: ${mcpServer.tcp}`);
+      }
+      if (mcpServer.type) {
+        output.push(`    Type: ${mcpServer.type}`);
+      }
+      if (mcpServer.timeout !== undefined) {
+        output.push(`    Timeout: ${mcpServer.timeout}`);
+      }
+      if (mcpServer.trust !== undefined) {
+        output.push(`    Trust: ${mcpServer.trust}`);
+      }
+      if (mcpServer.description) {
+        output.push(`    Description: ${mcpServer.description}`);
+      }
+      if (mcpServer.includeTools && mcpServer.includeTools.length > 0) {
+        output.push(`    Include tools: ${mcpServer.includeTools.join(', ')}`);
+      }
+      if (mcpServer.excludeTools && mcpServer.excludeTools.length > 0) {
+        output.push(`    Exclude tools: ${mcpServer.excludeTools.join(', ')}`);
+      }
+      if (mcpServer.authProviderType) {
+        output.push(`    Auth Provider Type: ${mcpServer.authProviderType}`);
+      }
+      if (mcpServer.targetAudience) {
+        output.push(`    Target Audience: ${mcpServer.targetAudience}`);
+      }
+      if (mcpServer.targetServiceAccount) {
+        output.push(
+          `    Target Service Account: ${mcpServer.targetServiceAccount}`,
+        );
+      }
+      if (mcpServer.oauth) {
+        output.push('    OAuth Configuration:');
+        const sortedOauth = Object.entries(mcpServer.oauth).sort(([a], [b]) =>
+          a.localeCompare(b),
+        );
+        for (const [oKey, oValue] of sortedOauth) {
+          const isSensitive = /secret|token|password/i.test(oKey);
+          const valStr = Array.isArray(oValue)
+            ? oValue.join(', ')
+            : String(oValue ?? '');
+          const displayValue = isSensitive && valStr ? '********' : valStr;
+          output.push(`      - ${oKey}: ${displayValue}`);
+        }
+      }
+      output.push(`    Config signature: ${getMcpServerConfigHash(mcpServer)}`);
     }
   }
   if (sanitizedConfig.contextFileName) {
@@ -204,6 +354,14 @@ async function extensionConsentString(
     output.push(...(await renderSkillsList(skills)));
   }
 
+  if (sanitizedLinkedPath) {
+    output.push(
+      '\n' +
+        chalk.yellow(
+          `⚠️  Warning: Linking creates a live symbolic link to "${sanitizedLinkedPath}". Any future changes made to code, MCP servers, hooks, or prompts inside that directory will take effect automatically upon CLI startup without further warnings.`,
+        ),
+    );
+  }
   output.push('\n' + INSTALL_WARNING_MESSAGE);
   if (skills.length > 0) {
     output.push('\n' + SKILLS_WARNING_MESSAGE);
@@ -251,6 +409,8 @@ export async function maybeRequestConsentOrFail(
   skills: SkillDefinition[] = [],
   previousSkills: SkillDefinition[] = [],
   isMigrating: boolean = false,
+  linkedSourcePath?: string,
+  previousLinkedSourcePath?: string,
 ) {
   const extensionConsent = await extensionConsentString(
     extensionConfig,
@@ -258,12 +418,16 @@ export async function maybeRequestConsentOrFail(
     skills,
     previousExtensionConfig?.name,
     isMigrating,
+    linkedSourcePath,
   );
   if (previousExtensionConfig) {
     const previousExtensionConsent = await extensionConsentString(
       previousExtensionConfig,
       previousHasHooks ?? false,
       previousSkills,
+      undefined,
+      false,
+      previousLinkedSourcePath,
     );
     if (previousExtensionConsent === extensionConsent) {
       return;

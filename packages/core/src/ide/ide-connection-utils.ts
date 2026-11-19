@@ -7,9 +7,13 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { EnvHttpProxyAgent } from 'undici';
+import { EnvHttpProxyAgent, fetch as undiciFetch } from 'undici';
 import { debugLogger } from '../utils/debugLogger.js';
-import { isSubpath, resolveToRealPath } from '../utils/paths.js';
+import {
+  getIdeConnectionDir,
+  isSubpath,
+  resolveToRealPath,
+} from '../utils/paths.js';
 import { isNodeError } from '../utils/errors.js';
 import { type IdeInfo } from './detect-ide.js';
 
@@ -33,6 +37,25 @@ export type ConnectionConfig = {
   stdio?: StdioConfig;
 };
 
+/**
+ * Whether this CLI is running inside a Gemini CLI sandbox (the sandbox
+ * launcher sets `SANDBOX` for every sandbox type).
+ */
+export function isRunningInSandbox(): boolean {
+  return !!process.env['SANDBOX'];
+}
+
+/**
+ * Guidance for a failed companion connection. Inside a sandbox, `/ide install`
+ * cannot reach the IDE on the host and the connection is bridged by the
+ * sandbox launcher, so the advice differs.
+ */
+export function getConnectionFailureAdvice(): string {
+  return isRunningInSandbox()
+    ? 'Gemini CLI is running inside a sandbox: make sure the extension is installed and running in your IDE, then restart Gemini CLI so the sandbox can bridge the connection.'
+    : 'Please ensure the extension is running. To install the extension, run /ide install.';
+}
+
 export function validateWorkspacePath(
   ideWorkspacePath: string | undefined,
   cwd: string,
@@ -40,7 +63,7 @@ export function validateWorkspacePath(
   if (ideWorkspacePath === undefined) {
     return {
       isValid: false,
-      error: `Failed to connect to IDE companion extension. Please ensure the extension is running. To install the extension, run /ide install.`,
+      error: `Failed to connect to IDE companion extension. ${getConnectionFailureAdvice()}`,
     };
   }
 
@@ -109,30 +132,107 @@ export function getStdioConfigFromEnv(): StdioConfig | undefined {
 
 const IDE_SERVER_FILE_REGEX = /^gemini-ide-server-(\d+)-\d+\.json$/;
 
-export async function getConnectionConfigFromFile(
-  pid: number,
-): Promise<
-  (ConnectionConfig & { workspacePath?: string; ideInfo?: IdeInfo }) | undefined
-> {
-  // For backwards compatibility
+type DiscoveredConnectionConfig = ConnectionConfig & {
+  workspacePath?: string;
+  ideInfo?: IdeInfo;
+};
+
+async function verifyDirectory(
+  dirPath: string,
+  requireStrictPermissions: boolean,
+): Promise<boolean> {
   try {
-    const portFile = path.join(
-      os.tmpdir(),
-      'gemini',
-      'ide',
-      `gemini-ide-server-${pid}.json`,
-    );
-    const portFileContents = await fs.promises.readFile(portFile, 'utf8');
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    return JSON.parse(portFileContents);
-  } catch (_) {
+    const stat = await fs.promises.lstat(dirPath);
+    if (
+      (typeof stat.isSymbolicLink === 'function' && stat.isSymbolicLink()) ||
+      (typeof stat.isDirectory === 'function' && !stat.isDirectory())
+    ) {
+      return false;
+    }
+    if (requireStrictPermissions) {
+      if (process.getuid && stat.uid !== process.getuid()) {
+        return false;
+      }
+      if (
+        os.platform() !== 'win32' &&
+        typeof stat.mode === 'number' &&
+        (stat.mode & 0o077) !== 0
+      ) {
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function verifyAndReadFile(
+  filePath: string,
+): Promise<string | undefined> {
+  let handle: fs.promises.FileHandle | undefined;
+  try {
+    const openFlags =
+      os.platform() === 'win32'
+        ? 'r'
+        : fs.constants.O_RDONLY |
+          (fs.constants.O_NOFOLLOW ?? 0) |
+          (fs.constants.O_NONBLOCK ?? 0);
+    handle = await fs.promises.open(filePath, openFlags);
+    const stat = await handle.stat();
+    if (typeof stat.isFile === 'function' && !stat.isFile()) {
+      return undefined;
+    }
+    if (process.getuid && stat.uid !== process.getuid()) {
+      return undefined;
+    }
+    if (
+      os.platform() !== 'win32' &&
+      typeof stat.mode === 'number' &&
+      (stat.mode & 0o077) !== 0
+    ) {
+      return undefined;
+    }
+    return await handle.readFile('utf8');
+  } catch {
+    return undefined;
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+  }
+}
+
+async function readConnectionConfigFromDirectory(
+  portFileDir: string,
+  pid: number,
+  requireStrictPermissions: boolean,
+): Promise<DiscoveredConnectionConfig | undefined> {
+  if (!(await verifyDirectory(portFileDir, requireStrictPermissions))) {
+    return undefined;
+  }
+
+  // For backwards compatibility with single-file naming scheme
+  try {
+    const portFile = path.join(portFileDir, `gemini-ide-server-${pid}.json`);
+    const portFileContents = await verifyAndReadFile(portFile);
+    if (!portFileContents) {
+      throw new Error('Verification failed or file not found');
+    }
+    const parsed: unknown = JSON.parse(portFileContents);
+    const isConfig = (val: unknown): val is DiscoveredConnectionConfig =>
+      typeof val === 'object' && val !== null;
+    if (isConfig(parsed)) {
+      return parsed;
+    }
+    throw new Error('Invalid connection config format');
+  } catch {
     // For newer extension versions, the file name matches the pattern
     // /^gemini-ide-server-${pid}-\d+\.json$/. If multiple IDE
     // windows are open, multiple files matching the pattern are expected to
     // exist.
   }
 
-  const portFileDir = path.join(os.tmpdir(), 'gemini', 'ide');
   let portFiles;
   try {
     portFiles = await fs.promises.readdir(portFileDir);
@@ -155,60 +255,90 @@ export async function getConnectionConfigFromFile(
 
   sortConnectionFiles(matchingFiles, pid);
 
-  let fileContents: string[];
-  try {
-    fileContents = await Promise.all(
-      matchingFiles.map((file) =>
-        fs.promises.readFile(path.join(portFileDir, file), 'utf8'),
-      ),
-    );
-  } catch (e) {
-    logger.debug('Failed to read IDE connection config file(s):', e);
-    return undefined;
-  }
-  const parsedContents = fileContents.map((content) => {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      return JSON.parse(content);
-    } catch (e) {
-      logger.debug('Failed to parse JSON from config file: ', e);
-      return undefined;
-    }
-  });
+  const fileContents = await Promise.all(
+    matchingFiles.map((file) =>
+      verifyAndReadFile(path.join(portFileDir, file)),
+    ),
+  );
 
-  const validWorkspaces = parsedContents.filter((content) => {
-    if (!content) {
-      return false;
-    }
-    const { isValid } = validateWorkspacePath(
-      content.workspacePath,
-      process.cwd(),
-    );
-    return isValid;
-  });
+  const parsedContents = fileContents.map(
+    (content): DiscoveredConnectionConfig | undefined => {
+      if (!content) {
+        return undefined;
+      }
+      try {
+        const parsed: unknown = JSON.parse(content);
+        const isConfig = (val: unknown): val is DiscoveredConnectionConfig =>
+          typeof val === 'object' && val !== null;
+        if (isConfig(parsed)) {
+          return parsed;
+        }
+        return undefined;
+      } catch (e) {
+        logger.debug('Failed to parse JSON from config file: ', e);
+        return undefined;
+      }
+    },
+  );
+
+  const validWorkspaces = parsedContents.filter(
+    (content): content is DiscoveredConnectionConfig => {
+      if (!content) {
+        return false;
+      }
+      const { isValid } = validateWorkspacePath(
+        content.workspacePath,
+        process.cwd(),
+      );
+      return isValid;
+    },
+  );
 
   if (validWorkspaces.length === 0) {
+    // If no workspace matches the current CWD, but we found and parsed
+    // valid connection config file(s), return the best-sorted config.
+    // This lets downstream connection logic raise a helpful, detailed
+    // "Directory mismatch" warning instead of a generic connection error.
+    let fileIndex = -1;
+    const portFromEnv = getPortFromEnv();
+    if (portFromEnv) {
+      fileIndex = parsedContents.findIndex(
+        (content) =>
+          !!content &&
+          content.port !== undefined &&
+          String(content.port) === portFromEnv,
+      );
+    }
+    if (fileIndex === -1) {
+      fileIndex = parsedContents.findIndex((content) => !!content);
+    }
+
+    if (fileIndex !== -1) {
+      const selected = parsedContents[fileIndex]!;
+      logger.debug(
+        `Selected best mismatched IDE connection file: ${matchingFiles[fileIndex]}`,
+      );
+      return selected;
+    }
     return undefined;
   }
 
   if (validWorkspaces.length === 1) {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
     const selected = validWorkspaces[0];
     const fileIndex = parsedContents.indexOf(selected);
     if (fileIndex !== -1) {
       logger.debug(`Selected IDE connection file: ${matchingFiles[fileIndex]}`);
     }
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
     return selected;
   }
 
   const portFromEnv = getPortFromEnv();
   if (portFromEnv) {
     const matchingPortIndex = validWorkspaces.findIndex(
-      (content) => String(content.port) === portFromEnv,
+      (content) =>
+        content.port !== undefined && String(content.port) === portFromEnv,
     );
     if (matchingPortIndex !== -1) {
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       const selected = validWorkspaces[matchingPortIndex];
       const fileIndex = parsedContents.indexOf(selected);
       if (fileIndex !== -1) {
@@ -216,12 +346,10 @@ export async function getConnectionConfigFromFile(
           `Selected IDE connection file (matched port from env): ${matchingFiles[fileIndex]}`,
         );
       }
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
       return selected;
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const selected = validWorkspaces[0];
   const fileIndex = parsedContents.indexOf(selected);
   if (fileIndex !== -1) {
@@ -229,8 +357,28 @@ export async function getConnectionConfigFromFile(
       `Selected first valid IDE connection file: ${matchingFiles[fileIndex]}`,
     );
   }
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-return
   return selected;
+}
+
+export async function getConnectionConfigFromFile(
+  pid: number,
+): Promise<DiscoveredConnectionConfig | undefined> {
+  const baseTmpDir = os.tmpdir();
+  const primaryDir = getIdeConnectionDir(baseTmpDir);
+  const primaryConfig = await readConnectionConfigFromDirectory(
+    primaryDir,
+    pid,
+    Boolean(process.getuid),
+  );
+  if (primaryConfig) {
+    return primaryConfig;
+  }
+
+  const legacyDir = path.join(baseTmpDir, 'gemini', 'ide');
+  if (legacyDir !== primaryDir) {
+    return readConnectionConfigFromDirectory(legacyDir, pid, false);
+  }
+  return undefined;
 }
 
 // Sort files to prioritize the one matching the target pid,
@@ -286,12 +434,7 @@ export async function createProxyAwareFetch(ideServerHost: string) {
   const agent = new EnvHttpProxyAgent({
     noProxy: [existingNoProxy, ideServerHost].filter(Boolean).join(','),
   });
-  const undiciPromise = import('undici');
-  // Suppress unhandled rejection if the promise is not awaited immediately.
-  // If the import fails, the error will be thrown when awaiting undiciPromise below.
-  undiciPromise.catch(() => {});
   return async (url: string | URL, init?: RequestInit): Promise<Response> => {
-    const { fetch: fetchFn } = await undiciPromise;
     const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       ...init,
       dispatcher: agent,
@@ -299,7 +442,7 @@ export async function createProxyAwareFetch(ideServerHost: string) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const options = fetchOptions as unknown as import('undici').RequestInit;
     try {
-      const response = await fetchFn(url, options);
+      const response = await undiciFetch(url, options);
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
       return new Response(response.body as ReadableStream<unknown> | null, {
         status: response.status,

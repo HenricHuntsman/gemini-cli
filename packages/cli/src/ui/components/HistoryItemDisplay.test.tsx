@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { HistoryItemDisplay } from './HistoryItemDisplay.js';
 import { MessageType, type HistoryItem } from '../types.js';
@@ -16,6 +17,7 @@ import {
 import { ToolGroupMessage } from './messages/ToolGroupMessage.js';
 import { renderWithProviders } from '../../test-utils/render.js';
 import { createMockSettings } from '../../test-utils/settings.js';
+import { makeFakeConfig } from '@google/gemini-cli-core';
 
 // Mock child components
 vi.mock('./messages/ToolGroupMessage.js', () => ({
@@ -38,10 +40,9 @@ describe('<HistoryItemDisplay />', () => {
       type: MessageType.USER,
       text: 'Hello',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+    const { lastFrame, unmount } = await renderWithProviders(
       <HistoryItemDisplay {...baseItem} item={item} />,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain('Hello');
     unmount();
   });
@@ -52,10 +53,9 @@ describe('<HistoryItemDisplay />', () => {
       type: 'hint',
       text: 'Try using ripgrep first',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+    const { lastFrame, unmount } = await renderWithProviders(
       <HistoryItemDisplay {...baseItem} item={item} />,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain('Try using ripgrep first');
     unmount();
   });
@@ -66,10 +66,9 @@ describe('<HistoryItemDisplay />', () => {
       type: MessageType.USER,
       text: '/theme',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+    const { lastFrame, unmount } = await renderWithProviders(
       <HistoryItemDisplay {...baseItem} item={item} />,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain('/theme');
     unmount();
   });
@@ -82,11 +81,13 @@ describe('<HistoryItemDisplay />', () => {
         type: MessageType.INFO,
         text: '⚡ Line 1\n⚡ Line 2\n⚡ Line 3',
       };
-      const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+      const { lastFrame, unmount } = await renderWithProviders(
         <HistoryItemDisplay {...baseItem} item={item} />,
-        { useAlternateBuffer },
+        {
+          config: makeFakeConfig({ useAlternateBuffer }),
+          settings: createMockSettings({ ui: { useAlternateBuffer } }),
+        },
       );
-      await waitUntilReady();
       expect(lastFrame()).toMatchSnapshot();
       unmount();
     },
@@ -110,10 +111,9 @@ describe('<HistoryItemDisplay />', () => {
         },
       ],
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+    const { lastFrame, unmount } = await renderWithProviders(
       <HistoryItemDisplay {...baseItem} item={item} />,
     );
-    await waitUntilReady();
     expect(lastFrame()).toMatchSnapshot();
     unmount();
   });
@@ -124,12 +124,11 @@ describe('<HistoryItemDisplay />', () => {
       type: MessageType.STATS,
       duration: '1s',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
-      <SessionStatsProvider>
+    const { lastFrame, unmount } = await renderWithProviders(
+      <SessionStatsProvider sessionId="test-session-id">
         <HistoryItemDisplay {...baseItem} item={item} />
       </SessionStatsProvider>,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain('Stats');
     unmount();
   });
@@ -146,10 +145,9 @@ describe('<HistoryItemDisplay />', () => {
       gcpProject: 'test-project',
       ideClient: 'test-ide',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+    const { lastFrame, unmount } = await renderWithProviders(
       <HistoryItemDisplay {...baseItem} item={item} />,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain('About Gemini CLI');
     unmount();
   });
@@ -159,12 +157,11 @@ describe('<HistoryItemDisplay />', () => {
       ...baseItem,
       type: 'model_stats',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
-      <SessionStatsProvider>
+    const { lastFrame, unmount } = await renderWithProviders(
+      <SessionStatsProvider sessionId="test-session-id">
         <HistoryItemDisplay {...baseItem} item={item} />
       </SessionStatsProvider>,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain(
       'No API calls have been made in this session.',
     );
@@ -176,15 +173,48 @@ describe('<HistoryItemDisplay />', () => {
       ...baseItem,
       type: 'tool_stats',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
-      <SessionStatsProvider>
+    const { lastFrame, unmount } = await renderWithProviders(
+      <SessionStatsProvider sessionId="test-session-id">
         <HistoryItemDisplay {...baseItem} item={item} />
       </SessionStatsProvider>,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain(
       'No tool calls have been made in this session.',
     );
+    unmount();
+  });
+
+  it('renders HeatmapComponent for "heatmap_stats" type', async () => {
+    const item: HistoryItem = {
+      ...baseItem,
+      type: 'heatmap_stats',
+      dailyUsage: {
+        '2026-11-03': {
+          date: '2026-11-03',
+          totalTokens: 450,
+          inputTokens: 300,
+          outputTokens: 150,
+          cachedTokens: 50,
+          turns: 2,
+          sessions: 1,
+          modelBreakdown: { 'gemini-2.5-pro': 450 },
+        },
+      },
+      totalWindowTokens: 450,
+      totalWindowSessions: 1,
+      totalWindowTurns: 2,
+      currentStreak: 1,
+      longestStreak: 1,
+      today: '2026-11-03',
+      selectedDate: '2026-11-03',
+    };
+    const { lastFrame, unmount } = await renderWithProviders(
+      <HistoryItemDisplay {...baseItem} item={item} />,
+    );
+    expect(lastFrame()).toContain('Token Usage Heatmap');
+    expect(lastFrame()).toContain('Summary (last 28 weeks / 196 days)');
+    expect(lastFrame()).toContain('Total Tokens: 450 · 1 session · 2 turns');
+    expect(lastFrame()).toContain('Breakdown for 2026-11-03');
     unmount();
   });
 
@@ -194,13 +224,31 @@ describe('<HistoryItemDisplay />', () => {
       type: 'quit',
       duration: '1s',
     };
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
-      <SessionStatsProvider>
+    const { lastFrame, unmount } = await renderWithProviders(
+      <SessionStatsProvider sessionId="test-session-id">
         <HistoryItemDisplay {...baseItem} item={item} />
       </SessionStatsProvider>,
     );
-    await waitUntilReady();
     expect(lastFrame()).toContain('Agent powering down. Goodbye!');
+    unmount();
+  });
+
+  it('renders ExportSessionMessage for "export_session" type', async () => {
+    const testPath = path.join(path.sep, 'test', 'path.json');
+    const item: HistoryItem = {
+      ...baseItem,
+      type: 'export_session',
+      exportSession: {
+        isPending: false,
+        targetPath: testPath,
+      },
+    };
+    const { lastFrame, unmount } = await renderWithProviders(
+      <HistoryItemDisplay {...baseItem} item={item} />,
+    );
+    expect(lastFrame()).toContain(
+      `Successfully exported session to ${testPath}`,
+    );
     unmount();
   });
 
@@ -211,14 +259,13 @@ describe('<HistoryItemDisplay />', () => {
       text: 'Hello, \u001b[31mred\u001b[0m world!',
     };
 
-    const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+    const { lastFrame, unmount } = await renderWithProviders(
       <HistoryItemDisplay
         item={historyItem}
         terminalWidth={80}
         isPending={false}
       />,
     );
-    await waitUntilReady();
 
     // The ANSI codes should be escaped for display.
     expect(lastFrame()).toContain('Hello, \\u001b[31mred\\u001b[0m world!');
@@ -249,14 +296,13 @@ describe('<HistoryItemDisplay />', () => {
       ],
     };
 
-    const { waitUntilReady, unmount } = renderWithProviders(
+    const { unmount } = await renderWithProviders(
       <HistoryItemDisplay
         item={historyItem}
         terminalWidth={80}
         isPending={false}
       />,
     );
-    await waitUntilReady();
 
     const passedProps = vi.mocked(ToolGroupMessage).mock.calls[0][0];
     const confirmationDetails = passedProps.toolCalls[0]
@@ -268,6 +314,38 @@ describe('<HistoryItemDisplay />', () => {
     unmount();
   });
 
+  it('subtracts top margin from availableTerminalHeight when isToolGroupBoundary is true', async () => {
+    vi.mocked(ToolGroupMessage).mockClear();
+    const historyItem: HistoryItem = {
+      id: 1,
+      type: 'tool_group',
+      tools: [
+        {
+          callId: '123',
+          name: 'run_shell_command',
+          description: 'Run a shell command',
+          resultDisplay: 'output',
+          status: CoreToolCallStatus.Executing,
+          confirmationDetails: undefined,
+        },
+      ],
+    };
+
+    const { unmount } = await renderWithProviders(
+      <HistoryItemDisplay
+        item={historyItem}
+        terminalWidth={80}
+        availableTerminalHeight={10}
+        isPending={true}
+        isToolGroupBoundary={true}
+      />,
+    );
+
+    const passedProps = vi.mocked(ToolGroupMessage).mock.calls[0][0];
+    expect(passedProps.availableTerminalHeight).toBe(9);
+    unmount();
+  });
+
   describe('thinking items', () => {
     it('renders thinking item when enabled', async () => {
       const item: HistoryItem = {
@@ -275,15 +353,12 @@ describe('<HistoryItemDisplay />', () => {
         type: 'thinking',
         thought: { subject: 'Thinking', description: 'test' },
       };
-      const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+      const { lastFrame, unmount } = await renderWithProviders(
         <HistoryItemDisplay {...baseItem} item={item} />,
         {
-          settings: createMockSettings({
-            merged: { ui: { inlineThinkingMode: 'full' } },
-          }),
+          settings: createMockSettings({ ui: { inlineThinkingMode: 'full' } }),
         },
       );
-      await waitUntilReady();
 
       expect(lastFrame()).toMatchSnapshot();
       unmount();
@@ -295,15 +370,12 @@ describe('<HistoryItemDisplay />', () => {
         type: 'thinking',
         thought: { subject: 'Thinking', description: 'test' },
       };
-      const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+      const { lastFrame, unmount } = await renderWithProviders(
         <HistoryItemDisplay {...baseItem} item={item} isFirstThinking={true} />,
         {
-          settings: createMockSettings({
-            merged: { ui: { inlineThinkingMode: 'full' } },
-          }),
+          settings: createMockSettings({ ui: { inlineThinkingMode: 'full' } }),
         },
       );
-      await waitUntilReady();
 
       expect(lastFrame()).toContain(' Thinking...');
       expect(lastFrame()).toMatchSnapshot();
@@ -315,15 +387,12 @@ describe('<HistoryItemDisplay />', () => {
         type: 'thinking',
         thought: { subject: 'Thinking', description: 'test' },
       };
-      const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+      const { lastFrame, unmount } = await renderWithProviders(
         <HistoryItemDisplay {...baseItem} item={item} />,
         {
-          settings: createMockSettings({
-            merged: { ui: { inlineThinkingMode: 'off' } },
-          }),
+          settings: createMockSettings({ ui: { inlineThinkingMode: 'off' } }),
         },
       );
-      await waitUntilReady();
 
       expect(lastFrame({ allowEmpty: true })).toBe('');
       unmount();
@@ -345,17 +414,18 @@ describe('<HistoryItemDisplay />', () => {
           type: 'gemini',
           text: longCode,
         };
-        const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+        const { lastFrame, unmount } = await renderWithProviders(
           <HistoryItemDisplay
             item={item}
             isPending={false}
             terminalWidth={80}
             availableTerminalHeight={10}
           />,
-          { useAlternateBuffer },
+          {
+            config: makeFakeConfig({ useAlternateBuffer }),
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        await waitUntilReady();
-
         expect(lastFrame()).toMatchSnapshot();
         unmount();
       });
@@ -366,7 +436,7 @@ describe('<HistoryItemDisplay />', () => {
           type: 'gemini',
           text: longCode,
         };
-        const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+        const { lastFrame, unmount } = await renderWithProviders(
           <HistoryItemDisplay
             item={item}
             isPending={false}
@@ -374,10 +444,11 @@ describe('<HistoryItemDisplay />', () => {
             availableTerminalHeight={10}
             availableTerminalHeightGemini={Number.MAX_SAFE_INTEGER}
           />,
-          { useAlternateBuffer },
+          {
+            config: makeFakeConfig({ useAlternateBuffer }),
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        await waitUntilReady();
-
         expect(lastFrame()).toMatchSnapshot();
         unmount();
       });
@@ -388,17 +459,18 @@ describe('<HistoryItemDisplay />', () => {
           type: 'gemini_content',
           text: longCode,
         };
-        const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+        const { lastFrame, unmount } = await renderWithProviders(
           <HistoryItemDisplay
             item={item}
             isPending={false}
             terminalWidth={80}
             availableTerminalHeight={10}
           />,
-          { useAlternateBuffer },
+          {
+            config: makeFakeConfig({ useAlternateBuffer }),
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        await waitUntilReady();
-
         expect(lastFrame()).toMatchSnapshot();
         unmount();
       });
@@ -409,7 +481,7 @@ describe('<HistoryItemDisplay />', () => {
           type: 'gemini_content',
           text: longCode,
         };
-        const { lastFrame, waitUntilReady, unmount } = renderWithProviders(
+        const { lastFrame, unmount } = await renderWithProviders(
           <HistoryItemDisplay
             item={item}
             isPending={false}
@@ -417,10 +489,11 @@ describe('<HistoryItemDisplay />', () => {
             availableTerminalHeight={10}
             availableTerminalHeightGemini={Number.MAX_SAFE_INTEGER}
           />,
-          { useAlternateBuffer },
+          {
+            config: makeFakeConfig({ useAlternateBuffer }),
+            settings: createMockSettings({ ui: { useAlternateBuffer } }),
+          },
         );
-        await waitUntilReady();
-
         expect(lastFrame()).toMatchSnapshot();
         unmount();
       });

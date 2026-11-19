@@ -1,6 +1,6 @@
 # Gemini CLI companion plugin: Interface specification
 
-> Last Updated: September 15, 2025
+> Last Updated: November 17, 2026
 
 This document defines the contract for building a companion plugin to enable
 Gemini CLI's IDE mode. For VS Code, these features (native diffing, context
@@ -20,9 +20,9 @@ Protocol (MCP)**.
 
 - **Protocol:** The server must be a valid MCP server. We recommend using an
   existing MCP SDK for your language of choice if available.
-- **Endpoint:** The server should expose a single endpoint (e.g., `/mcp`) for
-  all MCP communication.
-- **Port:** The server **MUST** listen on a dynamically assigned port (i.e.,
+- **Endpoint:** The server should expose a single endpoint (for example, `/mcp`)
+  for all MCP communication.
+- **Port:** The server **MUST** listen on a dynamically assigned port (that is,
   listen on port `0`).
 
 ### 2. Discovery mechanism: The port file
@@ -34,9 +34,15 @@ creating a "discovery file."
 - **How the CLI finds the file:** The CLI determines the Process ID (PID) of the
   IDE it's running in by traversing the process tree. It then looks for a
   discovery file that contains this PID in its name.
-- **File location:** The file must be created in a specific directory:
-  `os.tmpdir()/gemini/ide/`. Your plugin must create this directory if it
-  doesn't exist.
+- **File location and permissions:** On POSIX systems (Linux and macOS), you
+  **MUST** create the file in `os.tmpdir()/gemini-ide-${UID}/` (where `${UID}`
+  is the numeric user ID of the current process). Your plugin **MUST** create
+  this directory with `0700` permissions, verify with `lstat` that it isn't a
+  symbolic link and is owned by `${UID}`, and write the discovery file
+  atomically with `0600` permissions (for example, opening a temporary file in
+  that directory with exclusive creation `wx` and mode `0600`, then renaming it
+  into place). On Windows, where `%TEMP%` is already scoped to the current user,
+  create the file in `os.tmpdir()\gemini\ide\`.
 - **File naming convention:** The filename is critical and **MUST** follow the
   pattern: `gemini-ide-server-${PID}-${PORT}.json`
   - `${PID}`: The process ID of the parent IDE process. Your plugin must
@@ -56,6 +62,7 @@ creating a "discovery file."
     }
   }
   ```
+
   - `port` (number, required): The port of the MCP server.
   - `workspacePath` (string, required): A list of all open workspace root paths,
     delimited by the OS-specific path separator (`:` for Linux/macOS, `;` for
@@ -68,15 +75,15 @@ creating a "discovery file."
     The CLI will include this token in an `Authorization: Bearer <token>` header
     on all requests.
   - `ideInfo` (object, required): Information about the IDE.
-    - `name` (string, required): A short, lowercase identifier for the IDE
-      (e.g., `vscode`, `jetbrains`).
-    - `displayName` (string, required): A user-friendly name for the IDE (e.g.,
-      `VS Code`, `JetBrains IDE`).
+    - `name` (string, required): A short, lowercase identifier for the IDE (for
+      example, `vscode`, `jetbrains`).
+    - `displayName` (string, required): A user-friendly name for the IDE (for
+      example, `VS Code`, `JetBrains IDE`).
 
 - **Authentication:** To secure the connection, the plugin **MUST** generate a
   unique, secret token and include it in the discovery file. The CLI will then
   include this token in the `Authorization` header for all requests to the MCP
-  server (e.g., `Authorization: Bearer a-very-secret-token`). Your server
+  server (for example, `Authorization: Bearer a-very-secret-token`). Your server
   **MUST** validate this token on every request and reject any that are
   unauthorized.
 - **Tie-breaking with environment variables (recommended):** For the most
@@ -132,9 +139,11 @@ to the CLI whenever the user's context changes.
   }
   ```
 
-  **Note:** The `openFiles` list should only include files that exist on disk.
-  Virtual files (e.g., unsaved files without a path, editor settings pages)
-  **MUST** be excluded.
+<!-- prettier-ignore -->
+> [!NOTE]
+> The `openFiles` list should only include files that exist on disk.
+> Virtual files (for example, unsaved files without a path, editor settings pages)
+> **MUST** be excluded.
 
 ### How the CLI uses this context
 
@@ -185,8 +194,9 @@ The plugin **MUST** register an `openDiff` tool on its MCP server.
 - **Response (`CallToolResult`):** The tool **MUST** immediately return a
   `CallToolResult` to acknowledge the request and report whether the diff view
   was successfully opened.
+
   - On Success: If the diff view was opened successfully, the response **MUST**
-    contain empty content (i.e., `content: []`).
+    contain empty content (that is, `content: []`).
   - On Failure: If an error prevented the diff view from opening, the response
     **MUST** have `isError: true` and include a `TextContent` block in the
     `content` array describing the error.
@@ -221,9 +231,9 @@ The plugin **MUST** register a `closeDiff` tool on its MCP server.
 
 ### `ide/diffAccepted` notification
 
-When the user accepts the changes in a diff view (e.g., by clicking an "Apply"
-or "Save" button), the plugin **MUST** send an `ide/diffAccepted` notification
-to the CLI.
+When the user accepts the changes in a diff view (for example, by clicking an
+"Apply" or "Save" button), the plugin **MUST** send an `ide/diffAccepted`
+notification to the CLI.
 
 - **Payload:** The notification parameters **MUST** include the file path and
   the final content of the file. The content may differ from the original
@@ -240,7 +250,7 @@ to the CLI.
 
 ### `ide/diffRejected` notification
 
-When the user rejects the changes (e.g., by closing the diff view without
+When the user rejects the changes (for example, by closing the diff view without
 accepting), the plugin **MUST** send an `ide/diffRejected` notification to the
 CLI.
 

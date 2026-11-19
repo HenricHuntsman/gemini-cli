@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Config } from '../config/config.js';
 import { MessageBus } from '../confirmation-bus/message-bus.js';
 import type { PolicyEngine } from '../policy/policy-engine.js';
@@ -30,17 +30,20 @@ describe('Tracker Tools Integration', () => {
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tracker-tools-test-'));
+    vi.stubEnv('GEMINI_CLI_HOME', tempDir);
     config = new Config({
-      sessionId: 'test-session',
+      sessionId: `test-session-${Math.random().toString(36).substring(7)}`,
       targetDir: tempDir,
       cwd: tempDir,
       model: 'gemini-3-flash',
       debugMode: false,
     });
+    await config.initialize();
     messageBus = new MessageBus(null as unknown as PolicyEngine, false);
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -120,8 +123,14 @@ describe('Tracker Tools Integration', () => {
     );
 
     const tasks = await config.getTrackerService().listTasks();
-    const parentId = tasks.find((t) => t.title === 'Parent Task')!.id;
-    const childId = tasks.find((t) => t.title === 'Child Task')!.id;
+    const parentTask = tasks.find((t) => t.title === 'Parent Task');
+    const childTask = tasks.find((t) => t.title === 'Child Task');
+
+    expect(parentTask).toBeDefined();
+    expect(childTask).toBeDefined();
+
+    const parentId = parentTask!.id;
+    const childId = childTask!.id;
 
     // Add Dependency
     const addDepTool = new TrackerAddDependencyTool(config, messageBus);
@@ -186,17 +195,60 @@ describe('Tracker Tools Integration', () => {
 
       expect(display.todos).toEqual([
         {
-          description: `[p1] [TASK] Parent`,
+          description: `task: Parent (p1)`,
           status: 'in_progress',
         },
         {
-          description: `  [c1] [EPIC] Child`,
+          description: `  epic: Child (c1)`,
           status: 'pending',
         },
         {
-          description: `    [leaf] [BUG] Closed Leaf`,
+          description: `    bug: Closed Leaf (leaf)`,
           status: 'completed',
         },
+      ]);
+    });
+
+    it('sorts tasks by status', async () => {
+      const t1 = {
+        id: 't1',
+        title: 'T1',
+        type: TaskType.TASK,
+        status: TaskStatus.CLOSED,
+        dependencies: [],
+      };
+      const t2 = {
+        id: 't2',
+        title: 'T2',
+        type: TaskType.TASK,
+        status: TaskStatus.OPEN,
+        dependencies: [],
+      };
+      const t3 = {
+        id: 't3',
+        title: 'T3',
+        type: TaskType.TASK,
+        status: TaskStatus.IN_PROGRESS,
+        dependencies: [],
+      };
+      const t4 = {
+        id: 't4',
+        title: 'T4',
+        type: TaskType.TASK,
+        status: TaskStatus.BLOCKED,
+        dependencies: [],
+      };
+
+      const mockService = {
+        listTasks: async () => [t1, t2, t3, t4],
+      } as unknown as TrackerService;
+      const display = await buildTodosReturnDisplay(mockService);
+
+      expect(display.todos).toEqual([
+        { description: `task: T3 (t3)`, status: 'in_progress' },
+        { description: `task: T2 (t2)`, status: 'pending' },
+        { description: `task: T4 (t4)`, status: 'blocked' },
+        { description: `task: T1 (t1)`, status: 'completed' },
       ]);
     });
 
@@ -220,7 +272,7 @@ describe('Tracker Tools Integration', () => {
 
       expect(display.todos).toEqual([
         {
-          description: `[p1] [TASK] Parent`,
+          description: `task: Parent (p1)`,
           status: 'pending',
         },
         {

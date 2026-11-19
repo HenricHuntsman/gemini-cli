@@ -8,6 +8,7 @@ import stripAnsi from 'strip-ansi';
 import ansiRegex from 'ansi-regex';
 import { stripVTControlCharacters } from 'node:util';
 import stringWidth from 'string-width';
+import { setStringWidthFunction } from 'ink';
 import { LRUCache } from 'mnemonist';
 import { LRU_BUFFER_PERF_CACHE_LIMIT } from '../constants.js';
 
@@ -98,8 +99,16 @@ export function cpSlice(str: string, start: number, end?: number): string {
 /**
  * Strip characters that can break terminal rendering.
  *
- * Uses Node.js built-in stripVTControlCharacters to handle VT sequences,
- * then filters remaining control characters that can disrupt display.
+ * This is a strict sanitization function intended for general display
+ * contexts. It strips all C1 control characters (0x80-0x9F) and VT
+ * control sequences. For list display contexts where a more lenient
+ * approach is needed (preserving C1 characters and only stripping ANSI
+ * codes and newlines/tabs), use a separate function instead.
+ *
+ * Processing order:
+ * 1. stripAnsi removes ANSI escape sequences (including 8-bit CSI 0x9B)
+ * 2. Regex strips C0, C1, BiDi, and zero-width control characters
+ * 3. stripVTControlCharacters removes any remaining VT sequences
  *
  * Characters stripped:
  * - ANSI escape sequences (via strip-ansi)
@@ -119,18 +128,20 @@ export function cpSlice(str: string, start: number, end?: number): string {
  */
 export function stripUnsafeCharacters(str: string): string {
   const strippedAnsi = stripAnsi(str);
-  const strippedVT = stripVTControlCharacters(strippedAnsi);
 
-  // Use a regex to strip remaining unsafe control characters
-  // C0: 0x00-0x1F except 0x09 (TAB), 0x0A (LF), 0x0D (CR)
-  // C1: 0x80-0x9F
-  // BiDi: U+200E (LRM), U+200F (RLM), U+202A-U+202E, U+2066-U+2069
-  // Zero-width: U+200B (ZWSP), U+FEFF (BOM)
-  return strippedVT.replace(
+  // Strip C0, C1, and other unsafe characters via regex first.
+  // This is more efficient than multiple replaces and crucially removes C1
+  // characters (e.g., 0x90 DCS) before they can be misinterpreted by
+  // stripVTControlCharacters, which could otherwise cause data loss.
+  const strippedWithRegex = strippedAnsi.replace(
     // eslint-disable-next-line no-control-regex
     /[\x00-\x08\x0B\x0C\x0E-\x1F\x80-\x9F\u200E\u200F\u202A-\u202E\u2066-\u2069\u200B\uFEFF]/g,
     '',
   );
+
+  // Finally, use stripVTControlCharacters for any remaining VT sequences
+  // that the regex might not cover.
+  return stripVTControlCharacters(strippedWithRegex);
 }
 
 /**
@@ -145,23 +156,59 @@ export function sanitizeForDisplay(str: string, maxLength?: number): string {
 
   let sanitized = stripUnsafeCharacters(str).replace(/\s+/g, ' ');
 
-  if (maxLength && sanitized.length > maxLength) {
-    sanitized = sanitized.substring(0, maxLength - 3) + '...';
+  // Measure and truncate by code points so surrogate pairs (e.g. emoji) are
+  // never split. The end index is clamped because, unlike substring(),
+  // cpSlice() treats a negative end as an offset from the end of the string.
+  if (maxLength && cpLen(sanitized) > maxLength) {
+    sanitized = cpSlice(sanitized, 0, Math.max(0, maxLength - 3)) + '...';
   }
 
   return sanitized;
 }
 
-/**
- * Normalizes escaped newline characters (e.g., "\\n") into actual newline characters.
- */
-export function normalizeEscapedNewlines(value: string): string {
-  return value.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
-}
+export { normalizeEscapedNewlines } from '@google/gemini-cli-core';
 
 const stringWidthCache = new LRUCache<string, number>(
   LRU_BUFFER_PERF_CACHE_LIMIT,
 );
+
+// Thai SARA AM (U+0E33) and Lao SARA AM (U+0EB3) have General_Category=Lo
+// (spacing letters that occupy 1 terminal column via wcwidth), but their
+// Grapheme_Cluster_Break=SpacingMark property causes Intl.Segmenter in
+// string-width to merge them with a preceding base character and ignore their
+// width. Replacing them with a 1-column ASCII space ensures each SARA AM is
+// measured as its own column.
+const SARA_AM_REGEX = /[\u0E33\u0EB3]/g;
+
+let ambiguousCharactersWide = false;
+
+/**
+ * Configures how East Asian Ambiguous-width characters (box-drawing borders,
+ * `…`, `●`, arrows, ...) are measured.
+ *
+ * Most terminals render them in a single cell, but terminals such as
+ * Terminal.app with "Unicode East Asian Ambiguous characters are wide" (and
+ * other CJK-oriented configurations) render them in two. Measuring them as one
+ * cell there makes every bordered row wider than the terminal; the rows wrap
+ * and the incremental renderer leaves a copy of the previous frame behind on
+ * every render (see https://github.com/google-gemini/gemini-cli/issues/24181).
+ *
+ * Ink measures through `getCachedStringWidth` as well, so this re-registers it
+ * to drop Ink's own per-character width cache along with ours.
+ */
+export function setAmbiguousCharactersWide(wide: boolean): void {
+  if (wide === ambiguousCharactersWide) {
+    return;
+  }
+  ambiguousCharactersWide = wide;
+  stringWidthCache.clear();
+  setStringWidthFunction(getCachedStringWidth);
+}
+
+/** Whether ambiguous-width characters are currently measured as two cells. */
+export function areAmbiguousCharactersWide(): boolean {
+  return ambiguousCharactersWide;
+}
 
 /**
  * Cached version of stringWidth function for better performance
@@ -183,7 +230,9 @@ export const getCachedStringWidth = (str: string): number => {
 
   let width: number;
   try {
-    width = stringWidth(str);
+    width = stringWidth(str.replace(SARA_AM_REGEX, ' '), {
+      ambiguousIsNarrow: !ambiguousCharactersWide,
+    });
   } catch {
     // Fallback for characters that cause string-width to crash (e.g. U+0602)
     // See: https://github.com/google-gemini/gemini-cli/issues/16418

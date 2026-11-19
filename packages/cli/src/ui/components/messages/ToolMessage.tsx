@@ -24,6 +24,7 @@ import {
 import { type Config, CoreToolCallStatus, Kind } from '@google/gemini-cli-core';
 import { ShellInputPrompt } from '../ShellInputPrompt.js';
 import { SUBAGENT_MAX_LINES } from '../../constants.js';
+import { useToolActions } from '../../contexts/ToolActionsContext.js';
 
 export type { TextEmphasis };
 
@@ -42,6 +43,7 @@ export interface ToolMessageProps extends IndividualToolCallDisplay {
 }
 
 export const ToolMessage: React.FC<ToolMessageProps> = ({
+  callId,
   name,
   description,
   resultDisplay,
@@ -63,6 +65,12 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
   progress,
   progressTotal,
 }) => {
+  const { isExpanded: isExpandedInContext } = useToolActions();
+
+  const isExpanded =
+    (isExpandedInContext ? isExpandedInContext(callId) : false) ||
+    availableTerminalHeight === undefined;
+
   const isThisShellFocused = checkIsShellFocused(
     name,
     status,
@@ -79,13 +87,15 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
     resultDisplay,
   );
 
+  const safeTerminalWidth = Math.max(0, Math.floor(terminalWidth || 0));
+
   return (
     // It is crucial we don't replace this <> with a Box because otherwise the
     // sticky header inside it would be sticky to that box rather than to the
     // parent component of this ToolMessage.
     <>
       <StickyHeader
-        width={terminalWidth}
+        width={safeTerminalWidth}
         isFirst={isFirst}
         borderColor={borderColor}
         borderDimColor={borderDimColor}
@@ -102,6 +112,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
           emphasis={emphasis}
           progressMessage={progressMessage}
           originalRequestName={originalRequestName}
+          isExpanded={isExpanded}
         />
         <FocusHint
           shouldShowFocusHint={shouldShowFocusHint}
@@ -110,7 +121,8 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
         {emphasis === 'high' && <TrailingIndicator />}
       </StickyHeader>
       <Box
-        width={terminalWidth}
+        width={safeTerminalWidth}
+        minWidth={0}
         borderStyle="round"
         borderColor={borderColor}
         borderDimColor={borderDimColor}
@@ -132,7 +144,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
         <ToolResultDisplay
           resultDisplay={resultDisplay}
           availableTerminalHeight={availableTerminalHeight}
-          terminalWidth={terminalWidth}
+          terminalWidth={safeTerminalWidth}
           renderOutputAsMarkdown={renderOutputAsMarkdown}
           hasFocus={isThisShellFocused}
           maxLines={

@@ -23,7 +23,7 @@ import { randomUUID } from 'node:crypto';
 import { type Server as HTTPServer } from 'node:http';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
-import { tmpdir } from '@google/gemini-cli-core';
+import { getIdeConnectionDir } from '@google/gemini-cli-core/src/utils/paths.js';
 import type { z } from 'zod';
 import type { DiffManager } from './diff-manager.js';
 import { OpenFilesManager } from './open-files-manager.js';
@@ -39,6 +39,75 @@ const MCP_SESSION_ID_HEADER = 'mcp-session-id';
 const IDE_SERVER_PORT_ENV_VAR = 'GEMINI_CLI_IDE_SERVER_PORT';
 const IDE_WORKSPACE_PATH_ENV_VAR = 'GEMINI_CLI_IDE_WORKSPACE_PATH';
 const IDE_AUTH_TOKEN_ENV_VAR = 'GEMINI_CLI_IDE_AUTH_TOKEN';
+
+let tempFileCounter = 0;
+
+/**
+ * Creates (if absent) and validates the IDE discovery directory:
+ * 1. Verifies it is a regular directory (not a symbolic link).
+ * 2. On POSIX, verifies it is owned by the current process UID.
+ * 3. On POSIX, enforces 0o700 permissions.
+ */
+async function ensurePortDir(portDir: string): Promise<void> {
+  await fs.mkdir(portDir, { recursive: true, mode: 0o700 });
+  const stat = await fs.lstat(portDir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`IDE port path is not a regular directory: ${portDir}`);
+  }
+  if (process.getuid && stat.uid !== process.getuid()) {
+    throw new Error(
+      `IDE port directory is owned by UID ${stat.uid}, expected ${process.getuid()}: ${portDir}`,
+    );
+  }
+  if (process.platform !== 'win32' && (stat.mode & 0o777) !== 0o700) {
+    await fs.chmod(portDir, 0o700);
+    const updatedStat = await fs.lstat(portDir);
+    if (
+      updatedStat.isSymbolicLink() ||
+      !updatedStat.isDirectory() ||
+      (process.getuid && updatedStat.uid !== process.getuid()) ||
+      (updatedStat.mode & 0o777) !== 0o700
+    ) {
+      throw new Error(
+        `Failed to enforce 0700 permissions on IDE port directory: ${portDir}`,
+      );
+    }
+  }
+}
+
+/**
+ * Writes the discovery file atomically by writing to an exclusive 0o600
+ * temporary file in the validated discovery directory and renaming it into
+ * place.
+ */
+async function writePortFileAtomically(
+  portFile: string,
+  content: string,
+): Promise<void> {
+  const portDir = path.dirname(portFile);
+  await ensurePortDir(portDir);
+
+  const uniqueSuffix = `${process.pid}-${Date.now()}-${++tempFileCounter}-${Math.random().toString(16).slice(2)}`;
+  const tempFile = `${portFile}.${uniqueSuffix}.tmp`;
+
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(tempFile, 'wx', 0o600);
+    if (process.platform !== 'win32') {
+      await handle.chmod(0o600);
+    }
+    await handle.writeFile(content, { encoding: 'utf8' });
+    await handle.close();
+    handle = undefined;
+    await fs.rename(tempFile, portFile);
+  } catch (err) {
+    if (handle) {
+      await handle.close().catch(() => {});
+    }
+    await fs.unlink(tempFile).catch(() => {});
+    throw err;
+  }
+}
 
 interface WritePortAndWorkspaceArgs {
   context: vscode.ExtensionContext;
@@ -88,7 +157,7 @@ async function writePortAndWorkspace({
   log(`Writing port file to: ${portFile}`);
 
   try {
-    await fs.writeFile(portFile, content).then(() => fs.chmod(portFile, 0o600));
+    await writePortFileAtomically(portFile, content);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Failed to write port to file: ${message}`);
@@ -128,6 +197,12 @@ export class IDEServer {
   private transports: { [sessionId: string]: StreamableHTTPServerTransport } =
     {};
   private openFilesManager: OpenFilesManager | undefined;
+  private subscriptions: vscode.Disposable[] = [];
+  private status: 'idle' | 'stopping' | 'stopped' = 'idle';
+  private stopPromise: Promise<void> | undefined;
+  /** Bumped by every start(); lets a late-finishing shutdown recognise that a
+   *  newer server now owns the status, env vars and port file. */
+  private generation = 0;
   diffManager: DiffManager;
 
   constructor(log: (message: string) => void, diffManager: DiffManager) {
@@ -137,6 +212,10 @@ export class IDEServer {
 
   start(context: vscode.ExtensionContext): Promise<void> {
     return new Promise((resolve) => {
+      // A restart after stop() must be stoppable again, and any shutdown still
+      // in flight must not touch this server's state when it finishes.
+      this.status = 'idle';
+      this.generation++;
       this.context = context;
       this.authToken = randomUUID();
       const sessionsWithInitialNotification = new Set<string>();
@@ -193,13 +272,11 @@ export class IDEServer {
         next();
       });
 
-      const mcpServer = createMcpServer(this.diffManager, this.log);
-
+      this.disposeResources();
       this.openFilesManager = new OpenFilesManager(context);
       const onDidChangeSubscription = this.openFilesManager.onDidChange(() => {
         this.broadcastIdeContextUpdate();
       });
-      context.subscriptions.push(onDidChangeSubscription);
       const onDidChangeDiffSubscription = this.diffManager.onDidChange(
         (notification) => {
           for (const transport of Object.values(this.transports)) {
@@ -208,7 +285,11 @@ export class IDEServer {
           }
         },
       );
-      context.subscriptions.push(onDidChangeDiffSubscription);
+      this.subscriptions.push(
+        ...(this.openFilesManager ? [this.openFilesManager] : []),
+        onDidChangeSubscription,
+        onDidChangeDiffSubscription,
+      );
 
       app.post('/mcp', async (req: Request, res: Response) => {
         const sessionId = getSessionId(req);
@@ -242,6 +323,14 @@ export class IDEServer {
                     `Session ${sessionId} missed ${missedPings} pings. Closing connection and cleaning up interval.`,
                   );
                   clearInterval(keepAlive);
+                  // `onclose` evicts the session from `this.transports`.
+                  transport.close().catch((error: unknown) => {
+                    const message =
+                      error instanceof Error ? error.message : String(error);
+                    this.log(
+                      `Failed to close transport for session ${sessionId}: ${message}`,
+                    );
+                  });
                 }
               });
           }, 60000); // 60 sec
@@ -255,8 +344,8 @@ export class IDEServer {
             }
           };
 
-          // eslint-disable-next-line @typescript-eslint/no-floating-promises
-          mcpServer.connect(transport);
+          const mcpServer = createMcpServer(this.diffManager, this.log);
+          await mcpServer.connect(transport);
         } else {
           this.log(
             'Bad Request: No valid session ID provided for non-initialize request.',
@@ -301,6 +390,31 @@ export class IDEServer {
         }
 
         const transport = this.transports[sessionId];
+        const maybeSendInitialNotification = () => {
+          if (
+            res.statusCode === 200 &&
+            this.openFilesManager &&
+            !sessionsWithInitialNotification.has(sessionId)
+          ) {
+            sessionsWithInitialNotification.add(sessionId);
+            const openFilesManager = this.openFilesManager;
+            setImmediate(() => {
+              if (this.transports[sessionId] === transport) {
+                sendIdeContextUpdateNotification(
+                  transport,
+                  this.log.bind(this),
+                  openFilesManager,
+                );
+              }
+            });
+          }
+        };
+        const originalFlushHeaders = res.flushHeaders.bind(res);
+        res.flushHeaders = () => {
+          originalFlushHeaders();
+          maybeSendInitialNotification();
+        };
+
         try {
           await transport.handleRequest(req, res);
         } catch (error) {
@@ -312,16 +426,8 @@ export class IDEServer {
           }
         }
 
-        if (
-          this.openFilesManager &&
-          !sessionsWithInitialNotification.has(sessionId)
-        ) {
-          sendIdeContextUpdateNotification(
-            transport,
-            this.log.bind(this),
-            this.openFilesManager,
-          );
-          sessionsWithInitialNotification.add(sessionId);
+        if (!res.writableEnded) {
+          maybeSendInitialNotification();
         }
       };
 
@@ -344,8 +450,8 @@ export class IDEServer {
           this.log(`IDE server listening on http://127.0.0.1:${this.port}`);
           let portFile: string | undefined;
           try {
-            const portDir = path.join(tmpdir(), 'gemini', 'ide');
-            await fs.mkdir(portDir, { recursive: true });
+            const portDir = getIdeConnectionDir();
+            await ensurePortDir(portDir);
             portFile = path.join(
               portDir,
               `gemini-ide-server-${process.ppid}-${this.port}.json`,
@@ -404,28 +510,80 @@ export class IDEServer {
   }
 
   async stop(): Promise<void> {
-    if (this.server) {
-      await new Promise<void>((resolve, reject) => {
-        this.server!.close((err?: Error) => {
-          if (err) {
-            this.log(`Error shutting down IDE server: ${err.message}`);
-            return reject(err);
+    switch (this.status) {
+      case 'stopping':
+        // Join the in-flight shutdown so a concurrent caller resolves only
+        // once the listener, sockets and port file are actually gone.
+        return this.stopPromise;
+      case 'stopped':
+        return;
+      default: {
+        this.status = 'stopping';
+        const generation = this.generation;
+        this.stopPromise = this.shutdown(generation).finally(() => {
+          // A start() issued meanwhile owns the state now; leave it alone.
+          if (this.generation === generation) {
+            this.status = 'stopped';
           }
-          this.log(`IDE server shut down`);
-          resolve();
         });
-      });
-      this.server = undefined;
+        return this.stopPromise;
+      }
     }
+  }
 
-    if (this.context) {
-      this.context.environmentVariableCollection.clear();
+  private disposeResources(): void {
+    this.openFilesManager = undefined;
+    const subscriptions = this.subscriptions;
+    this.subscriptions = [];
+    for (const subscription of subscriptions) {
+      subscription.dispose();
     }
-    if (this.portFile) {
-      try {
-        await fs.unlink(this.portFile);
-      } catch (_err) {
-        // Ignore errors if the file doesn't exist.
+  }
+
+  private async shutdown(generation: number): Promise<void> {
+    // Detach synchronously so a stop() issued after this one completes is a
+    // no-op rather than closing the same listener twice, and so a start()
+    // issued meanwhile cannot have its port file removed by this shutdown.
+    const server = this.server;
+    this.server = undefined;
+    const transports = Object.values(this.transports);
+    this.transports = {};
+    const portFile = this.portFile;
+    this.portFile = undefined;
+    this.disposeResources();
+
+    // Close every MCP session first. This ends their long-lived SSE
+    // responses and fires `onclose`, which clears the keep-alive interval.
+    await Promise.allSettled(transports.map((transport) => transport.close()));
+
+    try {
+      if (server) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((err?: Error) => {
+            if (err) {
+              this.log(`Error shutting down IDE server: ${err.message}`);
+              return reject(err);
+            }
+            this.log(`IDE server shut down`);
+            resolve();
+          });
+          // `close()` only stops accepting new connections and waits for
+          // existing ones to drain. Drop any remaining sockets so the callback
+          // above fires promptly instead of hanging on an idle keep-alive.
+          server.closeAllConnections();
+        });
+      }
+    } finally {
+      // Only clear the env vars if no newer start() has written its own.
+      if (this.generation === generation && this.context) {
+        this.context.environmentVariableCollection.clear();
+      }
+      if (portFile) {
+        try {
+          await fs.unlink(portFile);
+        } catch {
+          // Ignore errors if the file doesn't exist.
+        }
       }
     }
   }

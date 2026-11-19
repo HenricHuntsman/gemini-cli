@@ -16,6 +16,9 @@ vi.mock('@google/gemini-cli-core', () => ({
   shutdownTelemetry: vi.fn(),
   isTelemetrySdkInitialized: vi.fn().mockReturnValue(false),
   ExitCodes: { SUCCESS: 0 },
+  ShellExecutionService: {
+    cleanupAllActiveProcesses: vi.fn().mockResolvedValue(undefined),
+  },
 }));
 
 vi.mock('node:fs', () => ({
@@ -34,6 +37,7 @@ import {
   setupSignalHandlers,
   setupTtyCheck,
 } from './cleanup.js';
+import { ShellExecutionService } from '@google/gemini-cli-core';
 
 describe('cleanup', () => {
   beforeEach(async () => {
@@ -72,6 +76,46 @@ describe('cleanup', () => {
     expect(asyncFn).toHaveBeenCalledTimes(1);
   });
 
+  it('should run cleanupFunctions BEFORE draining stdin and BEFORE runSyncCleanup', async () => {
+    const callOrder: string[] = [];
+
+    // Cleanup function
+    registerCleanup(() => {
+      callOrder.push('cleanup');
+    });
+
+    // Sync cleanup function (e.g. setRawMode(false))
+    registerSyncCleanup(() => {
+      callOrder.push('sync');
+    });
+
+    // Mock stdin.resume to track drainStdin
+    const originalResume = process.stdin.resume;
+    process.stdin.resume = vi.fn().mockImplementation(() => {
+      callOrder.push('drain');
+      return process.stdin;
+    });
+
+    // Mock stdin properties for drainStdin
+    const originalIsTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
+
+    try {
+      await runExitCleanup();
+    } finally {
+      process.stdin.resume = originalResume;
+      Object.defineProperty(process.stdin, 'isTTY', {
+        value: originalIsTTY,
+        configurable: true,
+      });
+    }
+
+    expect(callOrder).toEqual(['drain', 'drain', 'sync', 'cleanup']);
+  });
+
   it('should continue running cleanup functions even if one throws an error', async () => {
     const errorFn = vi.fn().mockImplementation(() => {
       throw new Error('test error');
@@ -84,6 +128,36 @@ describe('cleanup', () => {
 
     expect(errorFn).toHaveBeenCalledTimes(1);
     expect(successFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('should be idempotent and not re-run cleanup functions if already completed', async () => {
+    const cleanupFn = vi.fn();
+    registerCleanup(cleanupFn);
+
+    await runExitCleanup();
+    expect(cleanupFn).toHaveBeenCalledTimes(1);
+
+    await runExitCleanup();
+    expect(cleanupFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('should deduplicate concurrent calls to runExitCleanup', async () => {
+    let callCount = 0;
+    registerCleanup(async () => {
+      callCount++;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    await Promise.all([runExitCleanup(), runExitCleanup()]);
+    expect(callCount).toBe(1);
+  });
+
+  it('should terminate active shell processes during runExitCleanup', async () => {
+    await runExitCleanup();
+
+    expect(
+      ShellExecutionService.cleanupAllActiveProcesses,
+    ).toHaveBeenCalledTimes(1);
   });
 
   describe('sync cleanup', () => {
@@ -167,7 +241,7 @@ describe('signal and TTY handling', () => {
       expect(processOnHandlers.has('SIGINT')).toBe(true);
     });
 
-    it('should gracefully shutdown when SIGHUP is received', async () => {
+    it('should gracefully shutdown with exit code 129 when SIGHUP is received', async () => {
       setupSignalHandlers();
 
       const sighupHandlers = processOnHandlers.get('SIGHUP') || [];
@@ -175,7 +249,7 @@ describe('signal and TTY handling', () => {
 
       await sighupHandlers[0]?.();
 
-      expect(process.exit).toHaveBeenCalledWith(0);
+      expect(process.exit).toHaveBeenCalledWith(129);
     });
 
     it('should register SIGTERM handler that can trigger shutdown', () => {
@@ -183,6 +257,7 @@ describe('signal and TTY handling', () => {
 
       const sigtermHandlers = processOnHandlers.get('SIGTERM') || [];
       expect(sigtermHandlers.length).toBeGreaterThan(0);
+      // eslint-disable-next-line no-restricted-syntax
       expect(typeof sigtermHandlers[0]).toBe('function');
     });
   });

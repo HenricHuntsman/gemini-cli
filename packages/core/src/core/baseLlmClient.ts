@@ -28,6 +28,7 @@ import {
   NetworkRetryAttemptEvent,
 } from '../telemetry/types.js';
 import { retryWithBackoff, getRetryErrorType } from '../utils/retry.js';
+import { getErrorStatus } from '../utils/httpErrors.js';
 import { coreEvents } from '../utils/events.js';
 import { getDisplayString } from '../config/models.js';
 import type { ModelConfigKey } from '../services/modelConfigService.js';
@@ -111,6 +112,12 @@ interface _CommonGenerateOptions {
   };
 }
 
+export interface CountTokenOptions {
+  modelConfigKey?: ModelConfigKey;
+  contents: Content[];
+  abortSignal?: AbortSignal;
+}
+
 /**
  * A client dedicated to stateless, utility-focused LLM calls.
  */
@@ -147,7 +154,7 @@ export class BaseLlmClient {
         // We don't use the result, just check if it's valid JSON
         JSON.parse(this.cleanJsonResponse(text, model));
         return false; // It's valid, don't retry
-      } catch (_e) {
+      } catch {
         return true; // It's not valid, retry
       }
     };
@@ -171,10 +178,15 @@ export class BaseLlmClient {
     );
 
     // If we are here, the content is valid (not empty and parsable).
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    return JSON.parse(
+    const parsed: unknown = JSON.parse(
       this.cleanJsonResponse(getResponseText(result)!.trim(), model),
     );
+    const isRecord = (val: unknown): val is Record<string, unknown> =>
+      typeof val === 'object' && val !== null && !Array.isArray(val);
+    if (isRecord(parsed)) {
+      return parsed;
+    }
+    throw new Error('Invalid JSON response format from LLM');
   }
 
   async generateEmbedding(texts: string[]): Promise<number[][]> {
@@ -225,6 +237,23 @@ export class BaseLlmClient {
     return text;
   }
 
+  async countTokens(
+    options: CountTokenOptions,
+  ): Promise<{ totalTokens: number }> {
+    const model = options.modelConfigKey
+      ? this.config.modelConfigService.getResolvedConfig(options.modelConfigKey)
+          .model
+      : this.config.getActiveModel();
+    const result = await this.contentGenerator.countTokens({
+      model,
+      contents: options.contents,
+      config: options.abortSignal
+        ? { abortSignal: options.abortSignal }
+        : undefined,
+    });
+    return { totalTokens: result.totalTokens || 0 };
+  }
+
   async generateContent(
     options: GenerateContentOptions,
   ): Promise<GenerateContentResponse> {
@@ -273,6 +302,8 @@ export class BaseLlmClient {
       maxAttempts,
       additionalProperties,
     } = options;
+    const requestRole = role;
+    const requestPromptId = promptId;
 
     const {
       model,
@@ -282,6 +313,7 @@ export class BaseLlmClient {
 
     let currentModel = model;
     let currentGenerateContentConfig = generateContentConfig;
+    let currentAvailabilityMaxAttempts = availabilityMaxAttempts;
 
     // Define callback to fetch context dynamically since active model may get updated during retry loop
     const getAvailabilityContext = createAvailabilityContextProvider(
@@ -290,9 +322,12 @@ export class BaseLlmClient {
     );
 
     let initialActiveModel = this.config.getActiveModel();
+    let isFirstAttempt = true;
 
     try {
       const apiCall = () => {
+        const firstAttempt = isFirstAttempt;
+        isFirstAttempt = false;
         // Ensure we use the current active model
         // in case a fallback occurred in a previous attempt.
         const activeModel = this.config.getActiveModel();
@@ -306,6 +341,23 @@ export class BaseLlmClient {
             });
           currentModel = resolvedModel;
           currentGenerateContentConfig = generateContentConfig;
+          currentAvailabilityMaxAttempts = undefined;
+        } else if (
+          !firstAttempt &&
+          (this.config.getModelAvailabilityService?.()?.snapshot(currentModel)
+            ?.available ?? true) === false
+        ) {
+          const {
+            model: reselectedModel,
+            config: reselectedConfig,
+            maxAttempts: reselectedMaxAttempts,
+          } = applyModelSelection(this.config, modelConfigKey);
+          currentModel = reselectedModel;
+          if (reselectedConfig) {
+            currentGenerateContentConfig = reselectedConfig;
+          }
+          currentAvailabilityMaxAttempts = reselectedMaxAttempts;
+          initialActiveModel = this.config.getActiveModel();
         }
         const finalConfig: GenerateContentConfig = {
           ...currentGenerateContentConfig,
@@ -320,8 +372,8 @@ export class BaseLlmClient {
         };
         return this.contentGenerator.generateContent(
           requestParams,
-          promptId,
-          role,
+          requestPromptId,
+          requestRole,
         );
       };
 
@@ -337,9 +389,13 @@ export class BaseLlmClient {
         authType:
           this.authType ?? this.config.getContentGeneratorConfig()?.authType,
         retryFetchErrors: this.config.getRetryFetchErrors(),
+        signal: abortSignal,
         onRetry: (attempt, error, delayMs) => {
           const actualMaxAttempts =
-            availabilityMaxAttempts ?? maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+            getAvailabilityContext()?.policy.maxAttempts ??
+            currentAvailabilityMaxAttempts ??
+            maxAttempts ??
+            DEFAULT_MAX_ATTEMPTS;
           const modelName = getDisplayString(currentModel);
           const errorType = getRetryErrorType(error);
 
@@ -349,6 +405,10 @@ export class BaseLlmClient {
             delayMs,
             error: errorType,
             model: modelName,
+            status: getErrorStatus(error),
+            sessionId: this.config.getSessionId?.(),
+            role: requestRole,
+            promptId: requestPromptId,
           });
 
           logNetworkRetryAttempt(

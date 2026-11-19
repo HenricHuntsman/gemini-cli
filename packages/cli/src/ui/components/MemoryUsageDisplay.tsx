@@ -11,24 +11,37 @@ import { theme } from '../semantic-colors.js';
 import process from 'node:process';
 import { formatBytes } from '../utils/formatters.js';
 
-export const MemoryUsageDisplay: React.FC<{ color?: string }> = ({
-  color = theme.text.primary,
-}) => {
-  const [memoryUsage, setMemoryUsage] = useState<string>('');
-  const [memoryUsageColor, setMemoryUsageColor] = useState<string>(color);
+export const MemoryUsageDisplay: React.FC<{
+  color?: string;
+  isActive?: boolean;
+}> = ({ color = theme.text.primary, isActive = true }) => {
+  const [memoryUsage, setMemoryUsage] = useState<string>(() =>
+    formatBytes(process.memoryUsage().rss),
+  );
+  const [memoryUsageColor, setMemoryUsageColor] = useState<string>(() =>
+    process.memoryUsage().rss >= 2 * 1024 * 1024 * 1024
+      ? theme.status.error
+      : color,
+  );
 
   useEffect(() => {
+    if (!isActive) {
+      return;
+    }
+
     const updateMemory = () => {
       const usage = process.memoryUsage().rss;
-      setMemoryUsage(formatBytes(usage));
-      setMemoryUsageColor(
-        usage >= 2 * 1024 * 1024 * 1024 ? theme.status.error : color,
-      );
+      const formatted = formatBytes(usage);
+      const nextColor =
+        usage >= 2 * 1024 * 1024 * 1024 ? theme.status.error : color;
+      setMemoryUsage((prev) => (prev === formatted ? prev : formatted));
+      setMemoryUsageColor((prev) => (prev === nextColor ? prev : nextColor));
     };
+
     const intervalId = setInterval(updateMemory, 2000);
     updateMemory(); // Initial update
     return () => clearInterval(intervalId);
-  }, [color]);
+  }, [color, isActive]);
 
   return (
     <Box>

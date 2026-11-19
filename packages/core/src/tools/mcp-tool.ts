@@ -16,11 +16,14 @@ import {
   type ToolMcpConfirmationDetails,
   type ToolResult,
   type PolicyUpdateOptions,
+  type ExecuteOptions,
 } from './tools.js';
 import type { CallableTool, FunctionCall, Part } from '@google/genai';
 import { ToolErrorType } from './tool-error.js';
 import type { MessageBus } from '../confirmation-bus/message-bus.js';
 import type { McpContext } from './mcp-client.js';
+
+import { wrapUntrusted } from '../utils/textUtils.js';
 
 /**
  * The separator used to qualify MCP tool names with their server prefix.
@@ -80,11 +83,11 @@ export function formatMcpToolName(
   serverName: string,
   toolName?: string,
 ): string {
-  if (serverName === '*' && !toolName) {
+  if (serverName === '*' && (toolName === undefined || toolName === '*')) {
     return `${MCP_TOOL_PREFIX}*`;
   } else if (serverName === '*') {
     return `${MCP_TOOL_PREFIX}*_${toolName}`;
-  } else if (!toolName) {
+  } else if (toolName === undefined || toolName === '*') {
     return `${MCP_TOOL_PREFIX}${serverName}_*`;
   } else {
     return `${MCP_TOOL_PREFIX}${serverName}_${toolName}`;
@@ -105,12 +108,13 @@ export interface McpToolAnnotation extends Record<string, unknown> {
 export function isMcpToolAnnotation(
   annotation: unknown,
 ): annotation is McpToolAnnotation {
-  return (
-    typeof annotation === 'object' &&
-    annotation !== null &&
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion, no-restricted-syntax
-    typeof (annotation as Record<string, unknown>)['_serverName'] === 'string'
-  );
+  if (typeof annotation !== 'object' || annotation === null) {
+    return false;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+  const record = annotation as Record<string, unknown>;
+  const serverName = record['_serverName'];
+  return typeof serverName === 'string';
 }
 
 type ToolParams = Record<string, unknown>;
@@ -148,6 +152,151 @@ type McpContentBlock =
   | McpMediaBlock
   | McpResourceBlock
   | McpResourceLinkBlock;
+
+const CONVERSATIONAL_PARAM_KEYS = new Set([
+  'description',
+  'explanation',
+  'reason',
+  'thought',
+]);
+
+function formatParamValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return String(value);
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint'
+  ) {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(formatParamValue).join(', ')}]`;
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => `${k}: ${formatParamValue(v)}`);
+    return `(${entries.join(', ')})`;
+  }
+  return String(value);
+}
+
+/**
+ * Formats tool parameters into a human-readable function signature or raw command,
+ * excluding conversational/explanatory parameters and avoiding raw JSON braces.
+ */
+export function formatToolDescription(
+  toolName: string,
+  fallbackDisplayName: string | undefined,
+  params: Record<string, unknown>,
+): string {
+  const functionalEntries = Object.entries(params).filter(
+    ([key, val]) =>
+      !CONVERSATIONAL_PARAM_KEYS.has(key.toLowerCase()) && val !== undefined,
+  );
+
+  const command = params['command'];
+  if (
+    typeof command === 'string' &&
+    functionalEntries.length === 1 &&
+    functionalEntries[0]?.[0] === 'command'
+  ) {
+    return command;
+  }
+
+  if (functionalEntries.length === 0) {
+    return fallbackDisplayName || toolName;
+  }
+
+  const formattedArgs = functionalEntries
+    .map(([key, val]) => `${key}: ${formatParamValue(val)}`)
+    .join(', ');
+
+  return `${toolName}(${formattedArgs})`;
+}
+
+/**
+ * Formats a clean title for UI/ACP display. If a `command` parameter is present,
+ * returns strictly the raw executable command so IDE clients can syntax-highlight it.
+ * Otherwise, returns the formatted function signature.
+ */
+export function formatToolDisplayTitle(
+  toolName: string,
+  fallbackDisplayName: string | undefined,
+  params: Record<string, unknown>,
+): string {
+  const command = params['command'];
+  if (typeof command === 'string' && command.trim().length > 0) {
+    return command;
+  }
+  return formatToolDescription(toolName, fallbackDisplayName, params);
+}
+
+/**
+ * Extracts conversational/explanatory text (and non-command contextual parameters
+ * when a command is present) so explanations travel in ACP content blocks.
+ */
+export function extractToolExplanation(
+  params: Record<string, unknown>,
+): string {
+  const MAX_EXPLANATION_LENGTH = 500;
+  const parts: string[] = [];
+
+  const command = params['command'];
+  const hasCommand = typeof command === 'string' && command.trim().length > 0;
+
+  if (hasCommand) {
+    const contextEntries = Object.entries(params).filter(
+      ([key, val]) =>
+        key !== 'command' &&
+        !CONVERSATIONAL_PARAM_KEYS.has(key.toLowerCase()) &&
+        val !== undefined,
+    );
+    if (contextEntries.length > 0) {
+      const formattedContext = contextEntries
+        .map(([key, val]) => `${key}: ${formatParamValue(val)}`)
+        .join(', ');
+      if (formattedContext.length > MAX_EXPLANATION_LENGTH) {
+        const keys = Object.keys(params);
+        const displayedKeys = keys.slice(0, 5);
+        const keysDesc =
+          displayedKeys.length > 0
+            ? ` with parameters: ${displayedKeys.join(', ')}${
+                keys.length > 5 ? ', ...' : ''
+              }`
+            : '';
+        parts.push(`[Payload omitted due to length${keysDesc}]`);
+      } else {
+        parts.push(`[${formattedContext}]`);
+      }
+    }
+  }
+
+  for (const [key, val] of Object.entries(params)) {
+    if (
+      CONVERSATIONAL_PARAM_KEYS.has(key.toLowerCase()) &&
+      typeof val === 'string' &&
+      val.trim().length > 0
+    ) {
+      parts.push(val.trim());
+    }
+  }
+
+  if (parts.length === 0) {
+    return '';
+  }
+
+  const combined = parts.join(' ');
+  if (combined.length > MAX_EXPLANATION_LENGTH) {
+    return `${combined.slice(0, MAX_EXPLANATION_LENGTH)}...`;
+  }
+  return combined;
+}
 
 export class DiscoveredMCPToolInvocation extends BaseToolInvocation<
   ToolParams,
@@ -263,7 +412,7 @@ export class DiscoveredMCPToolInvocation extends BaseToolInvocation<
     return false;
   }
 
-  async execute(signal: AbortSignal): Promise<ToolResult> {
+  async execute({ abortSignal: signal }: ExecuteOptions): Promise<ToolResult> {
     this.cliConfig?.setUserInteractedWithMcp?.();
     const functionCalls: FunctionCall[] = [
       {
@@ -329,7 +478,23 @@ export class DiscoveredMCPToolInvocation extends BaseToolInvocation<
   }
 
   getDescription(): string {
-    return safeJsonStringify(this.params);
+    return formatToolDescription(
+      this.serverToolName,
+      this.displayName,
+      this.params,
+    );
+  }
+
+  override getDisplayTitle(): string {
+    return formatToolDisplayTitle(
+      this.serverToolName,
+      this.displayName,
+      this.params,
+    );
+  }
+
+  override getExplanation(): string {
+    return extractToolExplanation(this.params);
   }
 }
 
@@ -417,7 +582,7 @@ export class DiscoveredMCPTool extends BaseDeclarativeTool<
 }
 
 function transformTextBlock(block: McpTextBlock): Part {
-  return { text: block.text };
+  return { text: wrapUntrusted(block.text) };
 }
 
 function transformImageAudioBlock(
@@ -445,7 +610,7 @@ function transformResourceBlock(
 ): Part | Part[] | null {
   const resource = block.resource;
   if (resource?.text) {
-    return { text: resource.text };
+    return { text: wrapUntrusted(resource.text) };
   }
   if (resource?.blob) {
     const mimeType = resource.mimeType || 'application/octet-stream';

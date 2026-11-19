@@ -19,7 +19,6 @@ const runInDevTraceSpan = vi.hoisted(() =>
     const metadata = { attributes: opts.attributes || {} };
     return fn({
       metadata,
-      endSpan: vi.fn(),
     });
   }),
 );
@@ -73,7 +72,10 @@ describe('LoggingContentGenerator', () => {
       getContentGeneratorConfig: vi.fn().mockReturnValue({
         authType: 'API_KEY',
       }),
+      getTelemetryLogPromptsEnabled: vi.fn().mockReturnValue(true),
+      getTelemetryTracesEnabled: vi.fn().mockReturnValue(false),
       refreshUserQuotaIfStale: vi.fn().mockResolvedValue(undefined),
+      getSessionId: vi.fn().mockReturnValue('test-session-id'),
     } as unknown as Config;
     loggingContentGenerator = new LoggingContentGenerator(wrapped, config);
     vi.useFakeTimers();
@@ -158,7 +160,7 @@ describe('LoggingContentGenerator', () => {
       const spanArgs = vi.mocked(runInDevTraceSpan).mock.calls[0];
       const fn = spanArgs[1];
       const metadata: SpanMetadata = { name: '', attributes: {} };
-      await fn({ metadata, endSpan: vi.fn() });
+      await fn({ metadata });
 
       expect(metadata).toMatchObject({
         input: req.contents,
@@ -168,6 +170,80 @@ describe('LoggingContentGenerator', () => {
           [GEN_AI_USAGE_OUTPUT_TOKENS]: 2,
         },
       });
+    });
+
+    it('should omit serialized request_text, response_text, and prompt.contents when prompt logging is disabled', async () => {
+      vi.mocked(config.getTelemetryLogPromptsEnabled).mockReturnValue(false);
+      vi.mocked(config.getTelemetryTracesEnabled).mockReturnValue(false);
+
+      const req = {
+        contents: [{ role: 'user', parts: [{ text: 'large-payload' }] }],
+        model: 'gemini-pro',
+      };
+      const response: GenerateContentResponse = {
+        candidates: [{ content: { parts: [{ text: 'reply' }] } }],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 5,
+          totalTokenCount: 15,
+        },
+        text: undefined,
+        functionCalls: undefined,
+        executableCode: undefined,
+        codeExecutionResult: undefined,
+        data: undefined,
+      };
+      vi.mocked(wrapped.generateContent).mockResolvedValue(response);
+
+      await loggingContentGenerator.generateContent(
+        req,
+        'prompt-no-log',
+        LlmRole.MAIN,
+      );
+
+      const requestEvent = vi.mocked(logApiRequest).mock.calls[0][1];
+      const responseEvent = vi.mocked(logApiResponse).mock.calls[0][1];
+      expect(requestEvent.request_text).toBeUndefined();
+      expect(requestEvent.prompt.contents).toEqual([]);
+      expect(responseEvent.response_text).toBeUndefined();
+      expect(responseEvent.prompt.contents).toEqual([]);
+    });
+
+    it('should include prompt.contents only when both prompt logging and traces are enabled', async () => {
+      vi.mocked(config.getTelemetryLogPromptsEnabled).mockReturnValue(true);
+      vi.mocked(config.getTelemetryTracesEnabled).mockReturnValue(true);
+
+      const req = {
+        contents: [{ role: 'user', parts: [{ text: 'trace-payload' }] }],
+        model: 'gemini-pro',
+      };
+      const response: GenerateContentResponse = {
+        candidates: [{ content: { parts: [{ text: 'reply' }] } }],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 5,
+          totalTokenCount: 15,
+        },
+        text: undefined,
+        functionCalls: undefined,
+        executableCode: undefined,
+        codeExecutionResult: undefined,
+        data: undefined,
+      };
+      vi.mocked(wrapped.generateContent).mockResolvedValue(response);
+
+      await loggingContentGenerator.generateContent(
+        req,
+        'prompt-trace-enabled',
+        LlmRole.MAIN,
+      );
+
+      const requestEvent = vi.mocked(logApiRequest).mock.calls[0][1];
+      const responseEvent = vi.mocked(logApiResponse).mock.calls[0][1];
+      expect(requestEvent.request_text).toContain('trace-payload');
+      expect(requestEvent.prompt.contents).toEqual(req.contents);
+      expect(responseEvent.response_text).toContain('reply');
+      expect(responseEvent.prompt.contents).toEqual(req.contents);
     });
 
     it('should log error on failure', async () => {
@@ -222,7 +298,7 @@ describe('LoggingContentGenerator', () => {
       const spanArgs = vi.mocked(runInDevTraceSpan).mock.calls[0];
       const fn = spanArgs[1];
       const metadata: SpanMetadata = { name: '', attributes: {} };
-      promise = fn({ metadata, endSpan: vi.fn() });
+      promise = fn({ metadata });
 
       await expect(promise).rejects.toThrow(error);
 
@@ -311,6 +387,100 @@ describe('LoggingContentGenerator', () => {
         ).rejects.toSatisfy((error: unknown) => {
           const gError = error as { response: { data: unknown } };
           expect(gError.response.data).toBe(invalidAscii);
+          return true;
+        });
+      });
+
+      it('should decode Uint8Array data in Gaxios errors', async () => {
+        const req = { contents: [], model: 'gemini-pro' };
+
+        const gaxiosError = Object.assign(new Error('Gaxios Error'), {
+          response: { data: new Uint8Array([72, 101, 108, 108, 111]) },
+        });
+
+        vi.mocked(wrapped.generateContent).mockRejectedValue(gaxiosError);
+
+        await expect(
+          loggingContentGenerator.generateContent(
+            req,
+            'prompt-123',
+            LlmRole.MAIN,
+          ),
+        ).rejects.toSatisfy((error: unknown) => {
+          const gError = error as { response: { data: unknown } };
+          expect(gError.response.data).toBe('Hello');
+          return true;
+        });
+      });
+
+      it('should decode multi-byte UTF-8 from comma-separated byte strings', async () => {
+        const req = { contents: [], model: 'gemini-pro' };
+
+        // "Héllo" in UTF-8 bytes: H=72, é=195,169, l=108, l=108, o=111
+        const utf8Data = '72,195,169,108,108,111';
+        const gaxiosError = Object.assign(new Error('Gaxios Error'), {
+          response: { data: utf8Data },
+        });
+
+        vi.mocked(wrapped.generateContent).mockRejectedValue(gaxiosError);
+
+        await expect(
+          loggingContentGenerator.generateContent(
+            req,
+            'prompt-123',
+            LlmRole.MAIN,
+          ),
+        ).rejects.toSatisfy((error: unknown) => {
+          const gError = error as { response: { data: unknown } };
+          expect(gError.response.data).toBe('Héllo');
+          return true;
+        });
+      });
+
+      it('should decode 3-byte UTF-8 from comma-separated byte strings', async () => {
+        const req = { contents: [], model: 'gemini-pro' };
+
+        // "こんにちは" in UTF-8 bytes (3 bytes per character)
+        const utf8Data =
+          '227,129,147,227,130,147,227,129,171,227,129,161,227,129,175';
+        const gaxiosError = Object.assign(new Error('Gaxios Error'), {
+          response: { data: utf8Data },
+        });
+
+        vi.mocked(wrapped.generateContent).mockRejectedValue(gaxiosError);
+
+        await expect(
+          loggingContentGenerator.generateContent(
+            req,
+            'prompt-123',
+            LlmRole.MAIN,
+          ),
+        ).rejects.toSatisfy((error: unknown) => {
+          const gError = error as { response: { data: unknown } };
+          expect(gError.response.data).toBe('こんにちは');
+          return true;
+        });
+      });
+
+      it('should reject byte strings with values outside 0-255 range', async () => {
+        const req = { contents: [], model: 'gemini-pro' };
+
+        const outOfRange = '72,256,108';
+        const gaxiosError = Object.assign(new Error('Gaxios Error'), {
+          response: { data: outOfRange },
+        });
+
+        vi.mocked(wrapped.generateContent).mockRejectedValue(gaxiosError);
+
+        await expect(
+          loggingContentGenerator.generateContent(
+            req,
+            'prompt-123',
+            LlmRole.MAIN,
+          ),
+        ).rejects.toSatisfy((error: unknown) => {
+          const gError = error as { response: { data: unknown } };
+          expect(gError.response.data).toBe(outOfRange);
           return true;
         });
       });
@@ -407,7 +577,7 @@ describe('LoggingContentGenerator', () => {
       expect(runInDevTraceSpan).toHaveBeenCalledWith(
         expect.objectContaining({
           operation: GeminiCliOperation.LLMCall,
-          noAutoEnd: true,
+
           attributes: expect.objectContaining({
             [GEN_AI_REQUEST_MODEL]: 'gemini-pro',
             [GEN_AI_PROMPT_NAME]: userPromptId,
@@ -427,7 +597,7 @@ describe('LoggingContentGenerator', () => {
       vi.mocked(wrapped.generateContentStream).mockResolvedValue(
         createAsyncGenerator(),
       );
-      stream = await fn({ metadata, endSpan: vi.fn() });
+      stream = await fn({ metadata });
 
       for await (const _ of stream) {
         // consume stream
@@ -644,7 +814,7 @@ describe('LoggingContentGenerator', () => {
       const spanArgs = vi.mocked(runInDevTraceSpan).mock.calls[0];
       const fn = spanArgs[1];
       const metadata: SpanMetadata = { name: '', attributes: {} };
-      await fn({ metadata, endSpan: vi.fn() });
+      await fn({ metadata });
 
       expect(metadata).toMatchObject({
         input: req.contents,

@@ -13,15 +13,17 @@ import {
   afterEach,
   type Mock,
 } from 'vitest';
-import { GitService } from './gitService.js';
+import {
+  GitService,
+  SHADOW_REPO_AUTHOR_NAME,
+  SHADOW_REPO_AUTHOR_EMAIL,
+} from './gitService.js';
 import { Storage } from '../config/storage.js';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
-import { GEMINI_DIR, homedir as pathsHomedir } from '../utils/paths.js';
+import { homedir as pathsHomedir } from '../utils/paths.js';
 import { spawnAsync } from '../utils/shell-utils.js';
-
-const PROJECT_SLUG = 'project-slug';
 
 vi.mock('../utils/shell-utils.js', () => ({
   spawnAsync: vi.fn(),
@@ -49,9 +51,13 @@ vi.mock('simple-git', () => ({
 }));
 
 const hoistedIsGitRepositoryMock = vi.hoisted(() => vi.fn());
-vi.mock('../utils/gitUtils.js', () => ({
-  isGitRepository: hoistedIsGitRepositoryMock,
-}));
+vi.mock('../utils/gitUtils.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/gitUtils.js')>();
+  return {
+    ...actual,
+    isGitRepository: hoistedIsGitRepositoryMock,
+  };
+});
 
 const hoistedMockHomedir = vi.hoisted(() => vi.fn());
 vi.mock('node:os', async (importOriginal) => {
@@ -94,10 +100,17 @@ describe('GitService', () => {
 
     vi.clearAllMocks();
     hoistedIsGitRepositoryMock.mockReturnValue(true);
-    (spawnAsync as Mock).mockResolvedValue({
-      stdout: 'git version 2.0.0',
-      stderr: '',
-    });
+    (spawnAsync as Mock).mockImplementation(
+      async (_cmd: string, args: string[]) => {
+        if (args && args[0] === '--version') {
+          return {
+            stdout: 'git version 2.0.0',
+            stderr: '',
+          };
+        }
+        throw new Error('Command failed');
+      },
+    );
 
     hoistedMockHomedir.mockReturnValue(homedir);
     (pathsHomedir as Mock).mockReturnValue(homedir);
@@ -127,11 +140,13 @@ describe('GitService', () => {
       commit: 'initial',
     });
     storage = new Storage(projectRoot);
+    await storage.initialize();
   });
 
   afterEach(async () => {
-    vi.restoreAllMocks();
-    await fs.rm(testRootDir, { recursive: true, force: true });
+    if (testRootDir) {
+      await fs.rm(testRootDir, { recursive: true, force: true });
+    }
   });
 
   describe('constructor', () => {
@@ -143,7 +158,9 @@ describe('GitService', () => {
   describe('verifyGitAvailability', () => {
     it('should resolve true if git --version command succeeds', async () => {
       await expect(GitService.verifyGitAvailability()).resolves.toBe(true);
-      expect(spawnAsync).toHaveBeenCalledWith('git', ['--version']);
+      expect(spawnAsync).toHaveBeenCalledWith('git', ['--version'], {
+        env: expect.anything(),
+      });
     });
 
     it('should resolve false if git --version command fails', async () => {
@@ -177,7 +194,7 @@ describe('GitService', () => {
     let gitConfigPath: string;
 
     beforeEach(async () => {
-      repoDir = path.join(homedir, GEMINI_DIR, 'history', PROJECT_SLUG);
+      repoDir = storage.getHistoryDir();
       gitConfigPath = path.join(repoDir, '.gitconfig');
     });
 
@@ -192,8 +209,7 @@ describe('GitService', () => {
       const service = new GitService(projectRoot, storage);
       await service.setupShadowGitRepository();
 
-      const expectedConfigContent =
-        '[user]\n  name = Gemini CLI\n  email = gemini-cli@google.com\n[commit]\n  gpgsign = false\n';
+      const expectedConfigContent = `[user]\n  name = ${SHADOW_REPO_AUTHOR_NAME}\n  email = ${SHADOW_REPO_AUTHOR_EMAIL}\n[commit]\n  gpgsign = false\n`;
       const actualConfigContent = await fs.readFile(gitConfigPath, 'utf-8');
       expect(actualConfigContent).toBe(expectedConfigContent);
     });
@@ -202,7 +218,10 @@ describe('GitService', () => {
       hoistedMockCheckIsRepo.mockResolvedValue(false);
       const service = new GitService(projectRoot, storage);
       await service.setupShadowGitRepository();
-      expect(hoistedMockSimpleGit).toHaveBeenCalledWith(repoDir);
+      expect(hoistedMockSimpleGit).toHaveBeenCalledWith(
+        repoDir,
+        expect.anything(),
+      );
       expect(hoistedMockInit).toHaveBeenCalled();
     });
 
@@ -224,6 +243,266 @@ describe('GitService', () => {
       const hiddenGitIgnorePath = path.join(repoDir, '.gitignore');
       const copiedContent = await fs.readFile(hiddenGitIgnorePath, 'utf-8');
       expect(copiedContent).toBe(gitignoreContent);
+    });
+
+    it('should configure core.excludesFile in shadow gitconfig when set globally', async () => {
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (args[0] === 'config') {
+            return {
+              stdout: '/path/to/global/.gitignore_global\n',
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const gitConfigPath = path.join(repoDir, '.gitconfig');
+      const content = await fs.readFile(gitConfigPath, 'utf-8');
+      expect(content).toContain(
+        '[core]\n  excludesFile = "/path/to/global/.gitignore_global"',
+      );
+    });
+
+    it('should escape backslashes and quotes in core.excludesFile for gitconfig', async () => {
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (args[0] === 'config') {
+            return {
+              stdout: 'C:\\Users\\User\\path"with"quotes\\.gitignore_global\n',
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const gitConfigPath = path.join(repoDir, '.gitconfig');
+      const content = await fs.readFile(gitConfigPath, 'utf-8');
+      expect(content).toContain(
+        '[core]\n  excludesFile = "C:\\\\Users\\\\User\\\\path\\"with\\"quotes\\\\.gitignore_global"',
+      );
+    });
+
+    it('should copy .git/info/exclude from projectRoot if it exists', async () => {
+      const excludeContent = 'private_notes.md\nsecrets/';
+      const visibleExcludePath = path.join(
+        projectRoot,
+        '.git',
+        'info',
+        'exclude',
+      );
+      await fs.mkdir(path.dirname(visibleExcludePath), { recursive: true });
+      await fs.writeFile(visibleExcludePath, excludeContent);
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const copiedContent = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(copiedContent).toBe(excludeContent);
+    });
+
+    it('should resolve info/exclude via git rev-parse for linked worktrees', async () => {
+      const commonDir = path.join(testRootDir, 'main_repo', '.git');
+      const commonExcludeDir = path.join(commonDir, 'info');
+      await fs.mkdir(commonExcludeDir, { recursive: true });
+      const commonExcludePath = path.join(commonExcludeDir, 'exclude');
+      await fs.writeFile(commonExcludePath, 'worktree_ignore.txt');
+
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (args[0] === 'rev-parse' && args.includes('--git-common-dir')) {
+            return {
+              stdout: `${commonDir}\n`,
+              stderr: '',
+            };
+          }
+          if (args[0] === 'rev-parse' && args.includes('info/exclude')) {
+            return {
+              stdout: `${commonExcludePath}\n`,
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const copiedContent = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(copiedContent).toBe('worktree_ignore.txt');
+    });
+
+    it('should reject path traversal in rev-parse info/exclude output', async () => {
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (args[0] === 'rev-parse' && args.includes('info/exclude')) {
+            return {
+              stdout: '../../../../etc/passwd\n',
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const content = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(content).toBe('');
+    });
+
+    it('should reject symlink pointing outside repository in fallback info/exclude', async () => {
+      const externalSecret = path.join(testRootDir, 'secret_outside.txt');
+      await fs.writeFile(externalSecret, 'sensitive data');
+
+      const infoDir = path.join(projectRoot, '.git', 'info');
+      await fs.mkdir(infoDir, { recursive: true });
+      const symlinkExclude = path.join(infoDir, 'exclude');
+      await fs.symlink(externalSecret, symlinkExclude);
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const content = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(content).toBe('');
+    });
+
+    it('should handle missing info/exclude gracefully', async () => {
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const content = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(content).toBe('');
+    });
+
+    it('should fall back to git rev-parse --git-common-dir without path-format on older Git', async () => {
+      const commonDir = path.join(testRootDir, 'main_repo', '.git');
+      const commonExcludeDir = path.join(commonDir, 'info');
+      await fs.mkdir(commonExcludeDir, { recursive: true });
+      const commonExcludePath = path.join(commonExcludeDir, 'exclude');
+      await fs.writeFile(commonExcludePath, 'older_git_ignore.txt');
+
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (
+            args[0] === 'rev-parse' &&
+            args.includes('--path-format=absolute')
+          ) {
+            throw new Error('unknown option --path-format=absolute');
+          }
+          if (args[0] === 'rev-parse' && args.includes('--git-common-dir')) {
+            return {
+              stdout: `${commonDir}\n`,
+              stderr: '',
+            };
+          }
+          if (args[0] === 'rev-parse' && args.includes('info/exclude')) {
+            return {
+              stdout: `${commonExcludePath}\n`,
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const copiedContent = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(copiedContent).toBe('older_git_ignore.txt');
+    });
+
+    it('should ignore ENOTDIR error when reading project info/exclude (e.g. .git is a file)', async () => {
+      // Create .git as a file to simulate submodule or worktree with failed rev-parse
+      const dotGitFile = path.join(projectRoot, '.git');
+      await fs.writeFile(dotGitFile, 'gitdir: /some/path');
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const content = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(content).toBe('');
+    });
+
+    it('should reject core.excludesFile containing null bytes or newlines', async () => {
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (args[0] === 'config') {
+            return {
+              stdout: '/path/to/global/.gitignore\ninjection = true\n',
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const gitConfigPath = path.join(repoDir, '.gitconfig');
+      const content = await fs.readFile(gitConfigPath, 'utf-8');
+      expect(content).not.toContain('excludesFile');
+    });
+
+    it('should reject info/exclude path containing null bytes or newlines', async () => {
+      (spawnAsync as Mock).mockImplementation(
+        async (_cmd: string, args: string[]) => {
+          if (args[0] === 'rev-parse' && args.includes('info/exclude')) {
+            return {
+              stdout: '/malicious/path\0something\n',
+              stderr: '',
+            };
+          }
+          if (args[0] === '--version') {
+            return { stdout: 'git version 2.0.0', stderr: '' };
+          }
+          throw new Error('Command failed');
+        },
+      );
+
+      const service = new GitService(projectRoot, storage);
+      await service.setupShadowGitRepository();
+
+      const hiddenExcludePath = path.join(repoDir, '.git', 'info', 'exclude');
+      const content = await fs.readFile(hiddenExcludePath, 'utf-8');
+      expect(content).toBe('');
     });
 
     it('should not create a .gitignore in shadow repo if project .gitignore does not exist', async () => {
@@ -288,6 +567,10 @@ describe('GitService', () => {
         expect.objectContaining({
           GIT_CONFIG_GLOBAL: gitConfigPath,
           GIT_CONFIG_SYSTEM: path.join(repoDir, '.gitconfig_system_empty'),
+          GIT_AUTHOR_NAME: SHADOW_REPO_AUTHOR_NAME,
+          GIT_AUTHOR_EMAIL: SHADOW_REPO_AUTHOR_EMAIL,
+          GIT_COMMITTER_NAME: SHADOW_REPO_AUTHOR_NAME,
+          GIT_COMMITTER_EMAIL: SHADOW_REPO_AUTHOR_EMAIL,
         }),
       );
 
@@ -296,6 +579,146 @@ describe('GitService', () => {
         'utf-8',
       );
       expect(systemConfigContent).toBe('');
+    });
+
+    describe('environment variable preservation', () => {
+      const customPath = '/custom/bin';
+      const safeHome = '/home/user';
+      const sensitiveKey = 'sk-123456789';
+
+      beforeEach(() => {
+        vi.stubEnv('PATH', customPath);
+        vi.stubEnv('HOME', safeHome);
+        vi.stubEnv('API_KEY', sensitiveKey);
+        vi.stubEnv('UNRELATED_VAR', 'some-value');
+        // Explicitly unset strict mode triggers to ensure predictable test behavior
+        // across local and CI environments.
+        vi.stubEnv('GITHUB_SHA', '');
+        vi.stubEnv('SURFACE', '');
+        hoistedMockCheckIsRepo.mockResolvedValue(false);
+      });
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it('should preserve system PATH in the Git environment', async () => {
+        const service = new GitService(projectRoot, storage);
+        await service.setupShadowGitRepository();
+
+        expect(hoistedMockEnv).toHaveBeenCalledWith(
+          expect.objectContaining({
+            PATH: customPath,
+            GIT_CONFIG_GLOBAL: expect.any(String),
+            GIT_AUTHOR_NAME: SHADOW_REPO_AUTHOR_NAME,
+          }),
+        );
+      });
+
+      it('should preserve safe environment variables like HOME', async () => {
+        const service = new GitService(projectRoot, storage);
+        await service.setupShadowGitRepository();
+
+        expect(hoistedMockEnv).toHaveBeenCalledWith(
+          expect.objectContaining({
+            HOME: safeHome,
+          }),
+        );
+      });
+
+      it('should NOT include sensitive environment variables like API_KEY', async () => {
+        const service = new GitService(projectRoot, storage);
+        await service.setupShadowGitRepository();
+
+        const callArgs = hoistedMockEnv.mock.calls[0][0];
+        expect(callArgs.API_KEY).toBeUndefined();
+      });
+
+      it('should preserve unrelated environment variables in non-strict mode', async () => {
+        const service = new GitService(projectRoot, storage);
+        await service.setupShadowGitRepository();
+
+        const callArgs = hoistedMockEnv.mock.calls[0][0];
+        expect(callArgs.UNRELATED_VAR).toBe('some-value');
+      });
+
+      it('should explicitly unset GIT_DIR and GIT_WORK_TREE to maintain isolation', async () => {
+        const service = new GitService(projectRoot, storage);
+        await service.setupShadowGitRepository();
+
+        const callArgs = hoistedMockEnv.mock.calls[0][0];
+        expect(callArgs.GIT_DIR).toBeUndefined();
+        expect(callArgs.GIT_WORK_TREE).toBeUndefined();
+      });
+    });
+
+    describe('GIT_CONFIG isolation', () => {
+      beforeEach(() => {
+        vi.stubEnv('GIT_CONFIG_GLOBAL', '/user/global/config');
+        vi.stubEnv('GIT_CONFIG_SYSTEM', '/user/system/config');
+        hoistedMockCheckIsRepo.mockResolvedValue(false);
+      });
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it('should override GIT_CONFIG environment variables from process.env', async () => {
+        const service = new GitService(projectRoot, storage);
+        await service.setupShadowGitRepository();
+
+        const expectedConfigPath = path.join(repoDir, '.gitconfig');
+        const expectedSystemPath = path.join(
+          repoDir,
+          '.gitconfig_system_empty',
+        );
+
+        expect(hoistedMockEnv).toHaveBeenCalledWith(
+          expect.objectContaining({
+            GIT_CONFIG_GLOBAL: expectedConfigPath,
+            GIT_CONFIG_SYSTEM: expectedSystemPath,
+          }),
+        );
+
+        // Ensure it's not using the values from stubbed process.env
+        const callArgs = hoistedMockEnv.mock.calls[0][0];
+        expect(callArgs.GIT_CONFIG_GLOBAL).not.toBe('/user/global/config');
+        expect(callArgs.GIT_CONFIG_SYSTEM).not.toBe('/user/system/config');
+      });
+    });
+
+    describe('shadowGitRepository prioritization', () => {
+      beforeEach(() => {
+        vi.stubEnv('GIT_DIR', '/user/fake/.git');
+        vi.stubEnv('GIT_WORK_TREE', '/user/fake/worktree');
+        hoistedMockCheckIsRepo.mockResolvedValue(true);
+      });
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it('should prioritize internal GIT_DIR and GIT_WORK_TREE over process.env', async () => {
+        const service = new GitService(projectRoot, storage);
+        // Trigger a call to shadowGitRepository (e.g., via getCurrentCommitHash)
+        hoistedMockRaw.mockResolvedValue('hash');
+        await service.getCurrentCommitHash();
+
+        const expectedRepoDir = storage.getHistoryDir();
+        const expectedGitDir = path.join(expectedRepoDir, '.git');
+
+        expect(hoistedMockEnv).toHaveBeenCalledWith(
+          expect.objectContaining({
+            GIT_DIR: expectedGitDir,
+            GIT_WORK_TREE: projectRoot,
+          }),
+        );
+
+        // Ensure user env was overridden
+        const callArgs = hoistedMockEnv.mock.calls[0][0];
+        expect(callArgs.GIT_DIR).not.toBe('/user/fake/.git');
+        expect(callArgs.GIT_WORK_TREE).not.toBe('/user/fake/worktree');
+      });
     });
   });
 
@@ -333,6 +756,38 @@ describe('GitService', () => {
       expect(hoistedMockCommit).not.toHaveBeenCalled();
       expect(hoistedMockRaw).toHaveBeenCalledWith('rev-parse', 'HEAD');
       expect(commitHash).toBe('current-head-hash');
+    });
+
+    it('does not interleave staging and committing across concurrent snapshots', async () => {
+      const events: string[] = [];
+      hoistedMockAdd.mockImplementation(async () => {
+        events.push('add:start');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        events.push('add:end');
+      });
+      hoistedMockStatus.mockResolvedValue({ isClean: () => false });
+      hoistedMockCommit.mockImplementation(async (message: string) => {
+        events.push(`commit:${message}`);
+        return { commit: `hash-${message}` };
+      });
+
+      const service = new GitService(projectRoot, storage);
+      await Promise.all([
+        service.createFileSnapshot('A'),
+        service.createFileSnapshot('B'),
+      ]);
+
+      // `add('.')` stages the whole working tree, so a second snapshot that
+      // stages while the first has not committed yet folds the first
+      // snapshot's files into its own commit.
+      expect(events).toEqual([
+        'add:start',
+        'add:end',
+        'commit:A',
+        'add:start',
+        'add:end',
+        'commit:B',
+      ]);
     });
   });
 });

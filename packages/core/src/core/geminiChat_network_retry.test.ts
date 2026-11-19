@@ -14,6 +14,16 @@ import { HookSystem } from '../hooks/hookSystem.js';
 import { createMockMessageBus } from '../test-utils/mock-message-bus.js';
 import { createAvailabilityServiceMock } from '../availability/testUtils.js';
 import { LlmRole } from '../telemetry/types.js';
+import {
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_MODEL_AUTO,
+} from '../config/models.js';
+import * as policyCatalog from '../availability/policyCatalog.js';
+import {
+  coreEvents,
+  CoreEvent,
+  type RetryAttemptPayload,
+} from '../utils/events.js';
 
 // Mock fs module
 vi.mock('node:fs', async (importOriginal) => {
@@ -83,6 +93,7 @@ describe('GeminiChat Network Retries', () => {
     const testMessageBus = { publish: vi.fn(), subscribe: vi.fn() };
 
     mockConfig = {
+      getRequestTimeoutMs: vi.fn().mockReturnValue(undefined),
       get config() {
         return this;
       },
@@ -95,7 +106,9 @@ describe('GeminiChat Network Retries', () => {
       promptId: 'test-session-id',
       getSessionId: () => 'test-session-id',
       getTelemetryLogPromptsEnabled: () => true,
+      getTelemetryTracesEnabled: () => false,
       getUsageStatisticsEnabled: () => true,
+      hasLatestFlashGAAccess: vi.fn().mockReturnValue(false),
       getDebugMode: () => false,
       getContentGeneratorConfig: vi.fn().mockReturnValue({
         authType: 'oauth-personal',
@@ -119,6 +132,7 @@ describe('GeminiChat Network Retries', () => {
           generateContentConfig: { temperature: 0 },
         })),
       },
+      isContextManagementEnabled: vi.fn().mockReturnValue(false),
       getEnableHooks: vi.fn().mockReturnValue(false),
       getModelAvailabilityService: vi
         .fn()
@@ -517,5 +531,249 @@ describe('GeminiChat Network Retries', () => {
         error_type: 'ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC',
       }),
     );
+  });
+
+  it('should retry on OpenSSL 3.x SSL error during stream iteration (ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC)', async () => {
+    // OpenSSL 3.x produces a different error code format than OpenSSL 1.x
+    const sslError = new Error(
+      'request to https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent failed',
+    ) as NodeJS.ErrnoException & { type?: string };
+    sslError.type = 'system';
+    sslError.errno =
+      'ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC' as unknown as number;
+    sslError.code = 'ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC';
+
+    vi.mocked(mockContentGenerator.generateContentStream)
+      .mockImplementationOnce(async () =>
+        (async function* () {
+          yield {
+            candidates: [
+              { content: { parts: [{ text: 'Partial response...' }] } },
+            ],
+          } as unknown as GenerateContentResponse;
+          throw sslError;
+        })(),
+      )
+      .mockImplementationOnce(async () =>
+        (async function* () {
+          yield {
+            candidates: [
+              {
+                content: { parts: [{ text: 'Complete response after retry' }] },
+                finishReason: 'STOP',
+              },
+            ],
+          } as unknown as GenerateContentResponse;
+        })(),
+      );
+
+    const stream = await chat.sendMessageStream(
+      { model: 'test-model' },
+      'test message',
+      'prompt-id-ssl3-mid-stream',
+      new AbortController().signal,
+      LlmRole.MAIN,
+    );
+
+    const events: StreamEvent[] = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    const retryEvent = events.find((e) => e.type === StreamEventType.RETRY);
+    expect(retryEvent).toBeDefined();
+
+    const successChunk = events.find(
+      (e) =>
+        e.type === StreamEventType.CHUNK &&
+        e.value.candidates?.[0]?.content?.parts?.[0]?.text ===
+          'Complete response after retry',
+    );
+    expect(successChunk).toBeDefined();
+
+    expect(mockLogNetworkRetryAttempt).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        error_type: 'ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC',
+      }),
+    );
+  });
+
+  it('should retry on premature stream closure (ERR_STREAM_PREMATURE_CLOSE)', async () => {
+    mockConfig.getRetryFetchErrors = vi.fn().mockReturnValue(true);
+
+    const prematureCloseError = new Error('Premature close');
+    Object.defineProperty(prematureCloseError, 'code', {
+      value: 'ERR_STREAM_PREMATURE_CLOSE',
+    });
+
+    vi.mocked(mockContentGenerator.generateContentStream)
+      .mockResolvedValueOnce(
+        (async function* () {
+          yield {
+            candidates: [{ content: { parts: [{ text: 'Incomplete part' }] } }],
+          } as unknown as GenerateContentResponse;
+          throw prematureCloseError;
+        })(),
+      )
+      .mockResolvedValueOnce(
+        (async function* () {
+          yield {
+            candidates: [
+              {
+                content: { parts: [{ text: 'Complete response after retry' }] },
+                finishReason: 'STOP',
+              },
+            ],
+          } as unknown as GenerateContentResponse;
+        })(),
+      );
+
+    const stream = await chat.sendMessageStream(
+      { model: 'test-model' },
+      'test message',
+      'prompt-id-premature-close',
+      new AbortController().signal,
+      LlmRole.MAIN,
+    );
+
+    const events: StreamEvent[] = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    const retryEvent = events.find((e) => e.type === StreamEventType.RETRY);
+    expect(retryEvent).toBeDefined();
+
+    const successChunk = events.find(
+      (e) =>
+        e.type === StreamEventType.CHUNK &&
+        e.value.candidates?.[0]?.content?.parts?.[0]?.text ===
+          'Complete response after retry',
+    );
+    expect(successChunk).toBeDefined();
+
+    expect(mockLogNetworkRetryAttempt).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        error_type: 'ERR_STREAM_PREMATURE_CLOSE',
+      }),
+    );
+  });
+
+  it('should include request role, promptId, and updated model policy maxAttempts in emitted RetryAttempt events', async () => {
+    const emittedRetries: RetryAttemptPayload[] = [];
+    const listener = (payload: RetryAttemptPayload) => {
+      emittedRetries.push(payload);
+    };
+    coreEvents.on(CoreEvent.RetryAttempt, listener);
+
+    try {
+      const { retryWithBackoff: actualRetryWithBackoff } =
+        await vi.importActual<typeof import('../utils/retry.js')>(
+          '../utils/retry.js',
+        );
+      let activeModel = DEFAULT_GEMINI_MODEL;
+      mockConfig.getActiveModel = vi.fn(() => activeModel);
+      mockConfig.getModel = vi.fn(() => DEFAULT_GEMINI_MODEL_AUTO);
+      mockConfig.getMaxAttempts = vi.fn(() => 5);
+      mockConfig.getUserTier = vi.fn(() => undefined);
+      vi.spyOn(policyCatalog, 'getModelPolicyChain').mockReturnValue([
+        {
+          model: DEFAULT_GEMINI_MODEL,
+          maxAttempts: 2,
+          actions: {},
+          stateTransitions: {},
+        },
+        {
+          model: 'gemini-2.5-flash',
+          maxAttempts: 4,
+          isLastResort: true,
+          actions: {},
+          stateTransitions: {},
+        },
+      ]);
+      const mockAvailabilityService = createAvailabilityServiceMock();
+      vi.mocked(
+        mockAvailabilityService.selectFirstAvailable,
+      ).mockImplementation((models: readonly string[]) => ({
+        selectedModel: models[0],
+        skipped: [],
+      }));
+      mockConfig.getModelAvailabilityService = vi
+        .fn()
+        .mockReturnValue(mockAvailabilityService);
+
+      mockRetryWithBackoff.mockImplementationOnce((apiCall, options) =>
+        actualRetryWithBackoff(apiCall, {
+          ...options,
+          initialDelayMs: 1,
+          maxDelayMs: 2,
+        }),
+      );
+
+      let callCount = 0;
+      vi.mocked(mockContentGenerator.generateContentStream).mockImplementation(
+        async () => {
+          callCount++;
+          if (callCount === 1) {
+            activeModel = 'gemini-2.5-flash';
+            throw Object.assign(new Error('Service Unavailable'), {
+              status: 503,
+            });
+          }
+          if (callCount === 2) {
+            throw Object.assign(new Error('Service Unavailable'), {
+              status: 503,
+            });
+          }
+          return (async function* () {
+            yield {
+              candidates: [
+                {
+                  content: { parts: [{ text: 'Success' }] },
+                  finishReason: 'STOP',
+                },
+              ],
+            } as unknown as GenerateContentResponse;
+          })();
+        },
+      );
+
+      const stream = await chat.sendMessageStream(
+        { model: DEFAULT_GEMINI_MODEL },
+        'test message',
+        'prompt-main-1',
+        new AbortController().signal,
+        LlmRole.MAIN,
+      );
+      for await (const _ of stream) {
+        // consume
+      }
+
+      expect(emittedRetries).toHaveLength(2);
+      expect(emittedRetries[0]).toEqual(
+        expect.objectContaining({
+          attempt: 1,
+          model: DEFAULT_GEMINI_MODEL,
+          maxAttempts: 2,
+          role: LlmRole.MAIN,
+          promptId: 'prompt-main-1',
+          status: 503,
+        }),
+      );
+      expect(emittedRetries[1]).toEqual(
+        expect.objectContaining({
+          attempt: 2,
+          model: 'gemini-2.5-flash',
+          maxAttempts: 4,
+          role: LlmRole.MAIN,
+          promptId: 'prompt-main-1',
+          status: 503,
+        }),
+      );
+    } finally {
+      coreEvents.off(CoreEvent.RetryAttempt, listener);
+    }
   });
 });

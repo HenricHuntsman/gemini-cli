@@ -13,11 +13,15 @@ import {
   type ToolResult,
   type PolicyUpdateOptions,
   type ToolConfirmationOutcome,
+  type ReadManyFilesResult,
+  type ExecuteOptions,
 } from './tools.js';
 import { getErrorMessage } from '../utils/errors.js';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import { glob, escape } from 'glob';
+import picomatch from 'picomatch';
+import { LRUCache } from 'mnemonist';
 import { buildParamArgsPattern } from '../policy/utils.js';
 import {
   detectFileType,
@@ -36,7 +40,10 @@ import { getProgrammingLanguage } from '../telemetry/telemetry-utils.js';
 import { logFileOperation } from '../telemetry/loggers.js';
 import { FileOperationEvent } from '../telemetry/types.js';
 import { ToolErrorType } from './tool-error.js';
-import { READ_MANY_FILES_TOOL_NAME } from './tool-names.js';
+import {
+  READ_MANY_FILES_TOOL_NAME,
+  READ_MANY_FILES_DISPLAY_NAME,
+} from './tool-names.js';
 import { READ_MANY_FILES_DEFINITION } from './definitions/coreTools.js';
 import { resolveToolDeclaration } from './definitions/resolver.js';
 
@@ -117,6 +124,57 @@ function getDefaultExcludes(config?: Config): string[] {
 const DEFAULT_OUTPUT_SEPARATOR_FORMAT = '--- {filePath} ---';
 const DEFAULT_OUTPUT_TERMINATOR = `\n${REFERENCE_CONTENT_END}`;
 
+/**
+ * Determines whether a non-text asset file (image, PDF, audio) was explicitly requested
+ * by name or extension in the include patterns, rather than matched by an indiscriminate
+ * directory traversal or unrelated glob pattern.
+ */
+export function isAssetExplicitlyRequested(
+  include: string[],
+  relativePath: string,
+  filePath: string,
+  matcherCache?: LRUCache<string, (target: string) => boolean>,
+): boolean {
+  const normalizedPath = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  const normalizedFilePath = filePath.replace(/\\/g, '/');
+  const fileName = path.posix.basename(normalizedFilePath);
+
+  return include.some((pattern) => {
+    const normalizedPattern = pattern.replace(/\\/g, '/').replace(/^\.\//, '');
+
+    // 1. Check if this pattern matches the file path
+    let isMatchPath = matcherCache?.get(normalizedPattern);
+    if (!isMatchPath) {
+      isMatchPath = picomatch(normalizedPattern, {
+        nocase: true,
+        dot: true,
+      });
+      matcherCache?.set(normalizedPattern, isMatchPath);
+    }
+
+    let matches = isMatchPath(normalizedPath);
+    if (!matches && !normalizedPattern.includes('/')) {
+      matches = isMatchPath(fileName);
+    }
+    if (!matches) {
+      return false;
+    }
+
+    // 2. Check if the pattern terminal segment explicitly targets this asset
+    const lastSegment = normalizedPattern.split('/').pop() ?? '';
+    if (
+      !lastSegment ||
+      lastSegment === '*' ||
+      lastSegment === '**' ||
+      lastSegment === '*.*'
+    ) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
 class ReadManyFilesToolInvocation extends BaseToolInvocation<
   ReadManyFilesParams,
   ToolResult
@@ -132,9 +190,9 @@ class ReadManyFilesToolInvocation extends BaseToolInvocation<
   }
 
   getDescription(): string {
-    const pathDesc = `using patterns: 
+    const pathDesc = `using patterns:
 ${this.params.include.join('`, `')}
- (within target directory: 
+ (within target directory:
 ${this.config.getTargetDir()}
 ) `;
 
@@ -148,7 +206,7 @@ ${this.config.getTargetDir()}
 
     const excludeDesc = `Excluding: ${
       finalExclusionPatternsForDescription.length > 0
-        ? `patterns like 
+        ? `patterns like
 ${finalExclusionPatternsForDescription
   .slice(0, 2)
   .join(
@@ -171,7 +229,7 @@ ${finalExclusionPatternsForDescription
     };
   }
 
-  async execute(signal: AbortSignal): Promise<ToolResult> {
+  async execute({ abortSignal: signal }: ExecuteOptions): Promise<ToolResult> {
     const { include, exclude = [], useDefaultExcludes = true } = this.params;
 
     const filesToConsider = new Set<string>();
@@ -194,8 +252,8 @@ ${finalExclusionPatternsForDescription
           const fullPath = path.join(dir, normalizedP);
           let exists = false;
           try {
-            await fsPromises.access(fullPath);
-            exists = true;
+            const st = await fsPromises.stat(fullPath);
+            exists = st.isFile();
           } catch {
             exists = false;
           }
@@ -269,7 +327,7 @@ ${finalExclusionPatternsForDescription
       const errorMessage = `Error during file search: ${getErrorMessage(error)}`;
       return {
         llmContent: errorMessage,
-        returnDisplay: `## File Search Error\n\nAn error occurred while searching for files:\n\`\`\`\n${getErrorMessage(error)}\n\`\`\``,
+        returnDisplay: `Error: ${getErrorMessage(error)}`,
         error: {
           message: errorMessage,
           type: ToolErrorType.READ_MANY_FILES_SEARCH_ERROR,
@@ -278,6 +336,7 @@ ${finalExclusionPatternsForDescription
     }
 
     const sortedFiles = Array.from(filesToConsider).sort();
+    const matcherCache = new LRUCache<string, (target: string) => boolean>(100);
 
     const fileProcessingPromises = sortedFiles.map(
       async (filePath): Promise<FileProcessingResult> => {
@@ -293,15 +352,11 @@ ${finalExclusionPatternsForDescription
             fileType === 'pdf' ||
             fileType === 'audio'
           ) {
-            const fileExtension = path.extname(filePath).toLowerCase();
-            const fileNameWithoutExtension = path.basename(
+            const requestedExplicitly = isAssetExplicitlyRequested(
+              include,
+              relativePathForDisplay,
               filePath,
-              fileExtension,
-            );
-            const requestedExplicitly = include.some(
-              (pattern: string) =>
-                pattern.toLowerCase().includes(fileExtension) ||
-                pattern.includes(fileNameWithoutExtension),
+              matcherCache,
             );
 
             if (!requestedExplicitly) {
@@ -416,14 +471,19 @@ ${finalExclusionPatternsForDescription
       }
     }
 
-    // Discover JIT subdirectory context for all unique directories of processed files
+    // Discover JIT subdirectory context for all unique directories of processed files.
+    // Run sequentially so each call sees paths marked as loaded by the previous
+    // one, preventing shared parent GEMINI.md files from being injected twice.
     const uniqueDirs = new Set(
       Array.from(filesToConsider).map((f) => path.dirname(f)),
     );
-    const jitResults = await Promise.all(
-      Array.from(uniqueDirs).map((dir) => discoverJitContext(this.config, dir)),
-    );
-    const jitParts = jitResults.filter(Boolean);
+    const jitParts: string[] = [];
+    for (const dir of uniqueDirs) {
+      const ctx = await discoverJitContext(this.config, dir);
+      if (ctx) {
+        jitParts.push(ctx);
+      }
+    }
     if (jitParts.length > 0) {
       contentParts.push(
         `${JIT_CONTEXT_PREFIX}${jitParts.join('\n')}${JIT_CONTEXT_SUFFIX}`,
@@ -478,9 +538,19 @@ ${finalExclusionPatternsForDescription
         'No files matching the criteria were found or all were skipped.',
       );
     }
+
+    const returnDisplay: ReadManyFilesResult = {
+      summary: displayMessage.trim(),
+      files: processedFilesRelativePaths,
+      skipped: skippedFiles,
+      include: this.params.include,
+      excludes: effectiveExcludes,
+      targetDir: this.config.getTargetDir(),
+    };
+
     return {
       llmContent: contentParts,
-      returnDisplay: displayMessage.trim(),
+      returnDisplay,
     };
   }
 }
@@ -502,7 +572,7 @@ export class ReadManyFilesTool extends BaseDeclarativeTool<
   ) {
     super(
       ReadManyFilesTool.Name,
-      'ReadManyFiles',
+      READ_MANY_FILES_DISPLAY_NAME,
       READ_MANY_FILES_DEFINITION.base.description!,
       Kind.Read,
       READ_MANY_FILES_DEFINITION.base.parametersJsonSchema,

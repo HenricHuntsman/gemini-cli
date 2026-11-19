@@ -53,13 +53,54 @@ const RETRYABLE_NETWORK_CODES = [
   'ENOTFOUND',
   'EAI_AGAIN',
   'ECONNREFUSED',
-  // SSL/TLS transient errors
-  'ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC',
   'ERR_SSL_WRONG_VERSION_NUMBER',
-  'ERR_SSL_DECRYPTION_FAILED_OR_BAD_RECORD_MAC',
-  'ERR_SSL_BAD_RECORD_MAC',
   'EPROTO', // Generic protocol error (often SSL-related)
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'ERR_STREAM_PREMATURE_CLOSE',
 ];
+
+const NON_RETRYABLE_NETWORK_CODES = [
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'EHOSTDOWN',
+  'EACCES',
+  'EPERM',
+  'ERR_INVALID_URL',
+  'UND_ERR_INVALID_ARG',
+  'UND_ERR_NOT_SUPPORTED',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'CERT_HAS_EXPIRED',
+  'CERT_NOT_YET_VALID',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'CERT_UNTRUSTED',
+];
+
+// Node.js builds SSL error codes by prepending ERR_SSL_ to the uppercased
+// OpenSSL reason string with spaces replaced by underscores (see
+// TLSWrap::ClearOut in node/src/crypto/crypto_tls.cc). The reason string
+// format varies by OpenSSL version (e.g. ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC
+// on OpenSSL 1.x, ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC on OpenSSL 3.x), so
+// match the stable suffix instead of enumerating every variant.
+const RETRYABLE_SSL_ERROR_PATTERN = /^ERR_SSL_.*BAD_RECORD_MAC/i;
+
+/**
+ * Returns true if the error code should be retried: either an exact match
+ * against RETRYABLE_NETWORK_CODES, or an SSL BAD_RECORD_MAC variant (the
+ * OpenSSL reason-string portion of the code varies across OpenSSL versions).
+ */
+function isRetryableSslErrorCode(code: string): boolean {
+  return (
+    RETRYABLE_NETWORK_CODES.includes(code) ||
+    RETRYABLE_SSL_ERROR_PATTERN.test(code)
+  );
+}
 
 function getNetworkErrorCode(error: unknown): string | undefined {
   const getCode = (obj: unknown): string | undefined => {
@@ -112,7 +153,7 @@ export function getRetryErrorType(error: unknown): string {
   }
 
   const errorCode = getNetworkErrorCode(error);
-  if (errorCode && RETRYABLE_NETWORK_CODES.includes(errorCode)) {
+  if (errorCode && isRetryableSslErrorCode(errorCode)) {
     return errorCode;
   }
 
@@ -153,8 +194,13 @@ export function isRetryableError(
 ): boolean {
   // Check for common network error codes
   const errorCode = getNetworkErrorCode(error);
-  if (errorCode && RETRYABLE_NETWORK_CODES.includes(errorCode)) {
-    return true;
+  if (errorCode) {
+    if (isRetryableSslErrorCode(errorCode)) {
+      return true;
+    }
+    if (NON_RETRYABLE_NETWORK_CODES.includes(errorCode)) {
+      return false;
+    }
   }
 
   if (retryFetchErrors && error instanceof Error) {
@@ -186,6 +232,46 @@ export function isRetryableError(
   }
 
   return false;
+}
+
+/**
+ * Enriches quota-related errors with helpful hints if using a shared Google project
+ * without a dedicated user project set in their environment.
+ */
+function enrichQuotaError(error: Error, authType?: string): Error {
+  const isQuotaError =
+    error instanceof TerminalQuotaError ||
+    error instanceof RetryableQuotaError ||
+    error.name === 'TerminalQuotaError' ||
+    error.name === 'RetryableQuotaError';
+
+  if (
+    isQuotaError &&
+    (authType === 'oauth-personal' ||
+      authType === 'compute-default-credentials' ||
+      authType === 'LOGIN_WITH_GOOGLE' ||
+      authType === 'COMPUTE_ADC')
+  ) {
+    const hasUserProject = !!(
+      process.env['GOOGLE_CLOUD_PROJECT'] ||
+      process.env['GOOGLE_CLOUD_PROJECT_ID']
+    );
+    if (!hasUserProject) {
+      const enrichment =
+        '\n\n💡 Tip: The shared Google Cloud project is experiencing high traffic and has hit its quota limits. ' +
+        'To get dedicated, uninterrupted quota, please set your own Google Cloud project by running:\n' +
+        '  gcloud config set project [PROJECT_ID]\n' +
+        'or by setting the GOOGLE_CLOUD_PROJECT environment variable.';
+      if (!error.message.includes('💡 Tip:')) {
+        Object.defineProperty(error, 'message', {
+          value: error.message + enrichment,
+          writable: true,
+          configurable: true,
+        });
+      }
+    }
+  }
+  return error;
 }
 
 /**
@@ -230,10 +316,22 @@ export async function retryWithBackoff<T>(
     ...cleanOptions,
   };
 
-  let attempt = 0;
-  let currentDelay = initialDelayMs;
+  const getCurrentMaxAttempts = () =>
+    getAvailabilityContext?.()?.policy.maxAttempts ?? maxAttempts;
 
-  while (attempt < maxAttempts) {
+  let attempt = 0;
+  let capacityAttempts = 0;
+  let validationAttempts = 0;
+  const MAX_SILENT_CAPACITY_ATTEMPTS = 3;
+  const MAX_VALIDATION_ATTEMPTS = 3;
+  let currentDelay = initialDelayMs;
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      throw createAbortError();
+    }
+  };
+
+  while (attempt < getCurrentMaxAttempts()) {
     if (signal?.aborted) {
       throw createAbortError();
     }
@@ -246,6 +344,7 @@ export async function retryWithBackoff<T>(
         // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         shouldRetryOnContent(result as GenerateContentResponse)
       ) {
+        throwIfAborted();
         const jitter = currentDelay * 0.3 * (Math.random() * 2 - 1);
         const delayWithJitter = Math.max(0, currentDelay + jitter);
         if (onRetry) {
@@ -266,8 +365,9 @@ export async function retryWithBackoff<T>(
       if (error instanceof Error && error.name === 'AbortError') {
         throw error;
       }
+      throwIfAborted();
 
-      const classifiedError = classifyGoogleError(error);
+      let classifiedError = classifyGoogleError(error);
 
       const errorCode = getErrorStatus(error);
 
@@ -275,32 +375,110 @@ export async function retryWithBackoff<T>(
         classifiedError instanceof TerminalQuotaError ||
         classifiedError instanceof ModelNotFoundError
       ) {
-        if (onPersistent429) {
-          try {
-            const fallbackModel = await onPersistent429(
-              authType,
-              classifiedError,
-            );
-            if (fallbackModel) {
-              attempt = 0; // Reset attempts and retry with the new model.
-              currentDelay = initialDelayMs;
-              continue;
+        // Fall back to automatic retry for capacity exhaustion in unattended/non-interactive mode,
+        // or allow up to 3 silent retries in interactive mode before prompting the fallback dialog.
+        const hasShortDelay =
+          classifiedError instanceof TerminalQuotaError &&
+          classifiedError.retryDelayMs !== undefined &&
+          classifiedError.retryDelayMs <= maxDelayMs;
+
+        const isCapacityExceeded =
+          classifiedError instanceof TerminalQuotaError &&
+          (classifiedError.reason === 'QUOTA_EXHAUSTED' ||
+          /quota will reset after/i.test(classifiedError.message)
+            ? hasShortDelay
+            : (classifiedError.reason === 'MODEL_CAPACITY_EXHAUSTED' ||
+                classifiedError.reason === 'MODEL_CAPACITY_EXCEEDED' ||
+                /capacity exceeded|MODEL_CAPACITY_EXHAUSTED|exhausted your capacity/i.test(
+                  classifiedError.message,
+                )) &&
+              (classifiedError.retryDelayMs === undefined ||
+                classifiedError.retryDelayMs <= maxDelayMs));
+
+        let useSilentRetry = false;
+        let silentDelayMs: number | undefined;
+
+        if (
+          classifiedError instanceof TerminalQuotaError &&
+          isCapacityExceeded
+        ) {
+          if (!onPersistent429) {
+            // Unattended mode: always retry up to standard maxAttempts
+            if (
+              classifiedError.retryDelayMs === undefined ||
+              classifiedError.retryDelayMs <= maxDelayMs
+            ) {
+              useSilentRetry = true;
+              silentDelayMs = classifiedError.retryDelayMs;
             }
-          } catch (fallbackError) {
-            debugLogger.warn('Fallback to Flash model failed:', fallbackError);
+          } else {
+            // Interactive mode: allow up to 3 silent retries with progressive backoff before calling fallback handler
+            capacityAttempts++;
+            if (capacityAttempts < MAX_SILENT_CAPACITY_ATTEMPTS) {
+              if (
+                classifiedError.retryDelayMs === undefined ||
+                classifiedError.retryDelayMs <= maxDelayMs
+              ) {
+                useSilentRetry = true;
+                silentDelayMs =
+                  classifiedError.retryDelayMs !== undefined
+                    ? classifiedError.retryDelayMs
+                    : Math.min(
+                        maxDelayMs,
+                        capacityAttempts === 1 ? 1000 : 3000,
+                      ); // 1s on attempt 1, 3s on attempt 2 (capped by maxDelayMs)
+              }
+            }
           }
         }
-        // Terminal/not_found already recorded; nothing else to mark here.
-        throw classifiedError; // Throw if no fallback or fallback failed.
+
+        if (useSilentRetry && classifiedError instanceof TerminalQuotaError) {
+          const retryable = new RetryableQuotaError(
+            classifiedError.message,
+            classifiedError.cause,
+          );
+          if (silentDelayMs !== undefined) {
+            retryable.retryDelayMs = silentDelayMs;
+            currentDelay = silentDelayMs;
+          }
+          classifiedError = retryable;
+        } else {
+          if (onPersistent429) {
+            try {
+              const fallbackModel = await onPersistent429(
+                authType,
+                classifiedError,
+              );
+              if (fallbackModel) {
+                attempt = 0; // Reset attempts and retry with the new model.
+                currentDelay = initialDelayMs;
+                continue;
+              }
+            } catch (fallbackError) {
+              debugLogger.warn(
+                'Fallback to Flash model failed:',
+                fallbackError,
+              );
+            }
+          }
+          // Terminal/not_found already recorded; nothing else to mark here.
+          throw classifiedError instanceof Error
+            ? enrichQuotaError(classifiedError, authType)
+            : classifiedError; // Throw if no fallback or fallback failed.
+        }
       }
 
       // Handle ValidationRequiredError - user needs to verify before proceeding
       if (classifiedError instanceof ValidationRequiredError) {
-        if (onValidationRequired) {
+        if (
+          onValidationRequired &&
+          validationAttempts < MAX_VALIDATION_ATTEMPTS
+        ) {
+          validationAttempts++;
           try {
             const intent = await onValidationRequired(classifiedError);
             if (intent === 'verify') {
-              // User verified, retry the request
+              // User verified, retry the request (bounded by MAX_VALIDATION_ATTEMPTS)
               attempt = 0;
               currentDelay = initialDelayMs;
               continue;
@@ -318,7 +496,7 @@ export async function retryWithBackoff<T>(
         errorCode !== undefined && errorCode >= 500 && errorCode < 600;
 
       if (classifiedError instanceof RetryableQuotaError || is500) {
-        if (attempt >= maxAttempts) {
+        if (attempt >= getCurrentMaxAttempts()) {
           const errorMessage =
             classifiedError instanceof Error ? classifiedError.message : '';
           debugLogger.warn(
@@ -340,7 +518,7 @@ export async function retryWithBackoff<T>(
             }
           }
           throw classifiedError instanceof RetryableQuotaError
-            ? classifiedError
+            ? enrichQuotaError(classifiedError, authType)
             : error;
         }
 
@@ -348,10 +526,13 @@ export async function retryWithBackoff<T>(
           classifiedError instanceof RetryableQuotaError &&
           classifiedError.retryDelayMs !== undefined
         ) {
+          if (classifiedError.retryDelayMs > maxDelayMs) {
+            throw enrichQuotaError(classifiedError, authType);
+          }
           currentDelay = Math.max(currentDelay, classifiedError.retryDelayMs);
           // Positive jitter up to +20% while respecting server minimum delay
           const jitter = currentDelay * 0.2 * Math.random();
-          const delayWithJitter = currentDelay + jitter;
+          const delayWithJitter = Math.min(maxDelayMs, currentDelay + jitter);
           debugLogger.warn(
             `Attempt ${attempt} failed: ${classifiedError.message}. Retrying after ${Math.round(delayWithJitter)}ms...`,
           );
@@ -379,7 +560,7 @@ export async function retryWithBackoff<T>(
 
       // Generic retry logic for other errors
       if (
-        attempt >= maxAttempts ||
+        attempt >= getCurrentMaxAttempts() ||
         // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
         !shouldRetryOnError(error as Error, retryFetchErrors)
       ) {

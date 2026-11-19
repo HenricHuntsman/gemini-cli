@@ -72,6 +72,11 @@ describe('CloudFreePrivacyNotice', () => {
       expectedText: 'Gemini Code Assist Privacy Notice',
     },
     {
+      stateName: 'tier unavailable state',
+      mockState: { isFreeTier: undefined, isTierUnavailable: true },
+      expectedText: 'GOOGLE_CLOUD_PROJECT',
+    },
+    {
       stateName: 'free tier state',
       mockState: { isFreeTier: true },
       expectedText: 'Gemini Code Assist for Individuals Privacy Notice',
@@ -82,10 +87,9 @@ describe('CloudFreePrivacyNotice', () => {
       updateDataCollectionOptIn,
     });
 
-    const { lastFrame, waitUntilReady, unmount } = render(
+    const { lastFrame, unmount } = await render(
       <CloudFreePrivacyNotice config={mockConfig} onExit={onExit} />,
     );
-    await waitUntilReady();
 
     expect(lastFrame()).toContain(expectedText);
     unmount();
@@ -103,6 +107,11 @@ describe('CloudFreePrivacyNotice', () => {
       shouldExit: true,
     },
     {
+      stateName: 'tier unavailable state',
+      mockState: { isFreeTier: undefined, isTierUnavailable: true },
+      shouldExit: true,
+    },
+    {
       stateName: 'free tier state (no selection)',
       mockState: { isFreeTier: true },
       shouldExit: false,
@@ -115,10 +124,9 @@ describe('CloudFreePrivacyNotice', () => {
         updateDataCollectionOptIn,
       });
 
-      const { waitUntilReady, unmount } = render(
+      const { waitUntilReady, unmount } = await render(
         <CloudFreePrivacyNotice config={mockConfig} onExit={onExit} />,
       );
-      await waitUntilReady();
 
       const keypressHandler = mockedUseKeypress.mock.calls[0][0];
       await act(async () => {
@@ -138,6 +146,26 @@ describe('CloudFreePrivacyNotice', () => {
     },
   );
 
+  it('provides renderItem to RadioButtonSelect that wraps option text without truncation', async () => {
+    const { unmount } = await render(
+      <CloudFreePrivacyNotice config={mockConfig} onExit={onExit} />,
+    );
+
+    const selectProps = mockedRadioButtonSelect.mock.calls[0][0];
+    expect(selectProps.renderItem).toBeDefined();
+
+    // Verify renderItem output has wrap="wrap"
+    const rendered = selectProps.renderItem(selectProps.items[0], {
+      titleColor: 'green',
+    });
+    expect(rendered.props.children.props.wrap).toBe('wrap');
+    expect(rendered.props.children.props.children).toBe(
+      'Yes, grant permission to use my data for product improvement (Opt-in)',
+    );
+
+    unmount();
+  });
+
   describe('RadioButtonSelect interaction', () => {
     it.each([
       { selection: true, label: 'Yes' },
@@ -145,10 +173,9 @@ describe('CloudFreePrivacyNotice', () => {
     ])(
       'calls correct functions on selecting "$label"',
       async ({ selection }) => {
-        const { waitUntilReady, unmount } = render(
+        const { waitUntilReady, unmount } = await render(
           <CloudFreePrivacyNotice config={mockConfig} onExit={onExit} />,
         );
-        await waitUntilReady();
 
         const onSelectHandler =
           mockedRadioButtonSelect.mock.calls[0][0].onSelect;

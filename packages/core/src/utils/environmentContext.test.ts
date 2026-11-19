@@ -90,6 +90,7 @@ describe('getEnvironmentContext', () => {
       getFileService: vi.fn(),
       getIncludeDirectoryTree: vi.fn().mockReturnValue(true),
       getEnvironmentMemory: vi.fn().mockReturnValue('Mock Environment Memory'),
+      getSessionMemory: vi.fn().mockReturnValue('Mock Session Memory'),
 
       getToolRegistry: vi.fn().mockReturnValue(mockToolRegistry),
       storage: {
@@ -116,7 +117,7 @@ describe('getEnvironmentContext', () => {
     expect(context).toContain(
       '- **Directory Structure:**\n\nMock Folder Structure',
     );
-    expect(context).toContain('Mock Environment Memory');
+    expect(context).toContain('Mock Session Memory');
     expect(context).toContain('</session_context>');
     expect(getFolderStructure).toHaveBeenCalledWith('/test/dir', {
       fileService: undefined,
@@ -160,32 +161,29 @@ describe('getEnvironmentContext', () => {
     expect(context).toContain('<session_context>');
     expect(context).not.toContain('Directory Structure:');
     expect(context).not.toContain('Mock Folder Structure');
-    expect(context).toContain('Mock Environment Memory');
+    expect(context).toContain('Mock Session Memory');
     expect(context).toContain('</session_context>');
     expect(getFolderStructure).not.toHaveBeenCalled();
   });
 
-  it('should exclude environment memory when JIT context is enabled', async () => {
-    (mockConfig as Record<string, unknown>)['isJitContextEnabled'] = vi
+  it('should use session memory instead of environment memory', async () => {
+    (mockConfig as Record<string, unknown>)['getSessionMemory'] = vi
       .fn()
-      .mockReturnValue(true);
+      .mockReturnValue(
+        '\n<loaded_context>\n<extension_context>\nExt Memory\n</extension_context>\n<project_context>\nProj Memory\n</project_context>\n</loaded_context>',
+      );
 
     const parts = await getEnvironmentContext(mockConfig as Config);
 
     const context = parts[0].text;
     expect(context).not.toContain('Mock Environment Memory');
     expect(mockConfig.getEnvironmentMemory).not.toHaveBeenCalled();
-  });
-
-  it('should include environment memory when JIT context is disabled', async () => {
-    (mockConfig as Record<string, unknown>)['isJitContextEnabled'] = vi
-      .fn()
-      .mockReturnValue(false);
-
-    const parts = await getEnvironmentContext(mockConfig as Config);
-
-    const context = parts[0].text;
-    expect(context).toContain('Mock Environment Memory');
+    expect(context).toContain('<loaded_context>');
+    expect(context).toContain('<extension_context>');
+    expect(context).toContain('Ext Memory');
+    expect(context).toContain('<project_context>');
+    expect(context).toContain('Proj Memory');
+    expect(context).toContain('</loaded_context>');
   });
 
   it('should handle read_many_files returning no content', async () => {

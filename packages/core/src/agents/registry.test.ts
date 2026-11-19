@@ -5,7 +5,11 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { AgentRegistry, getModelConfigAlias } from './registry.js';
+import {
+  AgentRegistry,
+  getModelConfigAlias,
+  DYNAMIC_RULE_SOURCE,
+} from './registry.js';
 import { makeFakeConfig } from '../test-utils/config.js';
 import type { AgentDefinition, LocalAgentDefinition } from './types.js';
 import type {
@@ -15,7 +19,7 @@ import type {
 } from '../config/config.js';
 import { debugLogger } from '../utils/debugLogger.js';
 import { coreEvents, CoreEvent } from '../utils/events.js';
-import { A2AClientManager } from './a2a-client-manager.js';
+import type { A2AClientManager } from './a2a-client-manager.js';
 import {
   DEFAULT_GEMINI_FLASH_LITE_MODEL,
   DEFAULT_GEMINI_MODEL,
@@ -40,9 +44,7 @@ vi.mock('./agentLoader.js', () => ({
 }));
 
 vi.mock('./a2a-client-manager.js', () => ({
-  A2AClientManager: {
-    getInstance: vi.fn(),
-  },
+  A2AClientManager: vi.fn(),
 }));
 
 vi.mock('./auth-provider/factory.js', () => ({
@@ -248,11 +250,11 @@ describe('AgentRegistry', () => {
       };
 
       vi.mocked(tomlLoader.loadAgentsFromDirectory)
-        .mockResolvedValueOnce({ agents: [userAgent], errors: [] }) // User dir
         .mockResolvedValueOnce({
           agents: [projectAgent, uniqueProjectAgent],
           errors: [],
-        }); // Project dir
+        }) // Project dir
+        .mockResolvedValueOnce({ agents: [userAgent], errors: [] }); // User dir
 
       await registry.initialize();
 
@@ -264,6 +266,131 @@ describe('AgentRegistry', () => {
       expect(
         vi.mocked(tomlLoader.loadAgentsFromDirectory),
       ).toHaveBeenCalledTimes(2);
+    });
+
+    it('should NOT load project agents or emit duplicate warning when workspace is the user home directory', async () => {
+      mockConfig = makeMockedConfig({ enableAgents: true });
+      vi.spyOn(mockConfig.storage, 'isWorkspaceHomeDir').mockReturnValue(true);
+
+      const feedbackSpy = vi
+        .spyOn(coreEvents, 'emitFeedback')
+        .mockImplementation(() => {});
+
+      const homeAgent = {
+        ...MOCK_AGENT_V1,
+        name: 'home-agent',
+        description: 'Home agent',
+      };
+
+      vi.mocked(tomlLoader.loadAgentsFromDirectory).mockResolvedValue({
+        agents: [homeAgent],
+        errors: [],
+      });
+
+      registry = new TestableAgentRegistry(mockConfig);
+      await registry.initialize();
+
+      // Only user agents directory should be loaded (1 time), not both project and user (2 times)
+      expect(
+        vi.mocked(tomlLoader.loadAgentsFromDirectory),
+      ).toHaveBeenCalledTimes(1);
+
+      // Verify the agent was successfully registered as a user agent
+      expect(registry.getDefinition('home-agent')).toBeDefined();
+
+      // No duplicate agent warning should be emitted
+      expect(feedbackSpy).not.toHaveBeenCalledWith(
+        'warning',
+        expect.stringContaining("Duplicate agent name 'home-agent' detected"),
+      );
+    });
+
+    it('should NOT emit untrusted folder warning when workspace is the user home directory even if folder trust is enabled and untrusted', async () => {
+      mockConfig = makeMockedConfig({ enableAgents: true });
+      vi.spyOn(mockConfig.storage, 'isWorkspaceHomeDir').mockReturnValue(true);
+      vi.spyOn(mockConfig, 'getFolderTrust').mockReturnValue(true);
+      vi.spyOn(mockConfig, 'isTrustedFolder').mockReturnValue(false);
+
+      const feedbackSpy = vi
+        .spyOn(coreEvents, 'emitFeedback')
+        .mockImplementation(() => {});
+
+      const homeAgent = {
+        ...MOCK_AGENT_V1,
+        name: 'home-agent',
+        description: 'Home agent',
+      };
+
+      vi.mocked(tomlLoader.loadAgentsFromDirectory).mockResolvedValue({
+        agents: [homeAgent],
+        errors: [],
+      });
+
+      registry = new TestableAgentRegistry(mockConfig);
+      await registry.initialize();
+
+      // Only user agents directory should be loaded
+      expect(
+        vi.mocked(tomlLoader.loadAgentsFromDirectory),
+      ).toHaveBeenCalledTimes(1);
+
+      // Should NOT emit untrusted folder info feedback
+      expect(feedbackSpy).not.toHaveBeenCalledWith(
+        'info',
+        expect.stringContaining(
+          'Skipping project agents due to untrusted folder',
+        ),
+      );
+
+      // Verify the home agent was still loaded from user directory
+      expect(registry.getDefinition('home-agent')).toBeDefined();
+    });
+
+    it('should NOT load project agents or emit duplicate warning upon reload when workspace is the user home directory', async () => {
+      mockConfig = makeMockedConfig({ enableAgents: true });
+      vi.spyOn(mockConfig.storage, 'isWorkspaceHomeDir').mockReturnValue(true);
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
+        clearCache: vi.fn(),
+        loadAgent: vi.fn(),
+      } as unknown as A2AClientManager);
+
+      const feedbackSpy = vi
+        .spyOn(coreEvents, 'emitFeedback')
+        .mockImplementation(() => {});
+
+      const homeAgent = {
+        ...MOCK_AGENT_V1,
+        name: 'home-agent',
+        description: 'Home agent',
+      };
+
+      vi.mocked(tomlLoader.loadAgentsFromDirectory).mockResolvedValue({
+        agents: [homeAgent],
+        errors: [],
+      });
+
+      registry = new TestableAgentRegistry(mockConfig);
+      await registry.initialize();
+
+      // Initial load should call loadAgentsFromDirectory once
+      expect(
+        vi.mocked(tomlLoader.loadAgentsFromDirectory),
+      ).toHaveBeenCalledTimes(1);
+
+      // Reload
+      const reloadSummary = await registry.reload();
+      expect(reloadSummary.errors).toHaveLength(0);
+
+      // Reload should only have invoked loadAgentsFromDirectory once more (total 2 times, 1 per reload)
+      expect(
+        vi.mocked(tomlLoader.loadAgentsFromDirectory),
+      ).toHaveBeenCalledTimes(2);
+
+      // No duplicate agent warning should be emitted during reload
+      expect(feedbackSpy).not.toHaveBeenCalledWith(
+        'warning',
+        expect.stringContaining("Duplicate agent name 'home-agent' detected"),
+      );
     });
 
     it('should NOT load TOML agents when enableAgents is false', async () => {
@@ -285,6 +412,17 @@ describe('AgentRegistry', () => {
       expect(
         vi.mocked(tomlLoader.loadAgentsFromDirectory),
       ).not.toHaveBeenCalled();
+    });
+
+    it('should NOT load built-in agents when enableAgents is false (without per-agent overrides)', async () => {
+      const disabledConfig = makeMockedConfig({
+        enableAgents: false,
+      });
+      const disabledRegistry = new TestableAgentRegistry(disabledConfig);
+
+      await disabledRegistry.initialize();
+
+      expect(disabledRegistry.getAllDefinitions()).toHaveLength(0);
     });
 
     it('should register CLI help agent by default', async () => {
@@ -450,14 +588,14 @@ describe('AgentRegistry', () => {
       );
 
       // Mock A2AClientManager to avoid network calls
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({ name: 'RemoteAgent' }),
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
 
       await registry.initialize();
 
-      // Verify ackService was called with the URL, not the file hash
+      // Verify ackService was called with the raw URL to avoid breaking changes
       expect(ackService.isAcknowledged).toHaveBeenCalledWith(
         expect.anything(),
         'RemoteAgent',
@@ -465,7 +603,6 @@ describe('AgentRegistry', () => {
       );
 
       // Also verify that the agent's metadata was updated to use the URL as hash
-      // Use getDefinition because registerAgent might have been called
       expect(registry.getDefinition('RemoteAgent')?.metadata?.hash).toBe(
         'https://example.com/card',
       );
@@ -548,7 +685,7 @@ describe('AgentRegistry', () => {
         inputConfig: { inputSchema: { type: 'object' } },
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({ name: 'RemoteAgent' }),
       } as unknown as A2AClientManager);
 
@@ -583,7 +720,7 @@ describe('AgentRegistry', () => {
       const loadAgentSpy = vi
         .fn()
         .mockResolvedValue({ name: 'RemoteAgentWithAuth' });
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: loadAgentSpy,
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
@@ -598,7 +735,7 @@ describe('AgentRegistry', () => {
       });
       expect(loadAgentSpy).toHaveBeenCalledWith(
         'RemoteAgentWithAuth',
-        'https://example.com/card',
+        { type: 'url', url: 'https://example.com/card' },
         mockHandler,
       );
       expect(registry.getDefinition('RemoteAgentWithAuth')).toEqual(
@@ -622,7 +759,7 @@ describe('AgentRegistry', () => {
 
       vi.mocked(A2AAuthProviderFactory.create).mockResolvedValue(undefined);
       const loadAgentSpy = vi.fn();
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: loadAgentSpy,
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
@@ -645,6 +782,9 @@ describe('AgentRegistry', () => {
     it('should log remote agent registration in debug mode', async () => {
       const debugConfig = makeMockedConfig({ debugMode: true });
       const debugRegistry = new TestableAgentRegistry(debugConfig);
+      vi.spyOn(debugConfig, 'getA2AClientManager').mockReturnValue({
+        loadAgent: vi.fn().mockResolvedValue({ name: 'RemoteAgent' }),
+      } as unknown as A2AClientManager);
       const debugLogSpy = vi
         .spyOn(debugLogger, 'log')
         .mockImplementation(() => {});
@@ -656,10 +796,6 @@ describe('AgentRegistry', () => {
         agentCardUrl: 'https://example.com/card',
         inputConfig: { inputSchema: { type: 'object' } },
       };
-
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
-        loadAgent: vi.fn().mockResolvedValue({ name: 'RemoteAgent' }),
-      } as unknown as A2AClientManager);
 
       await debugRegistry.testRegisterAgent(remoteAgent);
 
@@ -688,7 +824,7 @@ describe('AgentRegistry', () => {
         new Error('ECONNREFUSED'),
       );
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockRejectedValue(a2aError),
       } as unknown as A2AClientManager);
 
@@ -714,7 +850,7 @@ describe('AgentRegistry', () => {
         inputConfig: { inputSchema: { type: 'object' } },
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockRejectedValue(new Error('unexpected crash')),
       } as unknown as A2AClientManager);
 
@@ -749,7 +885,7 @@ describe('AgentRegistry', () => {
         // No auth configured
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({
           name: 'SecuredAgent',
           securitySchemes: {
@@ -783,7 +919,7 @@ describe('AgentRegistry', () => {
       };
 
       const error = new Error('401 Unauthorized');
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockRejectedValue(error),
       } as unknown as A2AClientManager);
 
@@ -815,7 +951,7 @@ describe('AgentRegistry', () => {
         ],
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue(mockAgentCard),
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
@@ -843,7 +979,7 @@ describe('AgentRegistry', () => {
         skills: [{ name: 'Skill1', description: 'Desc1' }],
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue(mockAgentCard),
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
@@ -871,7 +1007,7 @@ describe('AgentRegistry', () => {
         skills: [],
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue(mockAgentCard),
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
@@ -902,7 +1038,7 @@ describe('AgentRegistry', () => {
         skills: [{ name: 'Skill1', description: 'Desc1' }],
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue(mockAgentCard),
         clearCache: vi.fn(),
       } as unknown as A2AClientManager);
@@ -930,7 +1066,7 @@ describe('AgentRegistry', () => {
         inputConfig: { inputSchema: { type: 'object' } },
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({
           name: 'EmptyDescAgent',
           description: 'Loaded from card',
@@ -955,7 +1091,7 @@ describe('AgentRegistry', () => {
         inputConfig: { inputSchema: { type: 'object' } },
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({
           name: 'SkillFallbackAgent',
           description: 'Card description',
@@ -1011,7 +1147,7 @@ describe('AgentRegistry', () => {
       );
     });
 
-    it('should overwrite an existing agent definition', async () => {
+    it('should NOT overwrite an existing agent definition', async () => {
       await registry.testRegisterAgent(MOCK_AGENT_V1);
       expect(registry.getDefinition('MockAgent')?.description).toBe(
         'Mock Description V1',
@@ -1019,36 +1155,22 @@ describe('AgentRegistry', () => {
 
       await registry.testRegisterAgent(MOCK_AGENT_V2);
       expect(registry.getDefinition('MockAgent')?.description).toBe(
-        'Mock Description V2 (Updated)',
+        'Mock Description V1',
       );
       expect(registry.getAllDefinitions()).toHaveLength(1);
     });
 
-    it('should log overwrites when in debug mode', async () => {
-      const debugConfig = makeMockedConfig({ debugMode: true });
-      const debugRegistry = new TestableAgentRegistry(debugConfig);
-      const debugLogSpy = vi
-        .spyOn(debugLogger, 'log')
-        .mockImplementation(() => {});
-
-      await debugRegistry.testRegisterAgent(MOCK_AGENT_V1);
-      await debugRegistry.testRegisterAgent(MOCK_AGENT_V2);
-
-      expect(debugLogSpy).toHaveBeenCalledWith(
-        `[AgentRegistry] Overriding agent 'MockAgent'`,
-      );
-    });
-
-    it('should not log overwrites when not in debug mode', async () => {
-      const debugLogSpy = vi
-        .spyOn(debugLogger, 'log')
+    it('should emit warning on duplicate agent definition', async () => {
+      const feedbackSpy = vi
+        .spyOn(coreEvents, 'emitFeedback')
         .mockImplementation(() => {});
 
       await registry.testRegisterAgent(MOCK_AGENT_V1);
       await registry.testRegisterAgent(MOCK_AGENT_V2);
 
-      expect(debugLogSpy).not.toHaveBeenCalledWith(
-        `[AgentRegistry] Overriding agent 'MockAgent'`,
+      expect(feedbackSpy).toHaveBeenCalledWith(
+        'warning',
+        expect.stringContaining("Duplicate agent name 'MockAgent' detected"),
       );
     });
 
@@ -1064,26 +1186,7 @@ describe('AgentRegistry', () => {
       expect(registry.getAllDefinitions()).toHaveLength(100);
     });
 
-    it('should dynamically register an ALLOW policy for local agents', async () => {
-      const agent: AgentDefinition = {
-        ...MOCK_AGENT_V1,
-        name: 'PolicyTestAgent',
-      };
-      const policyEngine = mockConfig.getPolicyEngine();
-      const addRuleSpy = vi.spyOn(policyEngine, 'addRule');
-
-      await registry.testRegisterAgent(agent);
-
-      expect(addRuleSpy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          toolName: 'PolicyTestAgent',
-          decision: PolicyDecision.ALLOW,
-          priority: 1.05,
-        }),
-      );
-    });
-
-    it('should dynamically register an ASK_USER policy for remote agents', async () => {
+    it('should result in ASK_USER policy for remote agents at runtime', async () => {
       const remoteAgent: AgentDefinition = {
         kind: 'remote',
         name: 'RemotePolicyAgent',
@@ -1092,43 +1195,51 @@ describe('AgentRegistry', () => {
         inputConfig: { inputSchema: { type: 'object' } },
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({ name: 'RemotePolicyAgent' }),
       } as unknown as A2AClientManager);
 
       const policyEngine = mockConfig.getPolicyEngine();
-      const addRuleSpy = vi.spyOn(policyEngine, 'addRule');
 
       await registry.testRegisterAgent(remoteAgent);
 
-      expect(addRuleSpy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          toolName: 'RemotePolicyAgent',
-          decision: PolicyDecision.ASK_USER,
-          priority: 1.05,
-        }),
+      // Verify behavior: calling invoke_agent with this remote agent should return ASK_USER
+      const result = await policyEngine.check(
+        { name: 'invoke_agent', args: { agent_name: 'RemotePolicyAgent' } },
+        undefined,
       );
+
+      expect(result.decision).toBe(PolicyDecision.ASK_USER);
     });
 
-    it('should not register a policy if a USER policy already exists', async () => {
+    it('should result in ALLOW policy for local agents at runtime (fallback to default allow)', async () => {
       const agent: AgentDefinition = {
         ...MOCK_AGENT_V1,
-        name: 'ExistingUserPolicyAgent',
+        name: 'LocalPolicyAgent',
       };
+
       const policyEngine = mockConfig.getPolicyEngine();
-      // Mock hasRuleForTool to return true when ignoreDynamic=true (simulating a user policy)
-      vi.spyOn(policyEngine, 'hasRuleForTool').mockImplementation(
-        (toolName, ignoreDynamic) =>
-          toolName === 'ExistingUserPolicyAgent' && ignoreDynamic === true,
-      );
-      const addRuleSpy = vi.spyOn(policyEngine, 'addRule');
+
+      // Simulate the blanket allow rule from agents.toml in this test environment
+      policyEngine.addRule({
+        toolName: 'invoke_agent',
+        decision: PolicyDecision.ALLOW,
+        priority: 1.05,
+        source: 'Mock Default Policy',
+      });
 
       await registry.testRegisterAgent(agent);
 
-      expect(addRuleSpy).not.toHaveBeenCalled();
+      const result = await policyEngine.check(
+        { name: 'invoke_agent', args: { agent_name: 'LocalPolicyAgent' } },
+        undefined,
+      );
+
+      // Since it's a local agent and no specific remote rule matches, it should fall through to the blanket allow
+      expect(result.decision).toBe(PolicyDecision.ALLOW);
     });
 
-    it('should replace an existing dynamic policy when an agent is overwritten', async () => {
+    it.skip('should replace an existing dynamic policy when an agent is overwritten', async () => {
       const localAgent: AgentDefinition = {
         ...MOCK_AGENT_V1,
         name: 'OverwrittenAgent',
@@ -1141,7 +1252,7 @@ describe('AgentRegistry', () => {
         inputConfig: { inputSchema: { type: 'object' } },
       };
 
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
         loadAgent: vi.fn().mockResolvedValue({ name: 'OverwrittenAgent' }),
       } as unknown as A2AClientManager);
 
@@ -1161,7 +1272,7 @@ describe('AgentRegistry', () => {
       // Verify old dynamic rule was removed
       expect(removeRuleSpy).toHaveBeenCalledWith(
         'OverwrittenAgent',
-        'AgentRegistry (Dynamic)',
+        DYNAMIC_RULE_SOURCE,
       );
       // Verify new dynamic rule (remote -> ASK_USER) was added
       expect(addRuleSpy).toHaveBeenLastCalledWith(
@@ -1189,8 +1300,10 @@ describe('AgentRegistry', () => {
       });
 
       const clearCacheSpy = vi.fn();
-      vi.mocked(A2AClientManager.getInstance).mockReturnValue({
+      vi.spyOn(config, 'getA2AClientManager').mockReturnValue({
         clearCache: clearCacheSpy,
+        loadAgent: vi.fn(),
+        getClient: vi.fn(),
       } as unknown as A2AClientManager);
 
       const emitSpy = vi.spyOn(coreEvents, 'emitAgentsRefreshed');
@@ -1207,6 +1320,32 @@ describe('AgentRegistry', () => {
   });
 
   describe('inheritance and refresh', () => {
+    it('should skip remote agents when refreshing on model change', async () => {
+      const remoteAgent: AgentDefinition = {
+        kind: 'remote',
+        name: 'RemoteAgent',
+        description: 'A remote agent',
+        agentCardUrl: 'https://example.com/card',
+        inputConfig: { inputSchema: { type: 'object' } },
+      };
+
+      const loadAgentSpy = vi.fn().mockResolvedValue({ name: 'RemoteAgent' });
+      vi.spyOn(mockConfig, 'getA2AClientManager').mockReturnValue({
+        loadAgent: loadAgentSpy,
+        clearCache: vi.fn(),
+      } as unknown as A2AClientManager);
+
+      await registry.testRegisterAgent(remoteAgent);
+
+      expect(loadAgentSpy).toHaveBeenCalledTimes(1);
+
+      coreEvents.emitModelChanged('new-model');
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(loadAgentSpy).toHaveBeenCalledTimes(1);
+    });
+
     it('should resolve "inherit" to the current model from configuration', async () => {
       const config = makeMockedConfig({ model: 'current-model' });
       const registry = new TestableAgentRegistry(config);
@@ -1507,6 +1646,89 @@ describe('AgentRegistry', () => {
       expect(getterCalled).toBe(false); // Getter should not have been called yet
       expect(registeredDef.toolConfig?.tools).toEqual(['lazy-tool']);
       expect(getterCalled).toBe(true); // Getter should have been called now
+    });
+  });
+
+  describe('browser agent sandbox registration', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('should NOT register browser agent in container sandbox without existing mode', async () => {
+      vi.stubEnv('SANDBOX', 'docker-container-0');
+      const feedbackSpy = vi
+        .spyOn(coreEvents, 'emitFeedback')
+        .mockImplementation(() => {});
+
+      const config = makeMockedConfig({
+        agents: {
+          overrides: {
+            browser_agent: { enabled: true },
+          },
+          browser: {
+            sessionMode: 'persistent',
+          },
+        },
+      });
+      const registry = new TestableAgentRegistry(config);
+      await registry.initialize();
+
+      expect(registry.getDefinition('browser_agent')).toBeUndefined();
+      expect(feedbackSpy).toHaveBeenCalledWith(
+        'info',
+        expect.stringContaining('Browser agent disabled in container sandbox'),
+      );
+    });
+
+    it('should register browser agent in container sandbox with existing mode', async () => {
+      vi.stubEnv('SANDBOX', 'docker-container-0');
+
+      const config = makeMockedConfig({
+        agents: {
+          overrides: {
+            browser_agent: { enabled: true },
+          },
+          browser: {
+            sessionMode: 'existing',
+          },
+        },
+      });
+      const registry = new TestableAgentRegistry(config);
+      await registry.initialize();
+
+      expect(registry.getDefinition('browser_agent')).toBeDefined();
+    });
+
+    it('should register browser agent normally in seatbelt sandbox', async () => {
+      vi.stubEnv('SANDBOX', 'sandbox-exec');
+
+      const config = makeMockedConfig({
+        agents: {
+          overrides: {
+            browser_agent: { enabled: true },
+          },
+        },
+      });
+      const registry = new TestableAgentRegistry(config);
+      await registry.initialize();
+
+      expect(registry.getDefinition('browser_agent')).toBeDefined();
+    });
+
+    it('should register browser agent normally when not in sandbox', async () => {
+      vi.stubEnv('SANDBOX', '');
+
+      const config = makeMockedConfig({
+        agents: {
+          overrides: {
+            browser_agent: { enabled: true },
+          },
+        },
+      });
+      const registry = new TestableAgentRegistry(config);
+      await registry.initialize();
+
+      expect(registry.getDefinition('browser_agent')).toBeDefined();
     });
   });
 });

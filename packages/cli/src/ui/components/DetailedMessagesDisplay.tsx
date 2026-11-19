@@ -5,7 +5,7 @@
  */
 
 import type React from 'react';
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useMemo } from 'react';
 import { Box, Text } from 'ink';
 import { theme } from '../semantic-colors.js';
 import type { ConsoleMessageItem } from '../types.js';
@@ -13,9 +13,10 @@ import {
   ScrollableList,
   type ScrollableListRef,
 } from './shared/ScrollableList.js';
+import { useConsoleMessages } from '../hooks/useConsoleMessages.js';
+import { useConfig } from '../contexts/ConfigContext.js';
 
 interface DetailedMessagesDisplayProps {
-  messages: ConsoleMessageItem[];
   maxHeight: number | undefined;
   width: number;
   hasFocus: boolean;
@@ -25,8 +26,18 @@ const iconBoxWidth = 3;
 
 export const DetailedMessagesDisplay: React.FC<
   DetailedMessagesDisplayProps
-> = ({ messages, maxHeight, width, hasFocus }) => {
+> = ({ maxHeight, width, hasFocus }) => {
   const scrollableListRef = useRef<ScrollableListRef<ConsoleMessageItem>>(null);
+
+  const consoleMessages = useConsoleMessages();
+  const config = useConfig();
+
+  const messages = useMemo(() => {
+    if (config.getDebugMode()) {
+      return consoleMessages;
+    }
+    return consoleMessages.filter((msg) => msg.type !== 'debug');
+  }, [consoleMessages, config]);
 
   const borderAndPadding = 3;
 
@@ -50,6 +61,12 @@ export const DetailedMessagesDisplay: React.FC<
     return null;
   }
 
+  const headerAndBorderHeight = 4;
+  const listHeight =
+    maxHeight !== undefined
+      ? Math.max(1, maxHeight - headerAndBorderHeight)
+      : undefined;
+
   return (
     <Box
       flexDirection="column"
@@ -68,9 +85,10 @@ export const DetailedMessagesDisplay: React.FC<
           Debug Console <Text color={theme.text.secondary}>(F12 to close)</Text>
         </Text>
       </Box>
-      <Box height={maxHeight} width={width - borderAndPadding}>
+      <Box height={listHeight} width={width - borderAndPadding}>
         <ScrollableList
           ref={scrollableListRef}
+          containerHeight={listHeight}
           data={messages}
           renderItem={({ item: msg }: { item: ConsoleMessageItem }) => {
             let textColor = theme.text.primary;

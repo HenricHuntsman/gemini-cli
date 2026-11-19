@@ -59,8 +59,9 @@ vi.mock('@google/gemini-cli-core', async (importOriginal) => {
 });
 
 async function expectConsentSnapshot(consentString: string) {
-  const renderResult = render(React.createElement(Text, null, consentString));
-  await renderResult.waitUntilReady();
+  const renderResult = await render(
+    React.createElement(Text, null, consentString),
+  );
   await expect(renderResult).toMatchSvgSnapshot();
 }
 
@@ -75,9 +76,14 @@ function normalizePathsForSnapshot(str: string, tempDir: string): string {
 
 describe('consent', () => {
   let tempDir: string;
+  const originalStdinIsTTY = process.stdin.isTTY;
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    Object.defineProperty(process.stdin, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
     if (originalReaddir.current) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       mockReaddir.mockImplementation(originalReaddir.current as any);
@@ -86,6 +92,10 @@ describe('consent', () => {
   });
 
   afterEach(async () => {
+    Object.defineProperty(process.stdin, 'isTTY', {
+      value: originalStdinIsTTY,
+      configurable: true,
+    });
     vi.restoreAllMocks();
     if (tempDir) {
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -97,7 +107,7 @@ describe('consent', () => {
     it.each([
       { input: 'y', expected: true },
       { input: 'Y', expected: true },
-      { input: '', expected: true },
+      { input: '', expected: false },
       { input: 'n', expected: false },
       { input: 'N', expected: false },
       { input: 'yes', expected: true },
@@ -115,12 +125,32 @@ describe('consent', () => {
         const consent = await requestConsentNonInteractive('Test consent');
         expect(debugLogger.log).toHaveBeenCalledWith('Test consent');
         expect(questionMock).toHaveBeenCalledWith(
-          'Do you want to continue? [Y/n]: ',
+          'Do you want to continue? [y/N]: ',
           expect.any(Function),
         );
         expect(consent).toBe(expected);
       },
     );
+
+    it('should fail closed and return false when readline closes on EOF without an answer', async () => {
+      let closeHandler: (() => void) | undefined;
+      const questionMock = vi.fn().mockImplementation(() => {
+        closeHandler?.();
+      });
+      mockReadline.createInterface.mockReturnValue({
+        question: questionMock,
+        on: vi.fn().mockImplementation((event: string, cb: () => void) => {
+          if (event === 'close') {
+            closeHandler = cb;
+          }
+        }),
+        close: vi.fn(),
+      });
+
+      const consent = await requestConsentNonInteractive('Test consent');
+      expect(debugLogger.log).toHaveBeenCalledWith('Test consent');
+      expect(consent).toBe(false);
+    });
   });
 
   describe('requestConsentInteractive', () => {
@@ -148,6 +178,35 @@ describe('consent', () => {
         expect(consent).toBe(expected);
       },
     );
+
+    it('should clear the active confirmation request before resolving', async () => {
+      const clearConfirmationRequest = vi.fn();
+      const steps: string[] = [];
+      const addExtensionUpdateConfirmationRequest = vi
+        .fn()
+        .mockImplementation((request: ConfirmationRequest) => {
+          steps.push('prompted');
+          request.onConfirm(true);
+          steps.push('confirmed');
+        });
+
+      const consentPromise = requestConsentInteractive(
+        'Test consent',
+        addExtensionUpdateConfirmationRequest,
+        () => {
+          steps.push('cleared');
+          clearConfirmationRequest();
+        },
+      ).then((consent) => {
+        steps.push('resolved');
+        return consent;
+      });
+
+      expect(clearConfirmationRequest).toHaveBeenCalledTimes(1);
+      expect(steps).toEqual(['prompted', 'cleared', 'confirmed']);
+      await expect(consentPromise).resolves.toBe(true);
+      expect(steps).toEqual(['prompted', 'cleared', 'confirmed', 'resolved']);
+    });
   });
 
   describe('maybeRequestConsentOrFail', () => {
@@ -186,6 +245,57 @@ describe('consent', () => {
       ).rejects.toThrow('Installation cancelled for "test-ext".');
     });
 
+    it('should request consent when transitioning from a non-linked extension to a linked extension', async () => {
+      const requestConsent = vi.fn().mockResolvedValue(true);
+      await maybeRequestConsentOrFail(
+        baseConfig,
+        requestConsent,
+        false,
+        baseConfig,
+        false,
+        [],
+        [],
+        false,
+        '/canonical/linked/path',
+        undefined,
+      );
+      expect(requestConsent).toHaveBeenCalledTimes(1);
+    });
+
+    it('should request consent when linkedSourcePath changes between updates', async () => {
+      const requestConsent = vi.fn().mockResolvedValue(true);
+      await maybeRequestConsentOrFail(
+        baseConfig,
+        requestConsent,
+        false,
+        baseConfig,
+        false,
+        [],
+        [],
+        false,
+        '/new/canonical/linked/path',
+        '/old/canonical/linked/path',
+      );
+      expect(requestConsent).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not request consent when linkedSourcePath and previousLinkedSourcePath are identical', async () => {
+      const requestConsent = vi.fn().mockResolvedValue(true);
+      await maybeRequestConsentOrFail(
+        baseConfig,
+        requestConsent,
+        false,
+        baseConfig,
+        false,
+        [],
+        [],
+        false,
+        '/same/canonical/linked/path',
+        '/same/canonical/linked/path',
+      );
+      expect(requestConsent).not.toHaveBeenCalled();
+    });
+
     describe('consent string generation', () => {
       it('should generate a consent string with all fields', async () => {
         const config: ExtensionConfig = {
@@ -210,11 +320,127 @@ describe('consent', () => {
         await expectConsentSnapshot(consentString);
       });
 
+      it('should sort environment variables alphabetically and handle undefined envValue', async () => {
+        const config: ExtensionConfig = {
+          ...baseConfig,
+          mcpServers: {
+            server1: {
+              command: 'node',
+              args: ['server.js'],
+              env: {
+                VAR_B: 'b',
+                VAR_A: 'a',
+                VAR_C: undefined as unknown as string,
+              },
+            },
+          },
+        };
+        const requestConsent = vi.fn().mockResolvedValue(true);
+        await maybeRequestConsentOrFail(
+          config,
+          requestConsent,
+          false,
+          undefined,
+        );
+
+        expect(requestConsent).toHaveBeenCalledTimes(1);
+        const consentString = requestConsent.mock.calls[0][0] as string;
+        expect(consentString).toContain('      - VAR_A: a');
+        expect(consentString).toContain('      - VAR_B: b');
+        expect(consentString).toContain('      - VAR_C: ');
+
+        const posA = consentString.indexOf('      - VAR_A: a');
+        const posB = consentString.indexOf('      - VAR_B: b');
+        const posC = consentString.indexOf('      - VAR_C: ');
+        expect(posA).toBeLessThan(posB);
+        expect(posB).toBeLessThan(posC);
+      });
+
+      it('should mask sensitive environment variables, headers, and OAuth parameters', async () => {
+        const config: ExtensionConfig = {
+          ...baseConfig,
+          mcpServers: {
+            server1: {
+              command: 'node',
+              args: ['server.js'],
+              env: {
+                SAFE_VAR: 'safe-value',
+                SUPER_TOKEN: 'secret-token-123',
+                DB_PASSWORD: 'my-password',
+              },
+              headers: {
+                'X-API-Key': 'some-api-key',
+                Authorization: 'Bearer 12345',
+                'Content-Type': 'application/json',
+              },
+              oauth: {
+                clientId: 'my-client-id',
+                clientSecret: 'secret-oauth-value',
+              },
+            },
+          },
+        };
+        const requestConsent = vi.fn().mockResolvedValue(true);
+        await maybeRequestConsentOrFail(
+          config,
+          requestConsent,
+          false,
+          undefined,
+        );
+
+        expect(requestConsent).toHaveBeenCalledTimes(1);
+        const consentString = requestConsent.mock.calls[0][0] as string;
+
+        // Assert sensitive env values are masked
+        expect(consentString).toContain('      - SAFE_VAR: safe-value');
+        expect(consentString).toContain('      - SUPER_TOKEN: ********');
+        expect(consentString).toContain('      - DB_PASSWORD: ********');
+
+        // Assert sensitive headers are masked
+        expect(consentString).toContain(
+          '      - Content-Type: application/json',
+        );
+        expect(consentString).toContain('      - Authorization: ********');
+        expect(consentString).toContain('      - X-API-Key: ********');
+
+        // Assert sensitive OAuth parameters are masked
+        expect(consentString).toContain('      - clientId: my-client-id');
+        expect(consentString).toContain('      - clientSecret: ********');
+      });
+
       it('should request consent if mcpServers change', async () => {
         const prevConfig: ExtensionConfig = { ...baseConfig };
         const newConfig: ExtensionConfig = {
           ...baseConfig,
           mcpServers: { server1: { command: 'npm', args: ['start'] } },
+        };
+        const requestConsent = vi.fn().mockResolvedValue(true);
+        await maybeRequestConsentOrFail(
+          newConfig,
+          requestConsent,
+          false,
+          prevConfig,
+          false,
+        );
+        expect(requestConsent).toHaveBeenCalledTimes(1);
+      });
+
+      it('should request consent if mcpServer env changes', async () => {
+        const prevConfig: ExtensionConfig = {
+          ...baseConfig,
+          mcpServers: {
+            server1: { command: 'node', args: ['server.js'] },
+          },
+        };
+        const newConfig: ExtensionConfig = {
+          ...baseConfig,
+          mcpServers: {
+            server1: {
+              command: 'node',
+              args: ['server.js'],
+              env: { NODE_OPTIONS: '--require=./payload.js' },
+            },
+          },
         };
         const requestConsent = vi.fn().mockResolvedValue(true);
         await maybeRequestConsentOrFail(

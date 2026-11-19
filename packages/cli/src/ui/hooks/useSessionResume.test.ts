@@ -5,14 +5,20 @@
  */
 
 import { act } from 'react';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 import { renderHook } from '../../test-utils/render.js';
 import { waitFor } from '../../test-utils/async.js';
 import { useSessionResume } from './useSessionResume.js';
-import type {
-  Config,
-  ResumedSessionData,
-  ConversationRecord,
-  MessageRecord,
+import {
+  WorkspaceContext,
+  resolveToRealPath,
+  type Config,
+  type ResumedSessionData,
+  type ConversationRecord,
+  type MessageRecord,
+  type HistoryTurn,
 } from '@google/gemini-cli-core';
 import type { UseHistoryManagerReturn } from './useHistoryManager.js';
 import type { HistoryItemWithoutId } from '../types.js';
@@ -56,14 +62,18 @@ describe('useSessionResume', () => {
   });
 
   describe('loadHistoryForResume', () => {
-    it('should return a loadHistoryForResume callback', () => {
-      const { result } = renderHook(() => useSessionResume(getDefaultProps()));
+    it('should return a loadHistoryForResume callback', async () => {
+      const { result } = await renderHook(() =>
+        useSessionResume(getDefaultProps()),
+      );
 
       expect(result.current.loadHistoryForResume).toBeInstanceOf(Function);
     });
 
     it('should clear history and add items when loading history', async () => {
-      const { result } = renderHook(() => useSessionResume(getDefaultProps()));
+      const { result } = await renderHook(() =>
+        useSessionResume(getDefaultProps()),
+      );
 
       const uiHistory: HistoryItemWithoutId[] = [
         { type: 'user', text: 'Hello' },
@@ -117,7 +127,7 @@ describe('useSessionResume', () => {
     });
 
     it('should not load history if Gemini client is not initialized', async () => {
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useSessionResume({
           ...getDefaultProps(),
           isGeminiClientInitialized: false,
@@ -154,8 +164,60 @@ describe('useSessionResume', () => {
       expect(mockGeminiClient.resumeChat).not.toHaveBeenCalled();
     });
 
+    it('should emit error and not mutate UI history or directories if getGeminiClient returns undefined', async () => {
+      const mockAddDirectories = vi.fn();
+      const mockWorkspaceContext = {
+        addDirectories: mockAddDirectories,
+      };
+      const configWithoutClient = {
+        ...mockConfig,
+        getGeminiClient: vi.fn().mockReturnValue(undefined),
+        getWorkspaceContext: vi.fn().mockReturnValue(mockWorkspaceContext),
+      };
+
+      const { result } = await renderHook(() =>
+        useSessionResume({
+          ...getDefaultProps(),
+          config: configWithoutClient as unknown as Config,
+          isGeminiClientInitialized: true,
+        }),
+      );
+
+      const uiHistory: HistoryItemWithoutId[] = [
+        { type: 'user', text: 'Hello' },
+      ];
+      const clientHistory = [
+        { role: 'user' as const, parts: [{ text: 'Hello' }] },
+      ];
+      const resumedData: ResumedSessionData = {
+        conversation: {
+          sessionId: 'test-123',
+          projectHash: 'project-123',
+          startTime: '2025-01-01T00:00:00Z',
+          lastUpdated: '2025-01-01T01:00:00Z',
+          messages: [] as MessageRecord[],
+          directories: ['/restored/dir1'],
+        },
+        filePath: '/path/to/session.json',
+      };
+
+      await act(async () => {
+        await result.current.loadHistoryForResume(
+          uiHistory,
+          clientHistory,
+          resumedData,
+        );
+      });
+
+      expect(mockHistoryManager.clearItems).not.toHaveBeenCalled();
+      expect(mockHistoryManager.addItem).not.toHaveBeenCalled();
+      expect(mockAddDirectories).not.toHaveBeenCalled();
+    });
+
     it('should handle empty history arrays', async () => {
-      const { result } = renderHook(() => useSessionResume(getDefaultProps()));
+      const { result } = await renderHook(() =>
+        useSessionResume(getDefaultProps()),
+      );
 
       const resumedData: ResumedSessionData = {
         conversation: {
@@ -190,7 +252,7 @@ describe('useSessionResume', () => {
         getWorkspaceContext: vi.fn().mockReturnValue(mockWorkspaceContext),
       };
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useSessionResume({
           ...getDefaultProps(),
           config: configWithWorkspace as unknown as Config,
@@ -230,7 +292,7 @@ describe('useSessionResume', () => {
         getWorkspaceContext: vi.fn().mockReturnValue(mockWorkspaceContext),
       };
 
-      const { result } = renderHook(() =>
+      const { result } = await renderHook(() =>
         useSessionResume({
           ...getDefaultProps(),
           config: configWithWorkspace as unknown as Config,
@@ -255,11 +317,147 @@ describe('useSessionResume', () => {
 
       expect(mockAddDirectories).not.toHaveBeenCalled();
     });
+
+    it('should not restore directories if resumeChat fails', async () => {
+      const mockAddDirectories = vi
+        .fn()
+        .mockReturnValue({ added: [], failed: [] });
+      const mockWorkspaceContext = {
+        addDirectories: mockAddDirectories,
+      };
+      const configWithWorkspace = {
+        ...mockConfig,
+        getWorkspaceContext: vi.fn().mockReturnValue(mockWorkspaceContext),
+      };
+
+      mockGeminiClient.resumeChat.mockRejectedValueOnce(
+        new Error('Failed to resume chat'),
+      );
+
+      const { result } = await renderHook(() =>
+        useSessionResume({
+          ...getDefaultProps(),
+          config: configWithWorkspace as unknown as Config,
+        }),
+      );
+
+      const resumedData: ResumedSessionData = {
+        conversation: {
+          sessionId: 'test-123',
+          projectHash: 'project-123',
+          startTime: '2025-01-01T00:00:00Z',
+          lastUpdated: '2025-01-01T01:00:00Z',
+          messages: [] as MessageRecord[],
+          directories: ['/restored/dir1', '/restored/dir2'],
+        },
+        filePath: '/path/to/session.json',
+      };
+
+      await act(async () => {
+        await result.current.loadHistoryForResume([], [], resumedData);
+      });
+
+      expect(mockGeminiClient.resumeChat).toHaveBeenCalled();
+      expect(mockHistoryManager.clearItems).not.toHaveBeenCalled();
+      expect(mockHistoryManager.addItem).not.toHaveBeenCalled();
+      expect(mockAddDirectories).not.toHaveBeenCalled();
+    });
+
+    it('should restore directories only after resumeChat succeeds', async () => {
+      const callOrder: string[] = [];
+      const mockAddDirectories = vi.fn().mockImplementation(() => {
+        callOrder.push('addDirectories');
+        return { added: [], failed: [] };
+      });
+      const mockWorkspaceContext = {
+        addDirectories: mockAddDirectories,
+      };
+      const configWithWorkspace = {
+        ...mockConfig,
+        getWorkspaceContext: vi.fn().mockReturnValue(mockWorkspaceContext),
+      };
+
+      mockGeminiClient.resumeChat.mockImplementationOnce(async () => {
+        callOrder.push('resumeChat');
+      });
+
+      const { result } = await renderHook(() =>
+        useSessionResume({
+          ...getDefaultProps(),
+          config: configWithWorkspace as unknown as Config,
+        }),
+      );
+
+      const resumedData: ResumedSessionData = {
+        conversation: {
+          sessionId: 'test-123',
+          projectHash: 'project-123',
+          startTime: '2025-01-01T00:00:00Z',
+          lastUpdated: '2025-01-01T01:00:00Z',
+          messages: [] as MessageRecord[],
+          directories: ['/restored/dir1'],
+        },
+        filePath: '/path/to/session.json',
+      };
+
+      await act(async () => {
+        await result.current.loadHistoryForResume([], [], resumedData);
+      });
+
+      expect(callOrder).toEqual(['resumeChat', 'addDirectories']);
+    });
+
+    it('should filter out stale saved directories that no longer exist when restoring', async () => {
+      const tempDir = resolveToRealPath(
+        fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-test-ws-')),
+      );
+      try {
+        const existingDir = path.join(tempDir, 'existing');
+        const missingDir = path.join(tempDir, 'missing');
+        fs.mkdirSync(existingDir);
+
+        const expectedExistingDir = resolveToRealPath(existingDir);
+        const workspaceContext = new WorkspaceContext(tempDir);
+        const configWithWorkspace = {
+          ...mockConfig,
+          getWorkspaceContext: vi.fn().mockReturnValue(workspaceContext),
+        };
+
+        const { result } = await renderHook(() =>
+          useSessionResume({
+            ...getDefaultProps(),
+            config: configWithWorkspace as unknown as Config,
+          }),
+        );
+
+        const resumedData: ResumedSessionData = {
+          conversation: {
+            sessionId: 'test-123',
+            projectHash: 'project-123',
+            startTime: '2025-01-01T00:00:00Z',
+            lastUpdated: '2025-01-01T01:00:00Z',
+            messages: [] as MessageRecord[],
+            directories: [existingDir, missingDir],
+          },
+          filePath: '/path/to/session.json',
+        };
+
+        await act(async () => {
+          await result.current.loadHistoryForResume([], [], resumedData);
+        });
+
+        const dirs = workspaceContext.getDirectories();
+        expect(dirs).toContain(expectedExistingDir);
+        expect(dirs).not.toContain(missingDir);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('callback stability', () => {
-    it('should maintain stable loadHistoryForResume reference across renders', () => {
-      const { result, rerender } = renderHook(() =>
+    it('should maintain stable loadHistoryForResume reference across renders', async () => {
+      const { result, rerender } = await renderHook(() =>
         useSessionResume(getDefaultProps()),
       );
 
@@ -270,8 +468,8 @@ describe('useSessionResume', () => {
       expect(result.current.loadHistoryForResume).toBe(initialCallback);
     });
 
-    it('should update callback when config changes', () => {
-      const { result, rerender } = renderHook(
+    it('should update callback when config changes', async () => {
+      const { result, rerender } = await renderHook(
         ({ config }: { config: Config }) =>
           useSessionResume({
             ...getDefaultProps(),
@@ -295,15 +493,15 @@ describe('useSessionResume', () => {
   });
 
   describe('automatic resume on mount', () => {
-    it('should not resume when resumedSessionData is not provided', () => {
-      renderHook(() => useSessionResume(getDefaultProps()));
+    it('should not resume when resumedSessionData is not provided', async () => {
+      await renderHook(() => useSessionResume(getDefaultProps()));
 
       expect(mockHistoryManager.clearItems).not.toHaveBeenCalled();
       expect(mockHistoryManager.addItem).not.toHaveBeenCalled();
       expect(mockGeminiClient.resumeChat).not.toHaveBeenCalled();
     });
 
-    it('should not resume when user is authenticating', () => {
+    it('should not resume when user is authenticating', async () => {
       const conversation: ConversationRecord = {
         sessionId: 'auto-resume-123',
         projectHash: 'project-123',
@@ -319,7 +517,7 @@ describe('useSessionResume', () => {
         ] as MessageRecord[],
       };
 
-      renderHook(() =>
+      await renderHook(() =>
         useSessionResume({
           ...getDefaultProps(),
           resumedSessionData: {
@@ -335,7 +533,7 @@ describe('useSessionResume', () => {
       expect(mockGeminiClient.resumeChat).not.toHaveBeenCalled();
     });
 
-    it('should not resume when Gemini client is not initialized', () => {
+    it('should not resume when Gemini client is not initialized', async () => {
       const conversation: ConversationRecord = {
         sessionId: 'auto-resume-123',
         projectHash: 'project-123',
@@ -351,7 +549,7 @@ describe('useSessionResume', () => {
         ] as MessageRecord[],
       };
 
-      renderHook(() =>
+      await renderHook(() =>
         useSessionResume({
           ...getDefaultProps(),
           resumedSessionData: {
@@ -390,7 +588,7 @@ describe('useSessionResume', () => {
       };
 
       await act(async () => {
-        renderHook(() =>
+        await renderHook(() =>
           useSessionResume({
             ...getDefaultProps(),
             resumedSessionData: {
@@ -440,7 +638,7 @@ describe('useSessionResume', () => {
 
       let rerenderFunc: (props: { refreshStatic: () => void }) => void;
       await act(async () => {
-        const { rerender } = renderHook(
+        const { rerender } = await renderHook(
           ({ refreshStatic }: { refreshStatic: () => void }) =>
             useSessionResume({
               ...getDefaultProps(),
@@ -500,7 +698,7 @@ describe('useSessionResume', () => {
       };
 
       await act(async () => {
-        renderHook(() =>
+        await renderHook(() =>
           useSessionResume({
             ...getDefaultProps(),
             resumedSessionData: {
@@ -521,10 +719,12 @@ describe('useSessionResume', () => {
 
       // Should only have the non-slash-command message
       expect(clientHistory).toHaveLength(1);
-      expect(clientHistory[0]).toEqual({
-        role: 'user',
-        parts: [{ text: 'Regular message' }],
-      });
+      expect(clientHistory.map((h: HistoryTurn) => h.content)).toEqual([
+        {
+          role: 'user',
+          parts: [{ text: 'Regular message' }],
+        },
+      ]);
 
       // But UI history should have both
       expect(mockHistoryManager.addItem).toHaveBeenCalledTimes(2);

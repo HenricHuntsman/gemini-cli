@@ -13,7 +13,7 @@ describe('ExpandableText', () => {
   const flat = (s: string | undefined) => (s ?? '').replace(/\n/g, '');
 
   it('renders plain label when no match (short label)', async () => {
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label="simple command"
         userInput=""
@@ -22,15 +22,14 @@ describe('ExpandableText', () => {
         isExpanded={false}
       />,
     );
-    const { waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { unmount } = renderResult;
     await expect(renderResult).toMatchSvgSnapshot();
     unmount();
   });
 
   it('truncates long label when collapsed and no match', async () => {
     const long = 'x'.repeat(MAX_WIDTH + 25);
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label={long}
         userInput=""
@@ -38,8 +37,7 @@ describe('ExpandableText', () => {
         isExpanded={false}
       />,
     );
-    const { lastFrame, waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { lastFrame, unmount } = renderResult;
     const out = lastFrame();
     const f = flat(out);
     expect(f.endsWith('...')).toBe(true);
@@ -48,9 +46,48 @@ describe('ExpandableText', () => {
     unmount();
   });
 
+  it('does not split a supplementary character when truncating without a match', async () => {
+    const renderResult = await render(
+      <ExpandableText
+        label="aaaa😀tail"
+        userInput=""
+        textColor={color}
+        isExpanded={false}
+        maxWidth={5}
+      />,
+    );
+    const { lastFrame, unmount } = renderResult;
+    const f = flat(lastFrame());
+    expect(f).toBe('aaaa😀...');
+    expect(f).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    unmount();
+  });
+
+  it('does not split a supplementary character when truncating by maxLines', async () => {
+    const renderResult = await render(
+      <ExpandableText
+        label={'aaaa😀tail\nmore'}
+        userInput=""
+        textColor={color}
+        isExpanded={false}
+        maxWidth={5}
+        maxLines={1}
+      />,
+    );
+    const { lastFrame, unmount } = renderResult;
+    const f = flat(lastFrame());
+    expect(f).toBe('aaaa😀...');
+    expect(f).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/,
+    );
+    unmount();
+  });
+
   it('shows full long label when expanded and no match', async () => {
     const long = 'y'.repeat(MAX_WIDTH + 25);
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label={long}
         userInput=""
@@ -58,8 +95,7 @@ describe('ExpandableText', () => {
         isExpanded={true}
       />,
     );
-    const { lastFrame, waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { lastFrame, unmount } = renderResult;
     const out = lastFrame();
     const f = flat(out);
     expect(f.length).toBe(long.length);
@@ -71,7 +107,7 @@ describe('ExpandableText', () => {
     const label = 'run: git commit -m "feat: add search"';
     const userInput = 'commit';
     const matchedIndex = label.indexOf(userInput);
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label={label}
         userInput={userInput}
@@ -81,8 +117,7 @@ describe('ExpandableText', () => {
       />,
       100,
     );
-    const { waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { unmount } = renderResult;
     await expect(renderResult).toMatchSvgSnapshot();
     unmount();
   });
@@ -93,7 +128,7 @@ describe('ExpandableText', () => {
     const suffix = '/and/then/some/more/components/'.repeat(3);
     const label = prefix + core + suffix;
     const matchedIndex = prefix.length;
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label={label}
         userInput={core}
@@ -103,8 +138,7 @@ describe('ExpandableText', () => {
       />,
       100,
     );
-    const { lastFrame, waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { lastFrame, unmount } = renderResult;
     const out = lastFrame();
     const f = flat(out);
     expect(f.includes(core)).toBe(true);
@@ -120,7 +154,7 @@ describe('ExpandableText', () => {
     const suffix = ' in this text';
     const label = prefix + core + suffix;
     const matchedIndex = prefix.length;
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label={label}
         userInput={core}
@@ -129,8 +163,7 @@ describe('ExpandableText', () => {
         isExpanded={false}
       />,
     );
-    const { lastFrame, waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { lastFrame, unmount } = renderResult;
     const out = lastFrame();
     const f = flat(out);
     expect(f.includes('...')).toBe(true);
@@ -144,7 +177,7 @@ describe('ExpandableText', () => {
   it('respects custom maxWidth', async () => {
     const customWidth = 50;
     const long = 'z'.repeat(100);
-    const renderResult = render(
+    const renderResult = await render(
       <ExpandableText
         label={long}
         userInput=""
@@ -153,8 +186,7 @@ describe('ExpandableText', () => {
         maxWidth={customWidth}
       />,
     );
-    const { lastFrame, waitUntilReady, unmount } = renderResult;
-    await waitUntilReady();
+    const { lastFrame, unmount } = renderResult;
     const out = lastFrame();
     const f = flat(out);
     expect(f.endsWith('...')).toBe(true);

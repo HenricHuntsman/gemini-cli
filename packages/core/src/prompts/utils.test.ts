@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as path from 'node:path';
 import {
   resolvePathFromEnv,
   isSectionEnabled,
@@ -123,24 +124,25 @@ describe('resolvePathFromEnv', () => {
   });
 
   it('should resolve a regular path', () => {
-    const result = resolvePathFromEnv('/some/absolute/path');
+    const p = path.resolve('/some/absolute/path');
+    const result = resolvePathFromEnv(p);
     expect(result.isSwitch).toBe(false);
-    expect(result.value).toBe('/some/absolute/path');
+    expect(result.value).toBe(p);
     expect(result.isDisabled).toBe(false);
   });
 
   it('should resolve a tilde path to the home directory', () => {
     const result = resolvePathFromEnv('~/my/custom/path');
     expect(result.isSwitch).toBe(false);
-    expect(result.value).toContain('/mock/home');
-    expect(result.value).toContain('my/custom/path');
+    expect(result.value).toContain(path.normalize('/mock/home'));
+    expect(result.value).toContain(path.normalize('my/custom/path'));
     expect(result.isDisabled).toBe(false);
   });
 
   it('should resolve a bare tilde to the home directory', () => {
     const result = resolvePathFromEnv('~');
     expect(result.isSwitch).toBe(false);
-    expect(result.value).toBe('/mock/home');
+    expect(result.value).toBe(path.resolve('/mock/home'));
     expect(result.isDisabled).toBe(false);
   });
 
@@ -218,6 +220,7 @@ describe('applySubstitutions', () => {
       },
       getAgentRegistry: vi.fn().mockReturnValue({
         getAllDefinitions: vi.fn().mockReturnValue([]),
+        getDefinition: vi.fn().mockReturnValue(undefined),
       }),
       getToolRegistry: vi.fn().mockReturnValue({
         getAllToolNames: vi.fn().mockReturnValue([]),
@@ -308,5 +311,49 @@ describe('applySubstitutions', () => {
       '',
     );
     expect(result).toBe('A plain prompt with no variables.');
+  });
+
+  it('should preserve $ replacement patterns literally in ${AgentSkills}', () => {
+    const dollarSkills =
+      "Skill costs $$5, matches $&, prefix $`, suffix $', group $1";
+    const result = applySubstitutions(
+      'Prefix ${AgentSkills} Suffix',
+      mockConfig,
+      dollarSkills,
+    );
+    expect(result).toBe(`Prefix ${dollarSkills} Suffix`);
+  });
+
+  it('should preserve $ replacement patterns literally in ${SubAgents}', async () => {
+    const snippets = await import('./snippets.js');
+    const dollarSubAgents =
+      "Agent costs $$5, matches $&, prefix $`, suffix $', group $1";
+    vi.mocked(snippets.renderSubAgents).mockReturnValueOnce(dollarSubAgents);
+
+    const result = applySubstitutions(
+      'Prefix ${SubAgents} Suffix',
+      mockConfig,
+      '',
+      true,
+    );
+    expect(result).toBe(`Prefix ${dollarSubAgents} Suffix`);
+  });
+
+  it('should preserve $ replacement patterns literally in ${AvailableTools} and tool-specific variables', () => {
+    (mockConfig as unknown as { toolRegistry: ToolRegistry }).toolRegistry = {
+      getAllToolNames: vi
+        .fn()
+        .mockReturnValue(['dollar_$$_tool', 'match_$&_tool', "quote_$'_tool"]),
+      getAllTools: vi.fn().mockReturnValue([]),
+    } as unknown as ToolRegistry;
+
+    const result = applySubstitutions(
+      'Tools:\n${AvailableTools}\nSpecific: ${dollar_$$_tool_ToolName} and ${match_$&_tool_ToolName}\nEnd',
+      mockConfig,
+      '',
+    );
+    expect(result).toBe(
+      "Tools:\n- dollar_$$_tool\n- match_$&_tool\n- quote_$'_tool\nSpecific: dollar_$$_tool and match_$&_tool\nEnd",
+    );
   });
 });

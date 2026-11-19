@@ -18,9 +18,14 @@ import {
   Storage,
   coreEvents,
   homedir,
+  AuthType,
   type AdminControlsSettings,
   createCache,
+  isFileAndDirectorySecureSync,
+  createPathSecurityCache,
+  type PathSecurityCache,
 } from '@google/gemini-cli-core';
+import { parse } from 'shell-quote';
 import stripJsonComments from 'strip-json-comments';
 import { DefaultLight } from '../ui/themes/builtin/light/default-light.js';
 import { DefaultDark } from '../ui/themes/builtin/dark/default-dark.js';
@@ -78,7 +83,12 @@ export function getMergeStrategyForPath(
 
 export const USER_SETTINGS_PATH = Storage.getGlobalSettingsPath();
 export const USER_SETTINGS_DIR = path.dirname(USER_SETTINGS_PATH);
-export const DEFAULT_EXCLUDED_ENV_VARS = ['DEBUG', 'DEBUG_MODE'];
+export const DEFAULT_EXCLUDED_ENV_VARS = [
+  'DEBUG',
+  'DEBUG_MODE',
+  'GEMINI_CLI_IDE_SERVER_STDIO_COMMAND',
+  'GEMINI_CLI_IDE_SERVER_STDIO_ARGS',
+];
 
 const AUTH_ENV_VAR_WHITELIST = [
   'GEMINI_API_KEY',
@@ -203,6 +213,14 @@ export interface SettingsFile {
   readOnly?: boolean;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
+
 function setNestedProperty(
   obj: Record<string, unknown>,
   path: string,
@@ -304,6 +322,9 @@ export interface LoadedSettingsSnapshot {
   merged: MergedSettings;
 }
 
+export const UNTRUSTED_WORKSPACE_SETTINGS_ERROR =
+  'Cannot modify settings in an untrusted workspace. To enable this, verify the source of the repository and set GEMINI_CLI_TRUST_WORKSPACE=true or move your configuration to the global settings file.';
+
 export class LoadedSettings {
   constructor(
     system: SettingsFile,
@@ -312,12 +333,14 @@ export class LoadedSettings {
     workspace: SettingsFile,
     isTrusted: boolean,
     errors: SettingsError[] = [],
+    blockedMcpServers: ReadonlySet<string> = new Set(),
   ) {
     this.system = system;
     this.systemDefaults = systemDefaults;
     this.user = user;
     this._workspaceFile = workspace;
     this.isTrusted = isTrusted;
+    this._blockedMcpServers = blockedMcpServers;
     this.workspace = isTrusted
       ? workspace
       : this.createEmptyWorkspace(workspace);
@@ -334,6 +357,7 @@ export class LoadedSettings {
   readonly errors: SettingsError[];
 
   private _workspaceFile: SettingsFile;
+  private readonly _blockedMcpServers: ReadonlySet<string>;
   private _merged: MergedSettings;
   private _snapshot: LoadedSettingsSnapshot;
   private _remoteAdminSettings: Partial<Settings> | undefined;
@@ -342,11 +366,40 @@ export class LoadedSettings {
     return this._merged;
   }
 
+  /**
+   * Returns a merged settings object as if the folder were trusted.
+   * This is useful for commands like 'mcp list' that want to show
+   * what's configured even if it's currently disabled for security reasons.
+   */
+  getMergedSettingsAsIfTrusted(): MergedSettings {
+    return this.computeMergedSettings(true);
+  }
+
   setTrusted(isTrusted: boolean): void {
     if (this.isTrusted === isTrusted) {
       return;
     }
     this.isTrusted = isTrusted;
+    if (
+      isTrusted &&
+      Object.keys(this._workspaceFile.settings).length === 0 &&
+      Object.keys(this._workspaceFile.originalSettings).length > 0
+    ) {
+      const resolvedWorkspaceSettings = resolveSettings(
+        this._workspaceFile.originalSettings,
+        this._workspaceFile.path,
+        this.errors,
+      );
+      normalizeLegacyTheme(resolvedWorkspaceSettings);
+      stripBlockedMcpServers(
+        resolvedWorkspaceSettings,
+        this._blockedMcpServers,
+      );
+      this._workspaceFile = {
+        ...this._workspaceFile,
+        settings: resolvedWorkspaceSettings,
+      };
+    }
     this.workspace = isTrusted
       ? this._workspaceFile
       : this.createEmptyWorkspace(this._workspaceFile);
@@ -359,17 +412,26 @@ export class LoadedSettings {
       ...workspace,
       settings: {},
       originalSettings: {},
+      readOnly: true,
     };
   }
 
-  private computeMergedSettings(): MergedSettings {
+  private computeMergedSettings(forceTrusted = false): MergedSettings {
+    const isTrusted = forceTrusted || this.isTrusted;
+    const workspaceSettings = forceTrusted
+      ? Object.keys(this._workspaceFile.settings).length > 0
+        ? this._workspaceFile.settings
+        : this._workspaceFile.originalSettings
+      : this.workspace.settings;
+
     const merged = mergeSettings(
       this.system.settings,
       this.systemDefaults.settings,
       this.user.settings,
-      this.workspace.settings,
-      this.isTrusted,
+      workspaceSettings,
+      isTrusted,
     );
+    stripBlockedMcpServers(merged, this._blockedMcpServers);
 
     // Remote admin settings always take precedence and file-based admin settings
     // are ignored.
@@ -392,8 +454,7 @@ export class LoadedSettings {
 
   private computeSnapshot(): LoadedSettingsSnapshot {
     const cloneSettingsFile = (file: SettingsFile): SettingsFile => ({
-      path: file.path,
-      rawJson: file.rawJson,
+      ...file,
       settings: structuredClone(file.settings),
       originalSettings: structuredClone(file.originalSettings),
     });
@@ -439,8 +500,22 @@ export class LoadedSettings {
     return !settingsFile.readOnly;
   }
 
-  setValue(scope: LoadableSettingScope, key: string, value: unknown): void {
+  setValue(
+    scope: LoadableSettingScope,
+    key: string,
+    value: unknown,
+    originalValue: unknown = value,
+  ): void {
     const settingsFile = this.forScope(scope);
+
+    if (scope === SettingScope.Workspace && !this.isPersistable(settingsFile)) {
+      if (settingsFile.path === '' || settingsFile.path === this.user.path) {
+        throw new Error(
+          'Cannot modify workspace settings in the home directory. Please use user scope instead.',
+        );
+      }
+      throw new Error(UNTRUSTED_WORKSPACE_SETTINGS_ERROR);
+    }
 
     // Clone value to prevent reference sharing
     const valueToSet =
@@ -452,11 +527,11 @@ export class LoadedSettings {
 
     if (this.isPersistable(settingsFile)) {
       // Use a fresh clone for originalSettings to ensure total independence
-      setNestedProperty(
-        settingsFile.originalSettings,
-        key,
-        structuredClone(valueToSet),
-      );
+      const originalValueToSet =
+        typeof originalValue === 'object' && originalValue !== null
+          ? structuredClone(originalValue)
+          : originalValue;
+      setNestedProperty(settingsFile.originalSettings, key, originalValueToSet);
       saveSettings(settingsFile);
     }
 
@@ -480,6 +555,7 @@ export class LoadedSettings {
     admin.mcp = {
       enabled: mcpSetting?.mcpEnabled,
       config: mcpSetting?.mcpConfig?.mcpServers,
+      requiredConfig: mcpSetting?.requiredMcpConfig,
     };
     admin.extensions = {
       enabled: cliFeatureSetting?.extensionsSetting?.extensionsEnabled,
@@ -491,26 +567,81 @@ export class LoadedSettings {
     this._remoteAdminSettings = { admin };
     this._merged = this.computeMergedSettings();
   }
+
+  /**
+   * Returns a consolidated list of excluded MCP servers across all settings files.
+   */
+  getConsolidatedExcludedMcpServers(): string[] {
+    const scopes = [
+      this.system,
+      this.systemDefaults,
+      this.user,
+      this.workspace,
+    ];
+    return scopes.flatMap((scope) => {
+      const excluded = scope?.settings?.mcp?.excluded;
+      return Array.isArray(excluded) ? excluded : [];
+    });
+  }
+
+  /**
+   * Returns a consolidated list of allowed MCP servers (via intersection of all defined lists).
+   */
+  getConsolidatedAllowedMcpServers(): string[] | undefined {
+    const scopes = [
+      this.system,
+      this.systemDefaults,
+      this.user,
+      this.workspace,
+    ];
+    const definedAllowlists = scopes.flatMap((scope) => {
+      const allowed = scope?.settings?.mcp?.allowed;
+      return Array.isArray(allowed) ? [allowed] : [];
+    });
+
+    if (definedAllowlists.length === 0) {
+      return undefined;
+    }
+
+    return definedAllowlists.reduce((acc, current) => {
+      const normalizedCurrent = new Set(
+        current.map((item) => item.toLowerCase().trim()),
+      );
+      return acc.filter((item) =>
+        normalizedCurrent.has(item.toLowerCase().trim()),
+      );
+    });
+  }
 }
 
-function findEnvFile(startDir: string): string | null {
+function findEnvFile(
+  startDir: string,
+  isTrusted: boolean,
+  ignoreLocalEnv: boolean,
+): string | null {
   let currentDir = path.resolve(startDir);
   while (true) {
     // prefer gemini-specific .env under GEMINI_DIR
-    const geminiEnvPath = path.join(currentDir, GEMINI_DIR, '.env');
-    if (fs.existsSync(geminiEnvPath)) {
-      return geminiEnvPath;
+    if (isTrusted) {
+      const geminiEnvPath = path.join(currentDir, GEMINI_DIR, '.env');
+      if (fs.existsSync(geminiEnvPath)) {
+        return geminiEnvPath;
+      }
     }
     const envPath = path.join(currentDir, '.env');
     if (fs.existsSync(envPath)) {
-      return envPath;
+      if (!ignoreLocalEnv || currentDir === homedir()) {
+        return envPath;
+      }
     }
     const parentDir = path.dirname(currentDir);
     if (parentDir === currentDir || !parentDir) {
       // check .env under home as fallback, again preferring gemini-specific .env
-      const homeGeminiEnvPath = path.join(homedir(), GEMINI_DIR, '.env');
-      if (fs.existsSync(homeGeminiEnvPath)) {
-        return homeGeminiEnvPath;
+      if (isTrusted) {
+        const homeGeminiEnvPath = path.join(homedir(), GEMINI_DIR, '.env');
+        if (fs.existsSync(homeGeminiEnvPath)) {
+          return homeGeminiEnvPath;
+        }
       }
       const homeEnvPath = path.join(homedir(), '.env');
       if (fs.existsSync(homeEnvPath)) {
@@ -522,17 +653,41 @@ function findEnvFile(startDir: string): string | null {
   }
 }
 
+// Internal env var used to preserve the user's original GOOGLE_CLOUD_PROJECT
+// across process restarts in Cloud Shell. This survives relaunch because child
+// processes inherit the parent's environment.
+const USER_GCP_PROJECT = '_GEMINI_USER_GCP_PROJECT';
+
 export function setUpCloudShellEnvironment(
   envFilePath: string | null,
   isTrusted: boolean,
   isSandboxed: boolean,
+  selectedAuthType?: string,
 ): void {
   // Special handling for GOOGLE_CLOUD_PROJECT in Cloud Shell:
   // Because GOOGLE_CLOUD_PROJECT in Cloud Shell tracks the project
   // set by the user using "gcloud config set project" we do not want to
   // use its value. So, unless the user overrides GOOGLE_CLOUD_PROJECT in
   // one of the .env files, we set the Cloud Shell-specific default here.
-  let value = 'cloudshell-gca';
+  //
+  // However, if the user has explicitly selected Vertex AI auth, they intend
+  // to use their own GCP project, so we restore the original value and skip
+  // the Cloud Shell override to respect their .env settings.
+
+  // Save the user's original value before overwriting, so it can be restored
+  // if the user later switches to Vertex AI (even after a process restart).
+  if (!process.env[USER_GCP_PROJECT]) {
+    const current = process.env['GOOGLE_CLOUD_PROJECT'];
+    if (current && current !== 'cloudshell-gca') {
+      process.env[USER_GCP_PROJECT] = current;
+    }
+  }
+
+  let value: string | undefined = 'cloudshell-gca';
+
+  if (selectedAuthType === AuthType.USE_VERTEX_AI) {
+    value = process.env[USER_GCP_PROJECT];
+  }
 
   if (envFilePath && fs.existsSync(envFilePath)) {
     const envFileContent = fs.readFileSync(envFilePath);
@@ -545,7 +700,12 @@ export function setUpCloudShellEnvironment(
       }
     }
   }
-  process.env['GOOGLE_CLOUD_PROJECT'] = value;
+
+  if (value !== undefined) {
+    process.env['GOOGLE_CLOUD_PROJECT'] = value;
+  } else if (process.env['GOOGLE_CLOUD_PROJECT'] === 'cloudshell-gca') {
+    delete process.env['GOOGLE_CLOUD_PROJECT'];
+  }
 }
 
 export function loadEnvironment(
@@ -553,10 +713,9 @@ export function loadEnvironment(
   workspaceDir: string,
   isWorkspaceTrustedFn = isWorkspaceTrusted,
 ): void {
-  const envFilePath = findEnvFile(workspaceDir);
   const trustResult = isWorkspaceTrustedFn(settings, workspaceDir);
-
   const isTrusted = trustResult.isTrusted ?? false;
+
   // Check settings OR check process.argv directly since this might be called
   // before arguments are fully parsed. This is a best-effort sniffing approach
   // that happens early in the CLI lifecycle. It is designed to detect the
@@ -572,9 +731,21 @@ export function loadEnvironment(
     relevantArgs.includes('-s') ||
     relevantArgs.includes('--sandbox');
 
+  const shouldIgnoreEnv =
+    !!settings.advanced?.ignoreLocalEnv ||
+    relevantArgs.includes('--ignore-env');
+
+  const envFilePath = findEnvFile(workspaceDir, isTrusted, shouldIgnoreEnv);
+
   // Cloud Shell environment variable handling
   if (process.env['CLOUD_SHELL'] === 'true') {
-    setUpCloudShellEnvironment(envFilePath, isTrusted, isSandboxed);
+    const selectedAuthType = settings.security?.auth?.selectedType;
+    setUpCloudShellEnvironment(
+      envFilePath,
+      isTrusted,
+      isSandboxed,
+      selectedAuthType,
+    );
   }
 
   if (envFilePath) {
@@ -591,8 +762,8 @@ export function loadEnvironment(
       for (const key in parsedEnv) {
         if (Object.hasOwn(parsedEnv, key)) {
           let value = parsedEnv[key];
-          // If the workspace is untrusted but we are sandboxed, only allow whitelisted variables.
-          if (!isTrusted && isSandboxed) {
+          // If the workspace is untrusted, only allow whitelisted variables.
+          if (!isTrusted) {
             if (!AUTH_ENV_VAR_WHITELIST.includes(key)) {
               continue;
             }
@@ -611,7 +782,7 @@ export function loadEnvironment(
           }
         }
       }
-    } catch (_e) {
+    } catch {
       // Errors are ignored to match the behavior of `dotenv.config({ quiet: true })`.
     }
   }
@@ -631,6 +802,10 @@ export function resetSettingsCacheForTesting() {
   settingsCache.clear();
 }
 
+export function isWorktreeEnabled(settings: LoadedSettings): boolean {
+  return settings.merged.experimental.worktrees;
+}
+
 /**
  * Loads settings from user and workspace directories.
  * Project settings override user settings.
@@ -642,6 +817,821 @@ export function loadSettings(
   return settingsCache.getOrCreate(normalizedWorkspaceDir, () =>
     _doLoadSettings(normalizedWorkspaceDir),
   );
+}
+
+/**
+ * A settings file as read from disk, before environment variable placeholders
+ * have been resolved.
+ */
+interface RawSettingsFile {
+  rawSettings: Settings;
+  rawJson?: string;
+}
+
+function getParentRecord(
+  root: unknown,
+  objectPath: readonly string[],
+): Record<string, unknown> | undefined {
+  let current = root;
+  for (let i = 0; i < objectPath.length - 1; i++) {
+    if (!isRecord(current)) {
+      return undefined;
+    }
+    current = current[objectPath[i]];
+  }
+  return isRecord(current) ? current : undefined;
+}
+
+/**
+ * When a settings object fails full-schema validation (for example, during the
+ * preliminary pre-`.env` pass when a typed field still holds an unexpanded
+ * `$VAR` placeholder), re-runs validation on a copy with the failing object
+ * properties removed so that all valid fields (such as boolean/number shell
+ * variables) are still coerced to their target types.
+ */
+function coerceValidSettings(
+  expandedSettings: Settings,
+  issues: ReadonlyArray<{ path: ReadonlyArray<string | number> }>,
+): Settings {
+  const clone = structuredClone(expandedSettings);
+  const pathsToRestore: string[][] = [];
+
+  for (const issue of issues) {
+    const firstNumberIdx = issue.path.findIndex((p) => typeof p === 'number');
+    const objectPath = (
+      firstNumberIdx === -1 ? issue.path : issue.path.slice(0, firstNumberIdx)
+    ).filter((p): p is string => typeof p === 'string');
+
+    if (objectPath.length === 0) {
+      return expandedSettings;
+    }
+
+    const lastKey = objectPath[objectPath.length - 1];
+    const container = getParentRecord(clone, objectPath);
+    if (container && Object.hasOwn(container, lastKey)) {
+      delete container[lastKey];
+      pathsToRestore.push(objectPath);
+    }
+  }
+
+  const partialValidation = validateSettings(clone);
+  if (!partialValidation.success || !partialValidation.data) {
+    return expandedSettings;
+  }
+
+  const coerced = partialValidation.data as Settings;
+  for (const objectPath of pathsToRestore) {
+    const lastKey = objectPath[objectPath.length - 1];
+    const sourceContainer = getParentRecord(expandedSettings, objectPath);
+    const targetContainer = getParentRecord(coerced, objectPath);
+    if (
+      sourceContainer &&
+      targetContainer &&
+      Object.hasOwn(sourceContainer, lastKey)
+    ) {
+      targetContainer[lastKey] = sourceContainer[lastKey];
+    }
+  }
+
+  return coerced;
+}
+
+function normalizeLegacyTheme(settings: Settings): void {
+  if (settings.ui?.theme === 'VS') {
+    settings.ui.theme = DefaultLight.name;
+  } else if (settings.ui?.theme === 'VS2015') {
+    settings.ui.theme = DefaultDark.name;
+  }
+}
+
+/**
+ * Expands environment variable placeholders in `rawSettings` against the
+ * current `process.env` and validates the result.
+ *
+ * Validation issues are only recorded in `settingsErrors` when provided, so
+ * that the preliminary pass (which runs before `.env` files are loaded) does
+ * not report placeholders that are resolved later on.
+ */
+function resolveSettings(
+  rawSettings: Settings,
+  filePath: string,
+  settingsErrors?: SettingsError[],
+): Settings {
+  if (Object.keys(rawSettings).length === 0) {
+    return {};
+  }
+
+  const expandedSettings = resolveEnvVarsInObject(rawSettings);
+
+  // Validate settings structure with Zod after environment variable expansion
+  const validationResult = validateSettings(expandedSettings);
+  if (!validationResult.success && validationResult.error) {
+    if (settingsErrors) {
+      settingsErrors.push({
+        message: formatValidationError(validationResult.error, filePath),
+        path: filePath,
+        severity: 'warning',
+      });
+    }
+    return coerceValidSettings(expandedSettings, validationResult.error.issues);
+  }
+
+  // Since we've successfully validated expandedSettings against settingsZodSchema,
+  // it's safe to cast the resulting data to the Settings type.
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+  return (validationResult.data as Settings) ?? expandedSettings;
+}
+
+const SCRIPT_INTERPRETERS = new Set([
+  'sh',
+  'bash',
+  'zsh',
+  'dash',
+  'ksh',
+  'fish',
+  'csh',
+  'tcsh',
+  'node',
+  'nodejs',
+  'python',
+  'python2',
+  'python3',
+  'py',
+  'ruby',
+  'perl',
+  'php',
+  'lua',
+  'rscript',
+  'pwsh',
+  'powershell',
+  'deno',
+  'bun',
+  'tsx',
+  'ts-node',
+  'ts-node-esm',
+  'cmd',
+  'osascript',
+  'cscript',
+  'wscript',
+]);
+
+const WINDOWS_SLASH_FLAG_INTERPRETERS = new Set(['cmd', 'cscript', 'wscript']);
+
+const INLINE_EVAL_FLAGS = new Set([
+  '-c',
+  '-e',
+  '-E',
+  '--eval',
+  '-p',
+  '--print',
+  '-command',
+  '-encodedcommand',
+]);
+
+const PRELOAD_FLAGS = new Set([
+  '-r',
+  '--require',
+  '--import',
+  '--loader',
+  '--experimental-loader',
+  '--preload',
+  '--env-file',
+  '--env-file-if-exists',
+  '-f',
+  '-file',
+]);
+
+const SCRIPT_EXTENSIONS = new Set([
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.jsx',
+  '.node',
+  '.ts',
+  '.mts',
+  '.cts',
+  '.tsx',
+  '.py',
+  '.pyw',
+  '.py3',
+  '.pyz',
+  '.sh',
+  '.bash',
+  '.zsh',
+  '.ksh',
+  '.fish',
+  '.csh',
+  '.pl',
+  '.pm',
+  '.rb',
+  '.php',
+  '.phar',
+  '.lua',
+  '.r',
+  '.ps1',
+  '.psm1',
+  '.cmd',
+  '.bat',
+  '.vbs',
+  '.vbe',
+  '.jse',
+  '.wsf',
+  '.wsh',
+  '.scpt',
+  '.scptd',
+  '.applescript',
+]);
+
+const NON_SCRIPT_VALUE_FLAGS = new Set([
+  '-W',
+  '-m',
+  '-I',
+  '-M',
+  '-K',
+  '-F',
+  '-C',
+  '-P',
+  '--project',
+  '--config',
+  '--log-file',
+  '--max-old-space-size',
+  '--inspect-port',
+  '--debug-port',
+  '--conditions',
+  '--input-type',
+  '--title',
+  '-executionpolicy',
+]);
+
+const KNOWN_BOOLEAN_FLAGS = new Set([
+  '-x',
+  '-v',
+  '-n',
+  '-u',
+  '-w',
+  '-d',
+  '-O',
+  '-B',
+  '-s',
+  '-S',
+  '-i',
+  '-t',
+  '--watch',
+  '--no-warnings',
+  '--trace-warnings',
+  '--inspect',
+  '--inspect-brk',
+  '--enable-source-maps',
+  '--preserve-symlinks',
+  '--no-deprecation',
+  '--throw-deprecation',
+  '-noprofile',
+  '-noninteractive',
+  '-sta',
+  '-mta',
+]);
+
+const SUBCOMMAND_INTERPRETERS = new Set(['deno', 'bun']);
+const INTERPRETER_SUBCOMMANDS = new Set(['run', 'x', 'serve', 'test', 'bench']);
+
+const IMPLICIT_SCRIPT_EXTENSIONS = [
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.ts',
+  '.mts',
+  '.cts',
+  '.py',
+  '.ps1',
+];
+
+interface SystemMcpCommandCheckContext {
+  workspaceDir: string;
+  settingsFilePath: string;
+  fileLabel: string;
+  securityCache: PathSecurityCache;
+  settingsErrors: SettingsError[];
+}
+
+function getCommandBaseName(command: string): string | undefined {
+  return command
+    .split(/[\\/]/)
+    .pop()
+    ?.toLowerCase()
+    .replace(/\.(exe|cmd|bat)$/, '');
+}
+
+function isExplicitCommandPath(command: string): boolean {
+  return (
+    path.isAbsolute(command) || command.includes('/') || command.includes('\\')
+  );
+}
+
+function resolveMcpCommandPath(
+  command: string,
+  cwd: string | undefined,
+  workspaceDir: string,
+): string {
+  if (path.isAbsolute(command) || /^[a-zA-Z]:[\\/]/.test(command)) {
+    return command;
+  }
+  const baseDir = cwd ? path.resolve(workspaceDir, cwd) : workspaceDir;
+  return path.resolve(baseDir, command);
+}
+
+function hasExistingScriptOnDisk(resolvedPath: string): boolean {
+  try {
+    if (fs.existsSync(resolvedPath)) {
+      return true;
+    }
+    for (const ext of IMPLICIT_SCRIPT_EXTENSIONS) {
+      if (fs.existsSync(`${resolvedPath}${ext}`)) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function isScriptPathCandidate(
+  token: string,
+  cwd: string | undefined,
+  workspaceDir: string,
+): boolean {
+  if (/^\d+$/.test(token)) {
+    return false;
+  }
+  const ext = path.extname(token).toLowerCase();
+  if (ext !== '') {
+    return SCRIPT_EXTENSIONS.has(ext);
+  }
+  if (isExplicitCommandPath(token)) {
+    return true;
+  }
+  return hasExistingScriptOnDisk(
+    resolveMcpCommandPath(token, cwd, workspaceDir),
+  );
+}
+
+function isPreloadTargetCandidate(
+  token: string,
+  cwd: string | undefined,
+  workspaceDir: string,
+): boolean {
+  return (
+    isExplicitCommandPath(token) ||
+    isScriptPathCandidate(token, cwd, workspaceDir)
+  );
+}
+
+function expandCandidatePaths(resolvedPath: string): string[] {
+  const paths = [resolvedPath];
+  if (path.extname(resolvedPath) !== '') {
+    return paths;
+  }
+  for (const ext of IMPLICIT_SCRIPT_EXTENSIONS) {
+    const withExt = `${resolvedPath}${ext}`;
+    try {
+      if (fs.existsSync(withExt)) {
+        paths.push(withExt);
+      }
+    } catch {
+      paths.push(withExt);
+    }
+  }
+  return paths;
+}
+
+function unwrapEnvInvocation(
+  command: string,
+  args: string[] | undefined,
+  cwd: string | undefined,
+  workspaceDir: string,
+): {
+  command: string;
+  args: string[];
+  cwd: string | undefined;
+  wrapperPaths: string[];
+  unsafeSplitString?: string;
+} {
+  let currentCmd = command.trim();
+  let currentArgs = [...(args ?? [])];
+  let effectiveCwd = cwd;
+  const wrapperPaths: string[] = [];
+
+  while (currentCmd && getCommandBaseName(currentCmd) === 'env') {
+    if (isExplicitCommandPath(currentCmd)) {
+      wrapperPaths.push(currentCmd);
+    }
+    let idx = 0;
+    let stopEnvOptions = false;
+    while (idx < currentArgs.length) {
+      const token = currentArgs[idx]?.trim() ?? '';
+      if (!token) {
+        idx++;
+        continue;
+      }
+      if (!stopEnvOptions && token === '--') {
+        stopEnvOptions = true;
+        idx++;
+        continue;
+      }
+      if (!stopEnvOptions && token.startsWith('-') && token !== '-') {
+        if (token === '-u' || token === '--unset') {
+          idx += 2;
+          continue;
+        }
+        if (token === '-C' || token === '--chdir') {
+          const dirArg = currentArgs[idx + 1]?.trim();
+          if (dirArg) {
+            effectiveCwd = effectiveCwd
+              ? path.resolve(workspaceDir, effectiveCwd, dirArg)
+              : dirArg;
+          }
+          idx += 2;
+          continue;
+        }
+        if (token.startsWith('--chdir=')) {
+          const dirArg = token.slice('--chdir='.length).trim();
+          if (dirArg) {
+            effectiveCwd = effectiveCwd
+              ? path.resolve(workspaceDir, effectiveCwd, dirArg)
+              : dirArg;
+          }
+          idx++;
+          continue;
+        }
+        if (
+          token === '-S' ||
+          token === '--split-string' ||
+          token.startsWith('-S') ||
+          token.startsWith('--split-string=')
+        ) {
+          const splitRaw =
+            token === '-S' || token === '--split-string'
+              ? (currentArgs[idx + 1] ?? '')
+              : token.startsWith('--split-string=')
+                ? token.slice('--split-string='.length)
+                : token.slice(2);
+          const consumed = token === '-S' || token === '--split-string' ? 2 : 1;
+          try {
+            const parsed = parse(splitRaw);
+            const strTokens = parsed.filter(
+              (t): t is string => typeof t === 'string',
+            );
+            if (strTokens.length !== parsed.length) {
+              return {
+                command: '',
+                args: [],
+                cwd: effectiveCwd,
+                wrapperPaths,
+                unsafeSplitString: splitRaw,
+              };
+            }
+            currentArgs = [...strTokens, ...currentArgs.slice(idx + consumed)];
+            idx = 0;
+            continue;
+          } catch {
+            return {
+              command: '',
+              args: [],
+              cwd: effectiveCwd,
+              wrapperPaths,
+              unsafeSplitString: splitRaw,
+            };
+          }
+        }
+        idx++;
+        continue;
+      }
+      if (token.includes('=') && !token.startsWith('=')) {
+        idx++;
+        continue;
+      }
+      break;
+    }
+    if (idx < currentArgs.length) {
+      currentCmd = currentArgs[idx]?.trim() ?? '';
+      currentArgs = currentArgs.slice(idx + 1);
+    } else {
+      currentCmd = '';
+      currentArgs = [];
+    }
+  }
+
+  return {
+    command: currentCmd,
+    args: currentArgs,
+    cwd: effectiveCwd,
+    wrapperPaths,
+  };
+}
+
+function extractInterpreterScriptArgs(
+  command: string,
+  args: string[] | undefined,
+  cwd: string | undefined,
+  workspaceDir: string,
+): string[] {
+  if (!args || args.length === 0) {
+    return [];
+  }
+  const baseName = getCommandBaseName(command);
+  if (!baseName || !SCRIPT_INTERPRETERS.has(baseName)) {
+    return [];
+  }
+  const candidates: string[] = [];
+  let expectPreloadValue = false;
+  let skipNextValue = false;
+  let prevWasUnknownFlag = false;
+  let sawSubcommand = false;
+  let afterDoubleDash = false;
+
+  for (const arg of args) {
+    const trimmed = arg.trim();
+    if (!trimmed) continue;
+
+    if (afterDoubleDash) {
+      if (isPreloadTargetCandidate(trimmed, cwd, workspaceDir)) {
+        candidates.push(trimmed);
+      }
+      break;
+    }
+
+    if (expectPreloadValue) {
+      if (isPreloadTargetCandidate(trimmed, cwd, workspaceDir)) {
+        candidates.push(trimmed);
+      }
+      expectPreloadValue = false;
+      prevWasUnknownFlag = false;
+      continue;
+    }
+
+    if (skipNextValue) {
+      skipNextValue = false;
+      prevWasUnknownFlag = false;
+      continue;
+    }
+
+    if (trimmed === '--') {
+      afterDoubleDash = true;
+      prevWasUnknownFlag = false;
+      continue;
+    }
+
+    if (
+      WINDOWS_SLASH_FLAG_INTERPRETERS.has(baseName) &&
+      /^\/(\/)?[a-zA-Z?][a-zA-Z0-9:_-]*$/.test(trimmed)
+    ) {
+      prevWasUnknownFlag = false;
+      continue;
+    }
+
+    if (trimmed.startsWith('-') && trimmed !== '-') {
+      const eqIndex = trimmed.indexOf('=');
+      const rawFlag = eqIndex >= 0 ? trimmed.slice(0, eqIndex) : trimmed;
+      const flagName = rawFlag.length === 2 ? rawFlag : rawFlag.toLowerCase();
+      if (INLINE_EVAL_FLAGS.has(flagName)) {
+        break;
+      }
+      if (PRELOAD_FLAGS.has(flagName)) {
+        if (eqIndex >= 0) {
+          const inlineValue = trimmed.slice(eqIndex + 1).trim();
+          if (
+            inlineValue &&
+            isPreloadTargetCandidate(inlineValue, cwd, workspaceDir)
+          ) {
+            candidates.push(inlineValue);
+          }
+          prevWasUnknownFlag = false;
+        } else {
+          expectPreloadValue = true;
+          prevWasUnknownFlag = false;
+        }
+      } else if (eqIndex < 0 && NON_SCRIPT_VALUE_FLAGS.has(flagName)) {
+        skipNextValue = true;
+        prevWasUnknownFlag = false;
+      } else {
+        prevWasUnknownFlag = eqIndex < 0 && !KNOWN_BOOLEAN_FLAGS.has(flagName);
+      }
+      continue;
+    }
+
+    if (
+      !sawSubcommand &&
+      candidates.length === 0 &&
+      SUBCOMMAND_INTERPRETERS.has(baseName) &&
+      INTERPRETER_SUBCOMMANDS.has(trimmed.toLowerCase())
+    ) {
+      sawSubcommand = true;
+      prevWasUnknownFlag = false;
+      continue;
+    }
+
+    if (isScriptPathCandidate(trimmed, cwd, workspaceDir)) {
+      candidates.push(trimmed);
+      if (!prevWasUnknownFlag) {
+        break;
+      }
+    }
+    prevWasUnknownFlag = false;
+  }
+
+  return candidates;
+}
+
+function findInsecureMcpTarget(
+  command: string | undefined,
+  args: string[] | undefined,
+  cwd: string | undefined,
+  ctx: SystemMcpCommandCheckContext,
+): { target: string; reason: string } | undefined {
+  const initialCmd = command?.trim();
+  if (!initialCmd) {
+    return undefined;
+  }
+  const unwrapped = unwrapEnvInvocation(
+    initialCmd,
+    args,
+    cwd,
+    ctx.workspaceDir,
+  );
+  if (unwrapped.unsafeSplitString !== undefined) {
+    return {
+      target: unwrapped.unsafeSplitString,
+      reason: 'Unsupported shell operators or malformed env -S string.',
+    };
+  }
+  for (const wrapperPath of unwrapped.wrapperPaths) {
+    const resolvedWrapper = resolveMcpCommandPath(
+      wrapperPath,
+      cwd,
+      ctx.workspaceDir,
+    );
+    const wrapperCheck = isFileAndDirectorySecureSync(
+      resolvedWrapper,
+      ctx.securityCache,
+    );
+    if (!wrapperCheck.secure) {
+      return {
+        target: wrapperPath,
+        reason: wrapperCheck.reason ?? 'Insecure file or directory.',
+      };
+    }
+  }
+  if (!unwrapped.command) {
+    return undefined;
+  }
+  const effectiveCwd = unwrapped.cwd;
+  const candidates: string[] = [];
+  if (
+    isExplicitCommandPath(unwrapped.command) ||
+    (path.extname(unwrapped.command) !== '' &&
+      isScriptPathCandidate(unwrapped.command, effectiveCwd, ctx.workspaceDir))
+  ) {
+    candidates.push(unwrapped.command);
+  }
+  candidates.push(
+    ...extractInterpreterScriptArgs(
+      unwrapped.command,
+      unwrapped.args,
+      effectiveCwd,
+      ctx.workspaceDir,
+    ),
+  );
+  for (const target of candidates) {
+    const resolved = resolveMcpCommandPath(
+      target,
+      effectiveCwd,
+      ctx.workspaceDir,
+    );
+    for (const candidatePath of expandCandidatePaths(resolved)) {
+      const check = isFileAndDirectorySecureSync(
+        candidatePath,
+        ctx.securityCache,
+      );
+      if (!check.secure) {
+        return {
+          target,
+          reason: check.reason ?? 'Insecure file or directory.',
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+function sanitizeSystemMcpServerMap(
+  settings: Settings,
+  ctx: SystemMcpCommandCheckContext,
+): string[] {
+  const skipped: string[] = [];
+  for (const [serverName, serverConfig] of Object.entries(
+    settings.mcpServers ?? {},
+  )) {
+    const insecure = findInsecureMcpTarget(
+      serverConfig.command,
+      serverConfig.args,
+      serverConfig.cwd,
+      ctx,
+    );
+    if (!insecure) continue;
+    ctx.settingsErrors.push({
+      message: `Security Warning: Skipping MCP server '${serverName}' in ${ctx.fileLabel} file '${ctx.settingsFilePath}' due to insecure command path '${insecure.target}': ${insecure.reason}`,
+      path: ctx.settingsFilePath,
+      severity: 'warning',
+    });
+    delete settings.mcpServers?.[serverName];
+    skipped.push(serverName);
+  }
+  return skipped;
+}
+
+function sanitizeSystemMcpServerCommand(
+  settings: Settings,
+  ctx: SystemMcpCommandCheckContext,
+): void {
+  if (!settings.mcp?.serverCommand) {
+    return;
+  }
+  let tokens: string[];
+  try {
+    const parsedTokens = parse(settings.mcp.serverCommand);
+    const stringTokens = parsedTokens.filter(
+      (token): token is string => typeof token === 'string',
+    );
+    if (stringTokens.length !== parsedTokens.length) {
+      ctx.settingsErrors.push({
+        message: `Security Warning: Skipping mcp.serverCommand in ${ctx.fileLabel} file '${ctx.settingsFilePath}' due to presence of shell operators.`,
+        path: ctx.settingsFilePath,
+        severity: 'warning',
+      });
+      delete settings.mcp.serverCommand;
+      return;
+    }
+    tokens = stringTokens;
+  } catch (err) {
+    ctx.settingsErrors.push({
+      message: `Security Warning: Skipping mcp.serverCommand in ${ctx.fileLabel} file '${ctx.settingsFilePath}' due to parse failure: ${getErrorMessage(err)}`,
+      path: ctx.settingsFilePath,
+      severity: 'warning',
+    });
+    delete settings.mcp.serverCommand;
+    return;
+  }
+  const insecure = findInsecureMcpTarget(
+    tokens[0],
+    tokens.slice(1),
+    undefined,
+    ctx,
+  );
+  if (!insecure) {
+    return;
+  }
+  ctx.settingsErrors.push({
+    message: `Security Warning: Skipping mcp.serverCommand in ${ctx.fileLabel} file '${ctx.settingsFilePath}' due to insecure command path '${insecure.target}': ${insecure.reason}`,
+    path: ctx.settingsFilePath,
+    severity: 'warning',
+  });
+  delete settings.mcp.serverCommand;
+}
+
+function stripBlockedMcpServers(
+  settings: Settings,
+  blockedIds: ReadonlySet<string>,
+): void {
+  if (blockedIds.size === 0 || !settings.mcpServers) {
+    return;
+  }
+  for (const key of Object.keys(settings.mcpServers)) {
+    if (blockedIds.has(key.toLowerCase().trim())) {
+      delete settings.mcpServers[key];
+    }
+  }
+}
+
+function blockSkippedSystemMcpServers(
+  skippedServers: string[],
+  allScopes: Settings[],
+  systemSettings: Settings,
+): Set<string> {
+  const blockedIds = new Set(
+    skippedServers.map((name) => name.toLowerCase().trim()),
+  );
+  if (blockedIds.size === 0) {
+    return blockedIds;
+  }
+  for (const scopeSettings of allScopes) {
+    stripBlockedMcpServers(scopeSettings, blockedIds);
+  }
+  const existingExcluded = systemSettings.mcp?.excluded ?? [];
+  systemSettings.mcp = {
+    ...systemSettings.mcp,
+    excluded: [...new Set([...existingExcluded, ...skippedServers])],
+  };
+  return blockedIds;
 }
 
 /**
@@ -659,7 +1649,11 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
   const storage = new Storage(workspaceDir);
   const workspaceSettingsPath = storage.getWorkspaceSettingsPath();
 
-  const load = (filePath: string): { settings: Settings; rawJson?: string } => {
+  /**
+   * Reads and parses a settings file. Environment variable placeholders are
+   * intentionally left unresolved here, see `resolveSettings` above.
+   */
+  const load = (filePath: string): RawSettingsFile => {
     try {
       if (fs.existsSync(filePath)) {
         const content = fs.readFileSync(filePath, 'utf-8');
@@ -675,27 +1669,10 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
             path: filePath,
             severity: 'error',
           });
-          return { settings: {} };
+          return { rawSettings: {} };
         }
 
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        const settingsObject = rawSettings as Record<string, unknown>;
-
-        // Validate settings structure with Zod
-        const validationResult = validateSettings(settingsObject);
-        if (!validationResult.success && validationResult.error) {
-          const errorMessage = formatValidationError(
-            validationResult.error,
-            filePath,
-          );
-          settingsErrors.push({
-            message: errorMessage,
-            path: filePath,
-            severity: 'warning',
-          });
-        }
-
-        return { settings: settingsObject as Settings, rawJson: content };
+        return { rawSettings: rawSettings as Settings, rawJson: content };
       }
     } catch (error: unknown) {
       settingsErrors.push({
@@ -704,45 +1681,93 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
         severity: 'error',
       });
     }
-    return { settings: {} };
+    return { rawSettings: {} };
   };
 
-  const systemResult = load(systemSettingsPath);
-  const systemDefaultsResult = load(systemDefaultsPath);
+  const securityCache = createPathSecurityCache();
+
+  const loadSystemFile = (
+    filePath: string,
+    fileLabel: string,
+  ): RawSettingsFile => {
+    if (!fs.existsSync(filePath)) {
+      return { rawSettings: {} };
+    }
+
+    const check = isFileAndDirectorySecureSync(filePath, securityCache);
+    if (!check.secure) {
+      settingsErrors.push({
+        message: `Security Warning: Skipping ${fileLabel} file '${filePath}': ${check.reason}`,
+        path: filePath,
+        severity: 'warning',
+      });
+      return { rawSettings: {} };
+    }
+
+    return load(filePath);
+  };
+
+  const systemResult = loadSystemFile(systemSettingsPath, 'system settings');
+  const systemDefaultsResult = loadSystemFile(
+    systemDefaultsPath,
+    'system defaults',
+  );
   const userResult = load(USER_SETTINGS_PATH);
 
-  let workspaceResult: { settings: Settings; rawJson?: string } = {
-    settings: {} as Settings,
-    rawJson: undefined,
-  };
+  let workspaceResult: RawSettingsFile = { rawSettings: {} };
   if (!storage.isWorkspaceHomeDir()) {
     workspaceResult = load(workspaceSettingsPath);
   }
 
-  const systemOriginalSettings = structuredClone(systemResult.settings);
+  // Support environment variable override from relaunch supervisor across exit code 199
+  const envAuthOverride = process.env['GEMINI_CLI_AUTH_OVERRIDE'];
+  if (envAuthOverride) {
+    delete process.env['GEMINI_CLI_AUTH_OVERRIDE'];
+  }
+  const authOverride =
+    envAuthOverride &&
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+    Object.values(AuthType).includes(envAuthOverride as AuthType)
+      ? // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+        (envAuthOverride as AuthType)
+      : undefined;
+  if (authOverride) {
+    // Applied to the raw settings so that the override is reflected both in
+    // the resolved settings and in the persisted `originalSettings`.
+    userResult.rawSettings = {
+      ...userResult.rawSettings,
+      security: {
+        ...userResult.rawSettings?.security,
+        auth: {
+          ...userResult.rawSettings?.security?.auth,
+          selectedType: authOverride,
+        },
+      },
+    };
+  }
+
+  const systemOriginalSettings = structuredClone(systemResult.rawSettings);
   const systemDefaultsOriginalSettings = structuredClone(
-    systemDefaultsResult.settings,
+    systemDefaultsResult.rawSettings,
   );
-  const userOriginalSettings = structuredClone(userResult.settings);
-  const workspaceOriginalSettings = structuredClone(workspaceResult.settings);
+  const userOriginalSettings = structuredClone(userResult.rawSettings);
+  const workspaceOriginalSettings = structuredClone(
+    workspaceResult.rawSettings,
+  );
 
-  // Environment variables for runtime use
-  systemSettings = resolveEnvVarsInObject(systemResult.settings);
-  systemDefaultSettings = resolveEnvVarsInObject(systemDefaultsResult.settings);
-  userSettings = resolveEnvVarsInObject(userResult.settings);
-  workspaceSettings = resolveEnvVarsInObject(workspaceResult.settings);
-
-  // Support legacy theme names
-  if (userSettings.ui?.theme === 'VS') {
-    userSettings.ui.theme = DefaultLight.name;
-  } else if (userSettings.ui?.theme === 'VS2015') {
-    userSettings.ui.theme = DefaultDark.name;
-  }
-  if (workspaceSettings.ui?.theme === 'VS') {
-    workspaceSettings.ui.theme = DefaultLight.name;
-  } else if (workspaceSettings.ui?.theme === 'VS2015') {
-    workspaceSettings.ui.theme = DefaultDark.name;
-  }
+  // Preliminary pass: resolve placeholders against the environment as it is
+  // before any `.env` file is loaded. The workspace trust check only depends on
+  // system and user settings, so workspace settings are not resolved before
+  // trust is established.
+  systemSettings = resolveSettings(
+    systemResult.rawSettings,
+    systemSettingsPath,
+  );
+  systemDefaultSettings = resolveSettings(
+    systemDefaultsResult.rawSettings,
+    systemDefaultsPath,
+  );
+  userSettings = resolveSettings(userResult.rawSettings, USER_SETTINGS_PATH);
 
   // For the initial trust check, we can only use user and system settings.
   const initialTrustCheckSettings = customDeepMerge(
@@ -754,7 +1779,14 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
   );
   const isTrusted =
     isWorkspaceTrusted(initialTrustCheckSettings as Settings, workspaceDir)
-      .isTrusted ?? false;
+      ?.isTrusted ?? false;
+
+  if (isTrusted) {
+    workspaceSettings = resolveSettings(
+      workspaceResult.rawSettings,
+      workspaceSettingsPath,
+    );
+  }
 
   // Create a temporary merged settings object to pass to loadEnvironment.
   const tempMergedSettings = mergeSettings(
@@ -768,6 +1800,63 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
   // loadEnvironment depends on settings so we have to create a temp version of
   // the settings to avoid a cycle
   loadEnvironment(tempMergedSettings, workspaceDir);
+
+  // Final pass: variables from `.env` files are now part of `process.env`, so
+  // resolve the settings again to expand the placeholders that reference them.
+  // Validation issues are only reported from this pass. Workspace settings are
+  // only resolved and validated when the workspace is trusted.
+  systemSettings = resolveSettings(
+    systemResult.rawSettings,
+    systemSettingsPath,
+    settingsErrors,
+  );
+  systemDefaultSettings = resolveSettings(
+    systemDefaultsResult.rawSettings,
+    systemDefaultsPath,
+    settingsErrors,
+  );
+  userSettings = resolveSettings(
+    userResult.rawSettings,
+    USER_SETTINGS_PATH,
+    settingsErrors,
+  );
+  workspaceSettings = isTrusted
+    ? resolveSettings(
+        workspaceResult.rawSettings,
+        workspaceSettingsPath,
+        settingsErrors,
+      )
+    : {};
+
+  const systemCheckCtx: SystemMcpCommandCheckContext = {
+    workspaceDir,
+    settingsFilePath: systemSettingsPath,
+    fileLabel: 'system settings',
+    securityCache,
+    settingsErrors,
+  };
+  const defaultsCheckCtx: SystemMcpCommandCheckContext = {
+    workspaceDir,
+    settingsFilePath: systemDefaultsPath,
+    fileLabel: 'system defaults',
+    securityCache,
+    settingsErrors,
+  };
+  const skippedSystemServers = [
+    ...sanitizeSystemMcpServerMap(systemSettings, systemCheckCtx),
+    ...sanitizeSystemMcpServerMap(systemDefaultSettings, defaultsCheckCtx),
+  ];
+  sanitizeSystemMcpServerCommand(systemSettings, systemCheckCtx);
+  sanitizeSystemMcpServerCommand(systemDefaultSettings, defaultsCheckCtx);
+  const blockedSystemMcpServerIds = blockSkippedSystemMcpServers(
+    skippedSystemServers,
+    [systemSettings, systemDefaultSettings, userSettings, workspaceSettings],
+    systemSettings,
+  );
+
+  // Support legacy theme names
+  normalizeLegacyTheme(userSettings);
+  normalizeLegacyTheme(workspaceSettings);
 
   // Check for any fatal errors before proceeding
   const fatalErrors = settingsErrors.filter((e) => e.severity === 'error');
@@ -811,6 +1900,7 @@ function _doLoadSettings(workspaceDir: string): LoadedSettings {
     },
     isTrusted,
     settingsErrors,
+    blockedSystemMcpServerIds,
   );
 
   // Automatically migrate deprecated settings when loading.
@@ -834,10 +1924,12 @@ export function migrateDeprecatedSettings(
   const systemWarnings: Map<LoadableSettingScope, string[]> = new Map();
 
   /**
-   * Helper to migrate a boolean setting and track it if it's deprecated.
+   * Helper to migrate a boolean setting in both runtime (`settings`) and
+   * persisted (`originalSettings`) records while preserving sibling placeholders.
    */
   const migrateBoolean = (
     settings: Record<string, unknown>,
+    originalSettings: Record<string, unknown>,
     oldKey: string,
     newKey: string,
     prefix: string,
@@ -852,16 +1944,22 @@ export function migrateDeprecatedSettings(
         foundDeprecated.push(prefix ? `${prefix}.${oldKey}` : oldKey);
       }
       if (typeof newValue === 'boolean') {
-        // Both exist, trust the new one
+        // Both exist, trust the new one (preserving any raw placeholder on newKey)
+        if (!(newKey in originalSettings)) {
+          originalSettings[newKey] = newValue;
+        }
         if (removeDeprecated) {
           delete settings[oldKey];
+          delete originalSettings[oldKey];
           modified = true;
         }
       } else {
         // Only old exists, migrate to new (inverted)
         settings[newKey] = !oldValue;
+        originalSettings[newKey] = !oldValue;
         if (removeDeprecated) {
           delete settings[oldKey];
+          delete originalSettings[oldKey];
         }
         modified = true;
       }
@@ -872,19 +1970,20 @@ export function migrateDeprecatedSettings(
   const processScope = (scope: LoadableSettingScope) => {
     const settingsFile = loadedSettings.forScope(scope);
     const settings = settingsFile.settings;
+    const originalSettings = settingsFile.originalSettings;
     const foundDeprecated: string[] = [];
 
     // Migrate general settings
-    const generalSettings = settings.general as
-      | Record<string, unknown>
-      | undefined;
+    const generalSettings = asRecord(settings.general);
     if (generalSettings) {
       const newGeneral = { ...generalSettings };
+      const newOriginalGeneral = { ...asRecord(originalSettings.general) };
       let modified = false;
 
       modified =
         migrateBoolean(
           newGeneral,
+          newOriginalGeneral,
           'disableAutoUpdate',
           'enableAutoUpdate',
           'general',
@@ -893,6 +1992,7 @@ export function migrateDeprecatedSettings(
       modified =
         migrateBoolean(
           newGeneral,
+          newOriginalGeneral,
           'disableUpdateNag',
           'enableAutoUpdateNotification',
           'general',
@@ -900,7 +2000,12 @@ export function migrateDeprecatedSettings(
         ) || modified;
 
       if (modified) {
-        loadedSettings.setValue(scope, 'general', newGeneral);
+        loadedSettings.setValue(
+          scope,
+          'general',
+          newGeneral,
+          newOriginalGeneral,
+        );
         if (!settingsFile.readOnly) {
           anyModified = true;
         }
@@ -908,19 +2013,22 @@ export function migrateDeprecatedSettings(
     }
 
     // Migrate ui settings
-    const uiSettings = settings.ui as Record<string, unknown> | undefined;
+    const uiSettings = asRecord(settings.ui);
     if (uiSettings) {
       const newUi = { ...uiSettings };
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      const accessibilitySettings = newUi['accessibility'] as
-        | Record<string, unknown>
-        | undefined;
+      const originalUi = asRecord(originalSettings.ui);
+      const newOriginalUi = { ...originalUi };
+      const accessibilitySettings = asRecord(newUi['accessibility']);
 
       if (accessibilitySettings) {
         const newAccessibility = { ...accessibilitySettings };
+        const newOriginalAccessibility = {
+          ...asRecord(originalUi?.['accessibility']),
+        };
         if (
           migrateBoolean(
             newAccessibility,
+            newOriginalAccessibility,
             'disableLoadingPhrases',
             'enableLoadingPhrases',
             'ui.accessibility',
@@ -928,7 +2036,8 @@ export function migrateDeprecatedSettings(
           )
         ) {
           newUi['accessibility'] = newAccessibility;
-          loadedSettings.setValue(scope, 'ui', newUi);
+          newOriginalUi['accessibility'] = newOriginalAccessibility;
+          loadedSettings.setValue(scope, 'ui', newUi, newOriginalUi);
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -942,7 +2051,8 @@ export function migrateDeprecatedSettings(
         ) {
           if (!enableLP) {
             newUi['loadingPhrases'] = 'off';
-            loadedSettings.setValue(scope, 'ui', newUi);
+            newOriginalUi['loadingPhrases'] = 'off';
+            loadedSettings.setValue(scope, 'ui', newUi, newOriginalUi);
             if (!settingsFile.readOnly) {
               anyModified = true;
             }
@@ -953,21 +2063,22 @@ export function migrateDeprecatedSettings(
     }
 
     // Migrate context settings
-    const contextSettings = settings.context as
-      | Record<string, unknown>
-      | undefined;
+    const contextSettings = asRecord(settings.context);
     if (contextSettings) {
       const newContext = { ...contextSettings };
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      const fileFilteringSettings = newContext['fileFiltering'] as
-        | Record<string, unknown>
-        | undefined;
+      const originalContext = asRecord(originalSettings.context);
+      const newOriginalContext = { ...originalContext };
+      const fileFilteringSettings = asRecord(newContext['fileFiltering']);
 
       if (fileFilteringSettings) {
         const newFileFiltering = { ...fileFilteringSettings };
+        const newOriginalFileFiltering = {
+          ...asRecord(originalContext?.['fileFiltering']),
+        };
         if (
           migrateBoolean(
             newFileFiltering,
+            newOriginalFileFiltering,
             'disableFuzzySearch',
             'enableFuzzySearch',
             'context.fileFiltering',
@@ -975,7 +2086,13 @@ export function migrateDeprecatedSettings(
           )
         ) {
           newContext['fileFiltering'] = newFileFiltering;
-          loadedSettings.setValue(scope, 'context', newContext);
+          newOriginalContext['fileFiltering'] = newOriginalFileFiltering;
+          loadedSettings.setValue(
+            scope,
+            'context',
+            newContext,
+            newOriginalContext,
+          );
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -984,19 +2101,26 @@ export function migrateDeprecatedSettings(
     }
 
     // Migrate tools settings
-    const toolsSettings = settings.tools as Record<string, unknown> | undefined;
+    const toolsSettings = asRecord(settings.tools);
     if (toolsSettings) {
       if (toolsSettings['approvalMode'] !== undefined) {
         foundDeprecated.push('tools.approvalMode');
 
-        const generalSettings =
-          (settings.general as Record<string, unknown> | undefined) || {};
-        const newGeneral = { ...generalSettings };
+        const originalTools = asRecord(originalSettings.tools);
+        const newGeneral = { ...asRecord(settings.general) };
+        const newOriginalGeneral = { ...asRecord(originalSettings.general) };
 
         // Only set defaultApprovalMode if it's not already set
         if (newGeneral['defaultApprovalMode'] === undefined) {
           newGeneral['defaultApprovalMode'] = toolsSettings['approvalMode'];
-          loadedSettings.setValue(scope, 'general', newGeneral);
+          newOriginalGeneral['defaultApprovalMode'] =
+            originalTools?.['approvalMode'] ?? toolsSettings['approvalMode'];
+          loadedSettings.setValue(
+            scope,
+            'general',
+            newGeneral,
+            newOriginalGeneral,
+          );
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -1004,8 +2128,10 @@ export function migrateDeprecatedSettings(
 
         if (removeDeprecated) {
           const newTools = { ...toolsSettings };
+          const newOriginalTools = { ...originalTools };
           delete newTools['approvalMode'];
-          loadedSettings.setValue(scope, 'tools', newTools);
+          delete newOriginalTools['approvalMode'];
+          loadedSettings.setValue(scope, 'tools', newTools, newOriginalTools);
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -1015,7 +2141,7 @@ export function migrateDeprecatedSettings(
 
     // Migrate experimental agent settings
     const experimentalModified = migrateExperimentalSettings(
-      settings,
+      settingsFile,
       loadedSettings,
       scope,
       removeDeprecated,
@@ -1099,111 +2225,187 @@ export function saveModelChange(
 }
 
 function migrateExperimentalSettings(
-  settings: Settings,
+  settingsFile: SettingsFile,
   loadedSettings: LoadedSettings,
   scope: LoadableSettingScope,
   removeDeprecated: boolean,
   foundDeprecated?: string[],
 ): boolean {
-  const experimentalSettings = settings.experimental as
-    | Record<string, unknown>
-    | undefined;
+  const settings = settingsFile.settings;
+  const originalSettings = settingsFile.originalSettings;
+  const experimentalSettings = asRecord(settings.experimental);
 
   if (experimentalSettings) {
-    const agentsSettings = {
-      ...(settings.agents as Record<string, unknown> | undefined),
-    };
-    const agentsOverrides = {
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-      ...((agentsSettings['overrides'] as Record<string, unknown>) || {}),
+    const originalExperimental = asRecord(originalSettings.experimental);
+    const agentsSettings = { ...asRecord(settings.agents) };
+    const agentsOverrides = { ...asRecord(agentsSettings['overrides']) };
+    const originalAgentsSettings = { ...asRecord(originalSettings.agents) };
+    const originalAgentsOverrides = {
+      ...asRecord(originalAgentsSettings['overrides']),
     };
     let modified = false;
+    let agentsModified = false;
+    let anyWritten = false;
 
-    const migrateExperimental = (
+    const migrateExperimental = <T = Record<string, unknown>>(
       oldKey: string,
-      migrateFn: (oldValue: Record<string, unknown>) => void,
+      migrateFn: (oldValue: T, rawOldValue: unknown) => void,
     ) => {
       const old = experimentalSettings[oldKey];
-      if (old) {
+      if (old !== undefined) {
         foundDeprecated?.push(`experimental.${oldKey}`);
         // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        migrateFn(old as Record<string, unknown>);
+        migrateFn(old as T, originalExperimental?.[oldKey]);
         modified = true;
       }
     };
 
     // Migrate codebaseInvestigatorSettings -> agents.overrides.codebase_investigator
-    migrateExperimental('codebaseInvestigatorSettings', (old) => {
+    migrateExperimental('codebaseInvestigatorSettings', (old, rawOldValue) => {
+      const oldObj = asRecord(old);
+      if (!oldObj) return;
+      const rawOld = asRecord(rawOldValue);
+
       const override = {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        ...(agentsOverrides['codebase_investigator'] as
-          | Record<string, unknown>
-          | undefined),
+        ...asRecord(agentsOverrides['codebase_investigator']),
+      };
+      const origOverride = {
+        ...asRecord(originalAgentsOverrides['codebase_investigator']),
       };
 
-      if (old['enabled'] !== undefined) override['enabled'] = old['enabled'];
+      if (oldObj['enabled'] !== undefined) {
+        override['enabled'] = oldObj['enabled'];
+        origOverride['enabled'] = rawOld?.['enabled'] ?? oldObj['enabled'];
+      }
 
-      const runConfig = {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        ...(override['runConfig'] as Record<string, unknown> | undefined),
-      };
-      if (old['maxNumTurns'] !== undefined)
-        runConfig['maxTurns'] = old['maxNumTurns'];
-      if (old['maxTimeMinutes'] !== undefined)
-        runConfig['maxTimeMinutes'] = old['maxTimeMinutes'];
-      if (Object.keys(runConfig).length > 0) override['runConfig'] = runConfig;
+      const runConfig = { ...asRecord(override['runConfig']) };
+      const origRunConfig = { ...asRecord(origOverride['runConfig']) };
+      if (oldObj['maxNumTurns'] !== undefined) {
+        runConfig['maxTurns'] = oldObj['maxNumTurns'];
+        origRunConfig['maxTurns'] =
+          rawOld?.['maxNumTurns'] ?? oldObj['maxNumTurns'];
+      }
+      if (oldObj['maxTimeMinutes'] !== undefined) {
+        runConfig['maxTimeMinutes'] = oldObj['maxTimeMinutes'];
+        origRunConfig['maxTimeMinutes'] =
+          rawOld?.['maxTimeMinutes'] ?? oldObj['maxTimeMinutes'];
+      }
+      if (Object.keys(runConfig).length > 0) {
+        override['runConfig'] = runConfig;
+        origOverride['runConfig'] = origRunConfig;
+      }
 
-      if (old['model'] !== undefined || old['thinkingBudget'] !== undefined) {
-        const modelConfig = {
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-          ...(override['modelConfig'] as Record<string, unknown> | undefined),
-        };
-        if (old['model'] !== undefined) modelConfig['model'] = old['model'];
-        if (old['thinkingBudget'] !== undefined) {
+      if (
+        oldObj['model'] !== undefined ||
+        oldObj['thinkingBudget'] !== undefined
+      ) {
+        const modelConfig = { ...asRecord(override['modelConfig']) };
+        const origModelConfig = { ...asRecord(origOverride['modelConfig']) };
+        if (oldObj['model'] !== undefined) {
+          modelConfig['model'] = oldObj['model'];
+          origModelConfig['model'] = rawOld?.['model'] ?? oldObj['model'];
+        }
+        if (oldObj['thinkingBudget'] !== undefined) {
           const generateContentConfig = {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-            ...(modelConfig['generateContentConfig'] as
-              | Record<string, unknown>
-              | undefined),
+            ...asRecord(modelConfig['generateContentConfig']),
+          };
+          const origGenerateContentConfig = {
+            ...asRecord(origModelConfig['generateContentConfig']),
           };
           const thinkingConfig = {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-            ...(generateContentConfig['thinkingConfig'] as
-              | Record<string, unknown>
-              | undefined),
+            ...asRecord(generateContentConfig['thinkingConfig']),
           };
-          thinkingConfig['thinkingBudget'] = old['thinkingBudget'];
+          const origThinkingConfig = {
+            ...asRecord(origGenerateContentConfig['thinkingConfig']),
+          };
+          thinkingConfig['thinkingBudget'] = oldObj['thinkingBudget'];
+          origThinkingConfig['thinkingBudget'] =
+            rawOld?.['thinkingBudget'] ?? oldObj['thinkingBudget'];
           generateContentConfig['thinkingConfig'] = thinkingConfig;
+          origGenerateContentConfig['thinkingConfig'] = origThinkingConfig;
           modelConfig['generateContentConfig'] = generateContentConfig;
+          origModelConfig['generateContentConfig'] = origGenerateContentConfig;
         }
         override['modelConfig'] = modelConfig;
+        origOverride['modelConfig'] = origModelConfig;
       }
 
       agentsOverrides['codebase_investigator'] = override;
+      originalAgentsOverrides['codebase_investigator'] = origOverride;
+      agentsModified = true;
     });
 
     // Migrate cliHelpAgentSettings -> agents.overrides.cli_help
-    migrateExperimental('cliHelpAgentSettings', (old) => {
-      const override = {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-        ...(agentsOverrides['cli_help'] as Record<string, unknown> | undefined),
-      };
-      if (old['enabled'] !== undefined) override['enabled'] = old['enabled'];
+    migrateExperimental('cliHelpAgentSettings', (old, rawOldValue) => {
+      const oldObj = asRecord(old);
+      if (!oldObj) return;
+      const rawOld = asRecord(rawOldValue);
+
+      const override = { ...asRecord(agentsOverrides['cli_help']) };
+      const origOverride = { ...asRecord(originalAgentsOverrides['cli_help']) };
+      if (oldObj['enabled'] !== undefined) {
+        override['enabled'] = oldObj['enabled'];
+        origOverride['enabled'] = rawOld?.['enabled'] ?? oldObj['enabled'];
+      }
       agentsOverrides['cli_help'] = override;
+      originalAgentsOverrides['cli_help'] = origOverride;
+      agentsModified = true;
     });
 
-    if (modified) {
-      agentsSettings['overrides'] = agentsOverrides;
-      loadedSettings.setValue(scope, 'agents', agentsSettings);
+    // Migrate experimental.plan -> general.plan.enabled
+    migrateExperimental<boolean>('plan', (planValue, rawPlanValue) => {
+      const newGeneral = { ...asRecord(settings.general) };
+      const newPlan = { ...asRecord(newGeneral['plan']) };
+      const originalGeneral = asRecord(originalSettings.general);
+      const newOriginalGeneral = { ...originalGeneral };
+      const newOriginalPlan = { ...asRecord(originalGeneral?.['plan']) };
 
-      if (removeDeprecated) {
-        const newExperimental = { ...experimentalSettings };
-        delete newExperimental['codebaseInvestigatorSettings'];
-        delete newExperimental['cliHelpAgentSettings'];
-        loadedSettings.setValue(scope, 'experimental', newExperimental);
+      if (newPlan['enabled'] === undefined) {
+        newPlan['enabled'] = planValue;
+        newGeneral['plan'] = newPlan;
+        newOriginalPlan['enabled'] = rawPlanValue ?? planValue;
+        newOriginalGeneral['plan'] = newOriginalPlan;
+        loadedSettings.setValue(
+          scope,
+          'general',
+          newGeneral,
+          newOriginalGeneral,
+        );
+        anyWritten = true;
       }
-      return true;
+    });
+
+    if (agentsModified) {
+      agentsSettings['overrides'] = agentsOverrides;
+      originalAgentsSettings['overrides'] = originalAgentsOverrides;
+      loadedSettings.setValue(
+        scope,
+        'agents',
+        agentsSettings,
+        originalAgentsSettings,
+      );
+      anyWritten = true;
     }
+
+    if (modified && removeDeprecated) {
+      const newExperimental = { ...experimentalSettings };
+      const newOriginalExperimental = { ...originalExperimental };
+      delete newExperimental['codebaseInvestigatorSettings'];
+      delete newExperimental['cliHelpAgentSettings'];
+      delete newExperimental['plan'];
+      delete newOriginalExperimental['codebaseInvestigatorSettings'];
+      delete newOriginalExperimental['cliHelpAgentSettings'];
+      delete newOriginalExperimental['plan'];
+      loadedSettings.setValue(
+        scope,
+        'experimental',
+        newExperimental,
+        newOriginalExperimental,
+      );
+      anyWritten = true;
+    }
+
+    return anyWritten;
   }
   return false;
 }

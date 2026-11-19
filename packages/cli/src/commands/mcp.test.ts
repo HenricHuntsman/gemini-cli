@@ -17,7 +17,7 @@ describe('mcp command', () => {
   });
 
   it('should show help when no subcommand is provided', async () => {
-    const yargsInstance = yargs();
+    const yargsInstance = yargs().locale('en');
     (mcpCommand.builder as (y: Argv) => Argv)(yargsInstance);
 
     const parser = yargsInstance.command(mcpCommand).help();
@@ -32,7 +32,7 @@ describe('mcp command', () => {
 
     try {
       await parser.parse('mcp');
-    } catch (_error) {
+    } catch {
       // yargs might throw an error when demandCommand is not met
     }
 

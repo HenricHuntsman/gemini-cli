@@ -18,6 +18,7 @@ import {
   isFatalToolError,
   debugLogger,
   coreEvents,
+  getErrorType,
   getErrorMessage,
 } from '@google/gemini-cli-core';
 import { runSyncCleanup } from './cleanup.js';
@@ -82,7 +83,7 @@ export function handleError(
       timestamp: new Date().toISOString(),
       status: 'error',
       error: {
-        type: error instanceof Error ? error.constructor.name : 'Error',
+        type: getErrorType(error),
         message: errorMessage,
       },
       stats: streamFormatter.convertToStreamStats(metrics, 0),
@@ -166,8 +167,11 @@ export function handleToolError(
 /**
  * Handles cancellation/abort signals consistently.
  */
-export function handleCancellationError(config: Config): never {
-  const cancellationError = new FatalCancellationError('Operation cancelled.');
+export function handleCancellationError(config: Config, exitCode = 130): never {
+  const cancellationError = new FatalCancellationError(
+    'Operation cancelled.',
+    exitCode,
+  );
 
   if (config.getOutputFormat() === OutputFormat.STREAM_JSON) {
     const streamFormatter = new StreamJsonFormatter();
@@ -177,7 +181,7 @@ export function handleCancellationError(config: Config): never {
       timestamp: new Date().toISOString(),
       status: 'error',
       error: {
-        type: 'FatalCancellationError',
+        type: getErrorType(cancellationError),
         message: cancellationError.message,
       },
       stats: streamFormatter.convertToStreamStats(metrics, 0),
@@ -218,7 +222,7 @@ export function handleMaxTurnsExceededError(config: Config): never {
       timestamp: new Date().toISOString(),
       status: 'error',
       error: {
-        type: 'FatalTurnLimitedError',
+        type: getErrorType(maxTurnsError),
         message: maxTurnsError.message,
       },
       stats: streamFormatter.convertToStreamStats(metrics, 0),
@@ -241,4 +245,19 @@ export function handleMaxTurnsExceededError(config: Config): never {
     runSyncCleanup();
     process.exit(maxTurnsError.exitCode);
   }
+}
+
+/**
+ * Type guard to check if an error is a FatalCancellationError.
+ */
+export function isFatalCancellationError(
+  error: unknown,
+): error is FatalCancellationError {
+  return (
+    error instanceof FatalCancellationError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      'name' in error &&
+      error.name === 'FatalCancellationError')
+  );
 }

@@ -11,7 +11,16 @@ import type * as os from 'node:os';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import { IDEServer } from './ide-server.js';
+import { OpenFilesManager } from './open-files-manager.js';
 import type { DiffManager } from './diff-manager.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { IdeContextNotificationSchema } from '@google/gemini-cli-core/src/ide/types.js';
+
+const { vscodeMock: baseVscodeMock } = await vi.hoisted(
+  () => import('./utils/vscode-mock.js'),
+);
 
 vi.mock('node:crypto', () => ({
   randomUUID: vi.fn(() => 'test-auth-token'),
@@ -21,6 +30,11 @@ const mocks = vi.hoisted(() => ({
   diffManager: {
     onDidChange: vi.fn(() => ({ dispose: vi.fn() })),
   } as unknown as DiffManager,
+  fileHandle: {
+    chmod: vi.fn(() => Promise.resolve(undefined)),
+    writeFile: vi.fn(() => Promise.resolve(undefined)),
+    close: vi.fn(() => Promise.resolve(undefined)),
+  },
 }));
 
 vi.mock('node:fs/promises', () => ({
@@ -28,7 +42,21 @@ vi.mock('node:fs/promises', () => ({
   unlink: vi.fn(() => Promise.resolve(undefined)),
   chmod: vi.fn(() => Promise.resolve(undefined)),
   mkdir: vi.fn(() => Promise.resolve(undefined)),
+  lstat: vi.fn(() =>
+    Promise.resolve({
+      uid: process.getuid ? process.getuid() : 1000,
+      mode: 0o40700,
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+    }),
+  ),
+  open: vi.fn(() => Promise.resolve(mocks.fileHandle)),
+  rename: vi.fn(() => Promise.resolve(undefined)),
 }));
+
+const expectedPortDir = process.getuid
+  ? path.join('/tmp', `gemini-ide-${process.getuid()}`)
+  : path.join('/tmp', 'gemini', 'ide');
 
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof os>();
@@ -38,17 +66,25 @@ vi.mock('node:os', async (importOriginal) => {
   };
 });
 
-vi.mock('@google/gemini-cli-core', async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import('@google/gemini-cli-core')>();
-  return {
-    ...actual,
-    tmpdir: vi.fn(() => '/tmp'),
-  };
-});
+vi.mock(
+  '@google/gemini-cli-core/src/utils/paths.js',
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import('@google/gemini-cli-core/src/utils/paths.js')
+      >();
+    return {
+      ...actual,
+      tmpdir: vi.fn(() => '/tmp'),
+      getIdeConnectionDir: vi.fn(() => expectedPortDir),
+    };
+  },
+);
 
 const vscodeMock = vi.hoisted(() => ({
+  ...baseVscodeMock,
   workspace: {
+    ...baseVscodeMock.workspace,
     workspaceFolders: [
       {
         uri: {
@@ -70,6 +106,12 @@ vi.mock('vscode', () => vscodeMock);
 vi.mock('./open-files-manager', () => {
   const OpenFilesManager = vi.fn();
   OpenFilesManager.prototype.onDidChange = vi.fn(() => ({ dispose: vi.fn() }));
+  OpenFilesManager.prototype.dispose = vi.fn();
+  // A schema-valid IdeContext so the GET /mcp handler can emit the initial
+  // `ide/contextUpdate` notification instead of throwing on parse.
+  OpenFilesManager.prototype.state = {
+    workspaceState: { openFiles: [], isTrusted: true },
+  };
   return { OpenFilesManager };
 });
 
@@ -94,6 +136,21 @@ describe('IDEServer', () => {
   let mockLog: (message: string) => void;
 
   beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.lstat).mockResolvedValue({
+      uid: process.getuid ? process.getuid() : 1000,
+      mode: 0o40700,
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+    } as unknown as Awaited<ReturnType<typeof fs.lstat>>);
+    vi.mocked(fs.open).mockResolvedValue(
+      mocks.fileHandle as unknown as fs.FileHandle,
+    );
+    mocks.fileHandle.chmod.mockResolvedValue(undefined);
+    mocks.fileHandle.writeFile.mockResolvedValue(undefined);
+    mocks.fileHandle.close.mockResolvedValue(undefined);
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
+
     mockLog = vi.fn();
     ideServer = new IDEServer(mockLog, mocks.diffManager);
     mockContext = {
@@ -145,9 +202,7 @@ describe('IDEServer', () => {
 
     const port = getPortFromMock(replaceMock);
     const expectedPortFile = path.join(
-      '/tmp',
-      'gemini',
-      'ide',
+      expectedPortDir,
       `gemini-ide-server-${process.ppid}-${port}.json`,
     );
     const expectedContent = JSON.stringify({
@@ -155,14 +210,27 @@ describe('IDEServer', () => {
       workspacePath: expectedWorkspacePaths,
       authToken: 'test-auth-token',
     });
-    expect(fs.mkdir).toHaveBeenCalledWith(path.join('/tmp', 'gemini', 'ide'), {
+    expect(fs.mkdir).toHaveBeenCalledWith(expectedPortDir, {
       recursive: true,
+      mode: 0o700,
     });
-    expect(fs.writeFile).toHaveBeenCalledWith(
-      expectedPortFile,
-      expectedContent,
+    expect(fs.open).toHaveBeenCalledWith(
+      expect.stringContaining(`${expectedPortFile}.`),
+      'wx',
+      0o600,
     );
-    expect(fs.chmod).toHaveBeenCalledWith(expectedPortFile, 0o600);
+    if (process.platform !== 'win32') {
+      expect(mocks.fileHandle.chmod).toHaveBeenCalledWith(0o600);
+    }
+    expect(mocks.fileHandle.writeFile).toHaveBeenCalledWith(expectedContent, {
+      encoding: 'utf8',
+    });
+    expect(mocks.fileHandle.close).toHaveBeenCalled();
+    expect(fs.rename).toHaveBeenCalledWith(
+      expect.stringContaining(`${expectedPortFile}.`),
+      expectedPortFile,
+    );
+    expect(fs.writeFile).not.toHaveBeenCalled();
   });
 
   it('should set a single folder path', async () => {
@@ -178,9 +246,7 @@ describe('IDEServer', () => {
 
     const port = getPortFromMock(replaceMock);
     const expectedPortFile = path.join(
-      '/tmp',
-      'gemini',
-      'ide',
+      expectedPortDir,
       `gemini-ide-server-${process.ppid}-${port}.json`,
     );
     const expectedContent = JSON.stringify({
@@ -188,11 +254,13 @@ describe('IDEServer', () => {
       workspacePath: '/foo/bar',
       authToken: 'test-auth-token',
     });
-    expect(fs.writeFile).toHaveBeenCalledWith(
+    expect(mocks.fileHandle.writeFile).toHaveBeenCalledWith(expectedContent, {
+      encoding: 'utf8',
+    });
+    expect(fs.rename).toHaveBeenCalledWith(
+      expect.stringContaining(`${expectedPortFile}.`),
       expectedPortFile,
-      expectedContent,
     );
-    expect(fs.chmod).toHaveBeenCalledWith(expectedPortFile, 0o600);
   });
 
   it('should set an empty string if no folders are open', async () => {
@@ -208,9 +276,7 @@ describe('IDEServer', () => {
 
     const port = getPortFromMock(replaceMock);
     const expectedPortFile = path.join(
-      '/tmp',
-      'gemini',
-      'ide',
+      expectedPortDir,
       `gemini-ide-server-${process.ppid}-${port}.json`,
     );
     const expectedContent = JSON.stringify({
@@ -218,11 +284,13 @@ describe('IDEServer', () => {
       workspacePath: '',
       authToken: 'test-auth-token',
     });
-    expect(fs.writeFile).toHaveBeenCalledWith(
+    expect(mocks.fileHandle.writeFile).toHaveBeenCalledWith(expectedContent, {
+      encoding: 'utf8',
+    });
+    expect(fs.rename).toHaveBeenCalledWith(
+      expect.stringContaining(`${expectedPortFile}.`),
       expectedPortFile,
-      expectedContent,
     );
-    expect(fs.chmod).toHaveBeenCalledWith(expectedPortFile, 0o600);
   });
 
   it('should update the path when workspace folders change', async () => {
@@ -256,9 +324,7 @@ describe('IDEServer', () => {
 
     const port = getPortFromMock(replaceMock);
     const expectedPortFile = path.join(
-      '/tmp',
-      'gemini',
-      'ide',
+      expectedPortDir,
       `gemini-ide-server-${process.ppid}-${port}.json`,
     );
     const expectedContent = JSON.stringify({
@@ -266,11 +332,13 @@ describe('IDEServer', () => {
       workspacePath: expectedWorkspacePaths,
       authToken: 'test-auth-token',
     });
-    expect(fs.writeFile).toHaveBeenCalledWith(
+    expect(mocks.fileHandle.writeFile).toHaveBeenCalledWith(expectedContent, {
+      encoding: 'utf8',
+    });
+    expect(fs.rename).toHaveBeenCalledWith(
+      expect.stringContaining(`${expectedPortFile}.`),
       expectedPortFile,
-      expectedContent,
     );
-    expect(fs.chmod).toHaveBeenCalledWith(expectedPortFile, 0o600);
 
     // Simulate removing a folder
     vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath: '/baz/qux' } }];
@@ -285,11 +353,13 @@ describe('IDEServer', () => {
       workspacePath: '/baz/qux',
       authToken: 'test-auth-token',
     });
-    expect(fs.writeFile).toHaveBeenCalledWith(
+    expect(mocks.fileHandle.writeFile).toHaveBeenCalledWith(expectedContent2, {
+      encoding: 'utf8',
+    });
+    expect(fs.rename).toHaveBeenCalledWith(
+      expect.stringContaining(`${expectedPortFile}.`),
       expectedPortFile,
-      expectedContent2,
     );
-    expect(fs.chmod).toHaveBeenCalledWith(expectedPortFile, 0o600);
   });
 
   it('should clear env vars and delete port file on stop', async () => {
@@ -297,17 +367,477 @@ describe('IDEServer', () => {
     const replaceMock = mockContext.environmentVariableCollection.replace;
     const port = getPortFromMock(replaceMock);
     const portFile = path.join(
-      '/tmp',
-      'gemini',
-      'ide',
+      expectedPortDir,
       `gemini-ide-server-${process.ppid}-${port}.json`,
     );
-    expect(fs.writeFile).toHaveBeenCalledWith(portFile, expect.any(String));
+    expect(fs.rename).toHaveBeenCalledWith(
+      expect.stringContaining(`${portFile}.`),
+      portFile,
+    );
 
     await ideServer.stop();
 
     expect(mockContext.environmentVariableCollection.clear).toHaveBeenCalled();
     expect(fs.unlink).toHaveBeenCalledWith(portFile);
+  });
+
+  it.runIf(process.getuid !== undefined)(
+    'should refuse to write port file when port directory is owned by another UID',
+    async () => {
+      const otherUid = (process.getuid ? process.getuid() : 1000) + 1;
+      vi.mocked(fs.lstat).mockResolvedValue({
+        uid: otherUid,
+        mode: 0o40700,
+        isSymbolicLink: () => false,
+        isDirectory: () => true,
+      } as unknown as Awaited<ReturnType<typeof fs.lstat>>);
+
+      await ideServer.start(mockContext);
+
+      expect(fs.open).not.toHaveBeenCalled();
+      expect(fs.rename).not.toHaveBeenCalled();
+      expect(mockLog).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to create IDE port file'),
+      );
+      expect(
+        mockContext.environmentVariableCollection.replace,
+      ).toHaveBeenCalledWith('GEMINI_CLI_IDE_AUTH_TOKEN', 'test-auth-token');
+    },
+  );
+
+  it('should refuse to write port file when port directory is a symlink', async () => {
+    vi.mocked(fs.lstat).mockResolvedValue({
+      uid: process.getuid ? process.getuid() : 1000,
+      mode: 0o120777,
+      isSymbolicLink: () => true,
+      isDirectory: () => false,
+    } as unknown as Awaited<ReturnType<typeof fs.lstat>>);
+
+    await ideServer.start(mockContext);
+
+    expect(fs.open).not.toHaveBeenCalled();
+    expect(fs.rename).not.toHaveBeenCalled();
+    expect(mockLog).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to create IDE port file'),
+    );
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'should tighten permissions to 0o700 if existing user-owned port directory has looser mode',
+    async () => {
+      const uid = process.getuid ? process.getuid() : 1000;
+      vi.mocked(fs.lstat)
+        .mockResolvedValueOnce({
+          uid,
+          mode: 0o40755,
+          isSymbolicLink: () => false,
+          isDirectory: () => true,
+        } as unknown as Awaited<ReturnType<typeof fs.lstat>>)
+        .mockResolvedValue({
+          uid,
+          mode: 0o40700,
+          isSymbolicLink: () => false,
+          isDirectory: () => true,
+        } as unknown as Awaited<ReturnType<typeof fs.lstat>>);
+
+      await ideServer.start(mockContext);
+
+      expect(fs.chmod).toHaveBeenCalledWith(expectedPortDir, 0o700);
+      expect(fs.open).toHaveBeenCalled();
+      expect(fs.rename).toHaveBeenCalled();
+    },
+  );
+
+  it('should clean up temporary file and close handle if rename fails', async () => {
+    vi.mocked(fs.rename).mockRejectedValueOnce(new Error('rename failed'));
+
+    await ideServer.start(mockContext);
+
+    const tempPath = vi.mocked(fs.open).mock.calls[0]?.[0] as string;
+    expect(tempPath).toContain('.tmp');
+    expect(fs.unlink).toHaveBeenCalledWith(tempPath);
+    expect(mockLog).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to write port to file: rename failed'),
+    );
+  });
+
+  it('should dispose OpenFilesManager and event subscriptions on stop', async () => {
+    const openFilesOnDidChangeDispose = vi.fn();
+    const diffOnDidChangeDispose = vi.fn();
+    vi.mocked(OpenFilesManager.prototype.onDidChange).mockReturnValueOnce({
+      dispose: openFilesOnDidChangeDispose,
+    });
+    vi.mocked(mocks.diffManager.onDidChange).mockReturnValueOnce({
+      dispose: diffOnDidChangeDispose,
+    });
+    vi.mocked(OpenFilesManager.prototype.dispose).mockClear();
+
+    await ideServer.start(mockContext);
+    expect(OpenFilesManager.prototype.dispose).not.toHaveBeenCalled();
+    expect(openFilesOnDidChangeDispose).not.toHaveBeenCalled();
+    expect(diffOnDidChangeDispose).not.toHaveBeenCalled();
+
+    await ideServer.stop();
+
+    expect(OpenFilesManager.prototype.dispose).toHaveBeenCalledTimes(1);
+    expect(openFilesOnDidChangeDispose).toHaveBeenCalledTimes(1);
+    expect(diffOnDidChangeDispose).toHaveBeenCalledTimes(1);
+  });
+
+  describe('shutdown with active MCP sessions', () => {
+    type ServerTransports = Record<string, StreamableHTTPServerTransport>;
+    const getTransports = () =>
+      (ideServer as unknown as { transports: ServerTransports }).transports;
+
+    /**
+     * Connects exactly the way IdeClient does. The SDK client opens a
+     * long-lived standalone `GET /mcp` SSE stream right after `initialize`
+     * (fire-and-forget), so we wait for the server's initial
+     * `ide/contextUpdate` push — which can only arrive over that stream — to
+     * know the socket is open end-to-end.
+     */
+    const connectMcpClient = async (port: string) => {
+      const client = new Client({ name: 'test-client', version: '0.0.0' });
+      const transport = new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${port}/mcp`),
+        {
+          requestInit: { headers: { Authorization: 'Bearer test-auth-token' } },
+        },
+      );
+      const sseStreamLive = new Promise<void>((resolve) => {
+        client.setNotificationHandler(IdeContextNotificationSchema, () =>
+          resolve(),
+        );
+      });
+      await client.connect(transport);
+      await Promise.race([
+        sseStreamLive,
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error('GET /mcp SSE stream never became live')),
+            2_000,
+          ),
+        ),
+      ]);
+      return client;
+    };
+
+    const withDeadline = <T>(promise: Promise<T>, ms: number) =>
+      Promise.race([
+        promise.then(() => 'resolved' as const),
+        new Promise<'timed-out'>((resolve) =>
+          setTimeout(() => resolve('timed-out'), ms),
+        ),
+      ]);
+
+    const getServer = () =>
+      (ideServer as unknown as { server: http.Server }).server;
+
+    /** Holds `server.close()` until the returned function is called. */
+    const gateServerClose = (server: http.Server) => {
+      const realClose = server.close.bind(server);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.spyOn(server, 'close').mockImplementation((cb) => {
+        void gate.then(() => realClose(cb));
+        return server;
+      });
+      return release;
+    };
+
+    const latestPort = () =>
+      vi
+        .mocked(mockContext.environmentVariableCollection.replace)
+        .mock.calls.filter(([k]) => k === 'GEMINI_CLI_IDE_SERVER_PORT')
+        .at(-1)?.[1] as string;
+
+    const portFileFor = (p: string) =>
+      path.join(expectedPortDir, `gemini-ide-server-${process.ppid}-${p}.json`);
+
+    const shutdownLogCount = () =>
+      vi
+        .mocked(mockLog)
+        .mock.calls.filter(([m]) => m === 'IDE server shut down').length;
+
+    let port: string;
+    let clients: Client[];
+
+    beforeEach(async () => {
+      clients = [];
+      await ideServer.start(mockContext);
+      port = getPortFromMock(mockContext.environmentVariableCollection.replace);
+    });
+
+    afterEach(async () => {
+      // Drain client sockets so a hung stop() cannot wedge the runner.
+      await Promise.allSettled(clients.map((c) => c.close()));
+    });
+
+    // Regression test for https://github.com/google-gemini/gemini-cli/issues/28785
+    it('should resolve stop() while a session holds an open SSE stream', async () => {
+      clients.push(await connectMcpClient(port));
+      expect(Object.keys(getTransports())).toHaveLength(1);
+
+      const outcome = await withDeadline(ideServer.stop(), 2_000);
+
+      expect(outcome, 'stop() hung while a client held GET /mcp open').toBe(
+        'resolved',
+      );
+      expect(mockLog).toHaveBeenCalledWith('IDE server shut down');
+    });
+
+    it('should close sessions, clear keep-alive, and clean up on stop()', async () => {
+      const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval');
+      clients.push(await connectMcpClient(port));
+      const [sessionId] = Object.keys(getTransports());
+
+      await ideServer.stop();
+
+      expect(Object.keys(getTransports())).toHaveLength(0);
+      expect(mockLog).toHaveBeenCalledWith(`Session closed: ${sessionId}`);
+      expect(clearIntervalSpy).toHaveBeenCalled();
+      expect(
+        mockContext.environmentVariableCollection.clear,
+      ).toHaveBeenCalled();
+      expect(fs.unlink).toHaveBeenCalled();
+    });
+
+    it('should close every session when multiple clients are connected', async () => {
+      // randomUUID is mocked to a constant, so give each session a unique id.
+      const { randomUUID } = await import('node:crypto');
+      vi.mocked(randomUUID)
+        .mockReturnValueOnce('session-a' as ReturnType<typeof randomUUID>)
+        .mockReturnValueOnce('session-b' as ReturnType<typeof randomUUID>);
+
+      clients.push(await connectMcpClient(port));
+      clients.push(await connectMcpClient(port));
+      expect(Object.keys(getTransports()).sort()).toEqual([
+        'session-a',
+        'session-b',
+      ]);
+
+      const outcome = await withDeadline(ideServer.stop(), 2_000);
+
+      expect(outcome).toBe('resolved');
+      expect(Object.keys(getTransports())).toHaveLength(0);
+      expect(mockLog).toHaveBeenCalledWith('Session closed: session-a');
+      expect(mockLog).toHaveBeenCalledWith('Session closed: session-b');
+    });
+
+    it('should make stop() idempotent', async () => {
+      clients.push(await connectMcpClient(port));
+
+      await ideServer.stop();
+      await expect(ideServer.stop()).resolves.toBeUndefined();
+
+      expect(
+        vi
+          .mocked(mockLog)
+          .mock.calls.filter(([m]) => m === 'IDE server shut down'),
+      ).toHaveLength(1);
+    });
+
+    it('should be stoppable again after a restart', async () => {
+      clients.push(await connectMcpClient(port));
+      await ideServer.stop();
+
+      await ideServer.start(mockContext);
+      clients.push(await connectMcpClient(latestPort()));
+      expect(Object.keys(getTransports())).toHaveLength(1);
+
+      const outcome = await withDeadline(ideServer.stop(), 2_000);
+
+      expect(outcome).toBe('resolved');
+      expect(Object.keys(getTransports())).toHaveLength(0);
+      expect(shutdownLogCount()).toBe(2);
+    });
+
+    it('should make concurrent stop() calls await the same in-flight shutdown', async () => {
+      clients.push(await connectMcpClient(port));
+      const releaseClose = gateServerClose(getServer());
+
+      const first = ideServer.stop();
+      const second = ideServer.stop();
+
+      // The second caller must not resolve while the listener is still
+      // closing and cleanup (env collection, port file) has not run yet.
+      expect(await withDeadline(second, 50)).toBe('timed-out');
+      expect(
+        mockContext.environmentVariableCollection.clear,
+      ).not.toHaveBeenCalled();
+
+      releaseClose();
+      await expect(Promise.all([first, second])).resolves.toEqual([
+        undefined,
+        undefined,
+      ]);
+      expect(
+        mockContext.environmentVariableCollection.clear,
+      ).toHaveBeenCalledTimes(1);
+      expect(shutdownLogCount()).toBe(1);
+      expect(mockLog).not.toHaveBeenCalledWith(
+        expect.stringContaining('Error shutting down IDE server'),
+      );
+    });
+
+    it('should not let a late-finishing stop() clobber a restarted server', async () => {
+      vi.mocked(fs.unlink).mockClear();
+      clients.push(await connectMcpClient(port));
+      const releaseOldClose = gateServerClose(getServer());
+      const oldStop = ideServer.stop();
+
+      // Restart while the old shutdown is still draining.
+      await ideServer.start(mockContext);
+      const newPort = latestPort();
+      expect(newPort).not.toBe(port);
+      clients.push(await connectMcpClient(newPort));
+
+      releaseOldClose();
+      await oldStop;
+
+      // The old shutdown removed only its own port file and left the new
+      // server's env vars alone.
+      expect(fs.unlink).toHaveBeenCalledWith(portFileFor(port));
+      expect(fs.unlink).not.toHaveBeenCalledWith(portFileFor(newPort));
+      expect(
+        mockContext.environmentVariableCollection.clear,
+      ).not.toHaveBeenCalled();
+
+      // ...and the new server is still fully stoppable.
+      expect(await withDeadline(ideServer.stop(), 2_000)).toBe('resolved');
+      expect(shutdownLogCount()).toBe(2);
+      expect(fs.unlink).toHaveBeenCalledWith(portFileFor(newPort));
+      expect(
+        mockContext.environmentVariableCollection.clear,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it('should keep a second shutdown joinable when the first finishes later', async () => {
+      clients.push(await connectMcpClient(port));
+      const releaseOldClose = gateServerClose(getServer());
+      const oldStop = ideServer.stop();
+
+      await ideServer.start(mockContext);
+      clients.push(await connectMcpClient(latestPort()));
+      const releaseNewClose = gateServerClose(getServer());
+      const newStop = ideServer.stop();
+
+      // First shutdown completes while the second is still in flight.
+      releaseOldClose();
+      await oldStop;
+
+      // The server must still report "stopping": a further stop() joins the
+      // second shutdown instead of returning instantly as "stopped".
+      expect(await withDeadline(ideServer.stop(), 50)).toBe('timed-out');
+
+      releaseNewClose();
+      await expect(newStop).resolves.toBeUndefined();
+      expect(shutdownLogCount()).toBe(2);
+    });
+
+    it('should still clean up when the HTTP server fails to close', async () => {
+      const server = (ideServer as unknown as { server: http.Server }).server;
+      const closeSpy = vi.spyOn(server, 'close').mockImplementation((cb) => {
+        cb?.(new Error('close failed'));
+        return server;
+      });
+
+      try {
+        await expect(ideServer.stop()).rejects.toThrow('close failed');
+
+        expect(
+          mockContext.environmentVariableCollection.clear,
+        ).toHaveBeenCalled();
+        expect(fs.unlink).toHaveBeenCalled();
+        // A follow-up stop() must not try to close the dead server again.
+        await expect(ideServer.stop()).resolves.toBeUndefined();
+      } finally {
+        closeSpy.mockRestore();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    describe('keep-alive', () => {
+      const KEEP_ALIVE_MS = 60_000;
+
+      beforeEach(() => {
+        // Only fake the interval APIs so real sockets/fetch keep working.
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      });
+
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('should close the session after 3 consecutive missed pings', async () => {
+        clients.push(await connectMcpClient(port));
+        const [sessionId] = Object.keys(getTransports());
+        const transport = getTransports()[sessionId];
+        const closeSpy = vi.spyOn(transport, 'close');
+        vi.spyOn(transport, 'send').mockRejectedValue(new Error('EPIPE'));
+
+        await vi.advanceTimersByTimeAsync(KEEP_ALIVE_MS * 2);
+        expect(closeSpy).not.toHaveBeenCalled();
+        expect(getTransports()[sessionId]).toBe(transport);
+
+        await vi.advanceTimersByTimeAsync(KEEP_ALIVE_MS);
+        expect(closeSpy).toHaveBeenCalledTimes(1);
+        expect(getTransports()[sessionId]).toBeUndefined();
+        expect(mockLog).toHaveBeenCalledWith(
+          expect.stringContaining(`Session ${sessionId} missed 3 pings`),
+        );
+        expect(mockLog).toHaveBeenCalledWith(`Session closed: ${sessionId}`);
+
+        // Interval is gone: no further pings are attempted.
+        const sendCalls = vi.mocked(transport.send).mock.calls.length;
+        await vi.advanceTimersByTimeAsync(KEEP_ALIVE_MS * 2);
+        expect(transport.send).toHaveBeenCalledTimes(sendCalls);
+      });
+
+      it('should reset the missed-ping count on a successful ping', async () => {
+        clients.push(await connectMcpClient(port));
+        const [sessionId] = Object.keys(getTransports());
+        const transport = getTransports()[sessionId];
+        const closeSpy = vi.spyOn(transport, 'close');
+        vi.spyOn(transport, 'send')
+          .mockRejectedValueOnce(new Error('EPIPE'))
+          .mockRejectedValueOnce(new Error('EPIPE'))
+          .mockResolvedValueOnce(undefined)
+          .mockRejectedValueOnce(new Error('EPIPE'))
+          .mockRejectedValueOnce(new Error('EPIPE'));
+
+        await vi.advanceTimersByTimeAsync(KEEP_ALIVE_MS * 5);
+
+        expect(transport.send).toHaveBeenCalledTimes(5);
+        expect(closeSpy).not.toHaveBeenCalled();
+        expect(getTransports()[sessionId]).toBe(transport);
+      });
+
+      it('should log and stop pinging if closing the evicted session fails', async () => {
+        clients.push(await connectMcpClient(port));
+        const [sessionId] = Object.keys(getTransports());
+        const transport = getTransports()[sessionId];
+        vi.spyOn(transport, 'send').mockRejectedValue(new Error('EPIPE'));
+        const closeSpy = vi
+          .spyOn(transport, 'close')
+          .mockRejectedValue(new Error('close failed'));
+
+        await vi.advanceTimersByTimeAsync(KEEP_ALIVE_MS * 3);
+
+        expect(closeSpy).toHaveBeenCalledTimes(1);
+        expect(mockLog).toHaveBeenCalledWith(
+          `Failed to close transport for session ${sessionId}: close failed`,
+        );
+
+        // The interval must not keep retrying a transport that cannot close.
+        const sendCalls = vi.mocked(transport.send).mock.calls.length;
+        await vi.advanceTimersByTimeAsync(KEEP_ALIVE_MS * 2);
+        expect(transport.send).toHaveBeenCalledTimes(sendCalls);
+        expect(closeSpy).toHaveBeenCalledTimes(1);
+      });
+    });
   });
 
   it.skipIf(process.platform !== 'win32')(
@@ -329,9 +859,7 @@ describe('IDEServer', () => {
 
       const port = getPortFromMock(replaceMock);
       const expectedPortFile = path.join(
-        '/tmp',
-        'gemini',
-        'ide',
+        expectedPortDir,
         `gemini-ide-server-${process.ppid}-${port}.json`,
       );
       const expectedContent = JSON.stringify({
@@ -339,11 +867,13 @@ describe('IDEServer', () => {
         workspacePath: expectedWorkspacePaths,
         authToken: 'test-auth-token',
       });
-      expect(fs.writeFile).toHaveBeenCalledWith(
+      expect(mocks.fileHandle.writeFile).toHaveBeenCalledWith(expectedContent, {
+        encoding: 'utf8',
+      });
+      expect(fs.rename).toHaveBeenCalledWith(
+        expect.stringContaining(`${expectedPortFile}.`),
         expectedPortFile,
-        expectedContent,
       );
-      expect(fs.chmod).toHaveBeenCalledWith(expectedPortFile, 0o600);
     },
   );
 

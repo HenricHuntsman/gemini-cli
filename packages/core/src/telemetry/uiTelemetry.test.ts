@@ -20,7 +20,7 @@ import type {
   CompletedToolCall,
   ErroredToolCall,
   SuccessfulToolCall,
-} from '../core/coreToolScheduler.js';
+} from '../scheduler/types.js';
 import { ToolErrorType } from '../tools/tool-error.js';
 import { ToolConfirmationOutcome } from '../tools/tools.js';
 import { MockTool } from '../test-utils/mock-tool.js';
@@ -173,6 +173,7 @@ describe('UiTelemetryService', () => {
           totalRequests: 1,
           totalErrors: 0,
           totalLatencyMs: 500,
+          errorsByType: {},
         },
         tokens: {
           input: 5,
@@ -229,6 +230,7 @@ describe('UiTelemetryService', () => {
           totalRequests: 2,
           totalErrors: 0,
           totalLatencyMs: 1100,
+          errorsByType: {},
         },
         tokens: {
           input: 10,
@@ -305,6 +307,9 @@ describe('UiTelemetryService', () => {
           totalRequests: 1,
           totalErrors: 1,
           totalLatencyMs: 300,
+          errorsByType: {
+            UNKNOWN: 1,
+          },
         },
         tokens: {
           input: 0,
@@ -316,6 +321,42 @@ describe('UiTelemetryService', () => {
           tool: 0,
         },
         roles: {},
+      });
+    });
+
+    it('should track errors by error_type distinctly', () => {
+      const event1 = {
+        'event.name': EVENT_API_ERROR,
+        model: 'gemini-2.5-pro',
+        duration_ms: 200,
+        error: 'Empty response',
+        error_type: 'NO_RESPONSE_TEXT',
+      } as unknown as ApiErrorEvent & { 'event.name': typeof EVENT_API_ERROR };
+
+      const event2 = {
+        'event.name': EVENT_API_ERROR,
+        model: 'gemini-2.5-pro',
+        duration_ms: 250,
+        error: 'Malformed JSON',
+        error_type: 'MALFORMED_FUNCTION_CALL',
+      } as unknown as ApiErrorEvent & { 'event.name': typeof EVENT_API_ERROR };
+
+      const event3 = {
+        'event.name': EVENT_API_ERROR,
+        model: 'gemini-2.5-pro',
+        duration_ms: 100,
+        error: 'Another empty response',
+        error_type: 'NO_RESPONSE_TEXT',
+      } as unknown as ApiErrorEvent & { 'event.name': typeof EVENT_API_ERROR };
+
+      service.addEvent(event1);
+      service.addEvent(event2);
+      service.addEvent(event3);
+
+      const metrics = service.getMetrics();
+      expect(metrics.models['gemini-2.5-pro'].api.errorsByType).toEqual({
+        NO_RESPONSE_TEXT: 2,
+        MALFORMED_FUNCTION_CALL: 1,
       });
     });
 
@@ -351,6 +392,9 @@ describe('UiTelemetryService', () => {
           totalRequests: 2,
           totalErrors: 1,
           totalLatencyMs: 800,
+          errorsByType: {
+            UNKNOWN: 1,
+          },
         },
         tokens: {
           input: 5,
@@ -403,6 +447,7 @@ describe('UiTelemetryService', () => {
         ToolConfirmationOutcome.ProceedOnce,
       );
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
@@ -437,6 +482,7 @@ describe('UiTelemetryService', () => {
         ToolConfirmationOutcome.Cancel,
       );
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
@@ -471,6 +517,7 @@ describe('UiTelemetryService', () => {
         ToolConfirmationOutcome.ModifyWithEditor,
       );
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
@@ -487,6 +534,7 @@ describe('UiTelemetryService', () => {
     it('should process a ToolCallEvent without a decision', () => {
       const toolCall = createFakeCompletedToolCall('test_tool', true, 100);
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
@@ -523,10 +571,12 @@ describe('UiTelemetryService', () => {
       );
 
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall1)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall2)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
@@ -558,10 +608,12 @@ describe('UiTelemetryService', () => {
       const toolCall1 = createFakeCompletedToolCall('tool_A', true, 100);
       const toolCall2 = createFakeCompletedToolCall('tool_B', false, 200);
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall1)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
       service.addEvent({
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall2)),
         'event.name': EVENT_TOOL_CALL,
       } as ToolCallEvent & { 'event.name': typeof EVENT_TOOL_CALL });
@@ -818,6 +870,7 @@ describe('UiTelemetryService', () => {
     it('should aggregate valid line count metadata', () => {
       const toolCall = createFakeCompletedToolCall('test_tool', true, 100);
       const event = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall)),
         'event.name': EVENT_TOOL_CALL,
         metadata: {
@@ -836,6 +889,7 @@ describe('UiTelemetryService', () => {
     it('should ignore null/undefined values in line count metadata', () => {
       const toolCall = createFakeCompletedToolCall('test_tool', true, 100);
       const event = {
+        // eslint-disable-next-line @typescript-eslint/no-misused-spread
         ...structuredClone(new ToolCallEvent(toolCall)),
         'event.name': EVENT_TOOL_CALL,
         metadata: {

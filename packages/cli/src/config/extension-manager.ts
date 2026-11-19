@@ -8,6 +8,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stat } from 'node:fs/promises';
 import chalk from 'chalk';
+import { lock } from 'proper-lockfile';
 import { ExtensionEnablementManager } from './extensions/extensionEnablement.js';
 import { type MergedSettings, SettingScope } from './settings.js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -41,6 +42,9 @@ import {
   loadSkillsFromDir,
   loadAgentsFromDirectory,
   homedir,
+  ExtensionIntegrityManager,
+  type IExtensionIntegrity,
+  type IntegrityDataStatus,
   type ExtensionEvents,
   type MCPServerConfig,
   type ExtensionInstallMetadata,
@@ -54,6 +58,7 @@ import {
   CoreToolCallStatus,
   loadExtensionPolicies,
   isSubpath,
+  isNodeError,
   type PolicyRule,
   type SafetyCheckerRule,
   HookType,
@@ -80,15 +85,38 @@ import {
 import type { EventEmitter } from 'node:stream';
 import { themeManager } from '../ui/themes/theme-manager.js';
 import { getFormattedSettingValue } from '../commands/extensions/utils.js';
+import { removeDirectoryWithRetry } from '../utils/retry.js';
+
+/**
+ * Suffix of the lock directory that guards an extension's install directory
+ * while it is being installed or updated: proper-lockfile locks
+ * `<extensionsDir>/<name>` by creating `<extensionsDir>/<name>.lock`.
+ * Extension names cannot contain dots (see `validateName`), so lock artifacts
+ * can never collide with, or be mistaken for, an extension.
+ */
+const INSTALL_LOCK_SUFFIX = '.lock';
+/**
+ * After this long without a refresh (e.g. its process was killed), an install
+ * lock is considered stale and may be taken over.
+ */
+const INSTALL_LOCK_STALE_MS = 15_000;
+/**
+ * Backoff while waiting for a concurrent install of the same extension to
+ * finish: 200ms, 400ms, then 500ms per retry, about 7s in total.
+ */
+const INSTALL_LOCK_RETRIES = { retries: 15, minTimeout: 200, maxTimeout: 500 };
 
 interface ExtensionManagerParams {
   enabledExtensionOverrides?: string[];
   settings: MergedSettings;
   requestConsent: (consent: string) => Promise<boolean>;
-  requestSetting: ((setting: ExtensionSetting) => Promise<string>) | null;
+  requestSetting:
+    | ((setting: ExtensionSetting) => Promise<string | undefined>)
+    | null;
   workspaceDir: string;
   eventEmitter?: EventEmitter<ExtensionEvents>;
   clientVersion?: string;
+  integrityManager?: IExtensionIntegrity;
 }
 
 /**
@@ -98,10 +126,11 @@ interface ExtensionManagerParams {
  */
 export class ExtensionManager extends ExtensionLoader {
   private extensionEnablementManager: ExtensionEnablementManager;
+  private integrityManager: IExtensionIntegrity;
   private settings: MergedSettings;
   private requestConsent: (consent: string) => Promise<boolean>;
   private requestSetting:
-    | ((setting: ExtensionSetting) => Promise<string>)
+    | ((setting: ExtensionSetting) => Promise<string | undefined>)
     | undefined;
   private telemetryConfig: Config;
   private workspaceDir: string;
@@ -127,10 +156,26 @@ export class ExtensionManager extends ExtensionLoader {
     });
     this.requestConsent = options.requestConsent;
     this.requestSetting = options.requestSetting ?? undefined;
+    this.integrityManager =
+      options.integrityManager ?? new ExtensionIntegrityManager();
   }
 
   getEnablementManager(): ExtensionEnablementManager {
     return this.extensionEnablementManager;
+  }
+
+  async verifyExtensionIntegrity(
+    extensionName: string,
+    metadata: ExtensionInstallMetadata | undefined,
+  ): Promise<IntegrityDataStatus> {
+    return this.integrityManager.verify(extensionName, metadata);
+  }
+
+  async storeExtensionIntegrity(
+    extensionName: string,
+    metadata: ExtensionInstallMetadata,
+  ): Promise<void> {
+    return this.integrityManager.store(extensionName, metadata);
   }
 
   setRequestConsent(
@@ -140,7 +185,7 @@ export class ExtensionManager extends ExtensionLoader {
   }
 
   setRequestSetting(
-    requestSetting?: (setting: ExtensionSetting) => Promise<string>,
+    requestSetting?: (setting: ExtensionSetting) => Promise<string | undefined>,
   ): void {
     this.requestSetting = requestSetting;
   }
@@ -159,10 +204,7 @@ export class ExtensionManager extends ExtensionLoader {
     previousExtensionConfig?: ExtensionConfig,
     requestConsentOverride?: (consent: string) => Promise<boolean>,
   ): Promise<GeminiCLIExtension> {
-    if (
-      this.settings.security?.allowedExtensions &&
-      this.settings.security?.allowedExtensions.length > 0
-    ) {
+    if ((this.settings.security?.allowedExtensions?.length ?? 0) > 0) {
       const extensionAllowed = this.settings.security?.allowedExtensions.some(
         (pattern) => {
           try {
@@ -272,6 +314,7 @@ Would you like to attempt to install via "git clone" instead?`,
         throw new Error(`Unsupported install type: ${installMetadata.type}`);
       }
 
+      let releaseLock: (() => Promise<void>) | undefined;
       try {
         newExtensionConfig = await this.loadExtensionConfig(localSourcePath);
 
@@ -320,6 +363,11 @@ Would you like to attempt to install via "git clone" instead?`,
             previous.installMetadata.source !== installMetadata.source,
         );
 
+        const previousLinkedSource =
+          previous?.installMetadata?.type === 'link'
+            ? previous?.installMetadata?.source?.trim()
+            : undefined;
+
         await maybeRequestConsentOrFail(
           newExtensionConfig,
           requestConsentOverride ?? this.requestConsent,
@@ -329,20 +377,38 @@ Would you like to attempt to install via "git clone" instead?`,
           newSkills,
           previousSkills,
           isMigrating,
+          installMetadata.type === 'link' ? localSourcePath : undefined,
+          previousLinkedSource
+            ? getRealPath(path.resolve(this.workspaceDir, previousLinkedSource))
+            : undefined,
         );
         const extensionId = getExtensionId(newExtensionConfig, installMetadata);
         const destinationPath = new ExtensionStorage(
           newExtensionName,
         ).getExtensionDir();
 
-        if (
-          (!isUpdate || newExtensionName !== previousName) &&
-          fs.existsSync(destinationPath)
-        ) {
-          throw new Error(
-            `Cannot install extension "${newExtensionName}" because a directory with that name already exists. Please remove it manually.`,
-          );
-        }
+        const assertDestinationIsAvailable = () => {
+          if (
+            (!isUpdate || newExtensionName !== previousName) &&
+            fs.existsSync(destinationPath)
+          ) {
+            throw new Error(
+              `Cannot install extension "${newExtensionName}" because a directory with that name already exists. Please remove it manually.`,
+            );
+          }
+        };
+        // Fail fast, before taking the lock, in the common non-concurrent case.
+        assertDestinationIsAvailable();
+
+        // Everything from here until `finally` writes to `destinationPath`, so
+        // serialize it against concurrent installs/updates of the same
+        // extension, in this process or another one. Then check again: a
+        // concurrent install may have created the directory while we waited.
+        releaseLock = await acquireExtensionInstallLock(
+          destinationPath,
+          newExtensionName,
+        );
+        assertDestinationIsAvailable();
 
         let previousSettings: Record<string, string> | undefined;
         let wasEnabledGlobally = false;
@@ -421,6 +487,12 @@ Would you like to attempt to install via "git clone" instead?`,
         );
         await fs.promises.writeFile(metadataPath, metadataString);
 
+        // Establish trust at point of installation
+        await this.storeExtensionIntegrity(
+          newExtensionConfig.name,
+          installMetadata,
+        );
+
         // TODO: Gracefully handle this call failing, we should back up the old
         // extension prior to overwriting it and then restore and restart it.
         extension = await this.loadExtension(destinationPath);
@@ -470,8 +542,25 @@ Would you like to attempt to install via "git clone" instead?`,
           );
         }
       } finally {
+        if (releaseLock) {
+          try {
+            await releaseLock();
+          } catch (releaseError) {
+            // A failed release (e.g. after the lock was compromised) must not
+            // mask the outcome of the install itself.
+            debugLogger.warn(
+              `Failed to release the install lock for extension "${newExtensionConfig?.name}": ${getErrorMessage(releaseError)}`,
+            );
+          }
+        }
         if (tempDir) {
-          await fs.promises.rm(tempDir, { recursive: true, force: true });
+          try {
+            await removeDirectoryWithRetry(tempDir);
+          } catch (cleanupError) {
+            debugLogger.warn(
+              `Failed to clean up temp directory ${tempDir}: ${getErrorMessage(cleanupError)}`,
+            );
+          }
         }
       }
       return extension;
@@ -540,10 +629,7 @@ Would you like to attempt to install via "git clone" instead?`,
         : path.basename(extension.path),
     );
 
-    await fs.promises.rm(storage.getExtensionDir(), {
-      recursive: true,
-      force: true,
-    });
+    await removeDirectoryWithRetry(storage.getExtensionDir());
 
     // The rest of the cleanup below here is only for true uninstalls, not
     // uninstalls related to updates.
@@ -590,7 +676,7 @@ Would you like to attempt to install via "git clone" instead?`,
 
     this.loadingPromise = (async () => {
       try {
-        if (this.settings.admin.extensions.enabled === false) {
+        if (this.settings.admin?.extensions?.enabled === false) {
           this.loadedExtensions = [];
           return this.loadedExtensions;
         }
@@ -682,6 +768,11 @@ Would you like to attempt to install via "git clone" instead?`,
   private async _buildExtension(
     extensionDir: string,
   ): Promise<GeminiCLIExtension | null> {
+    // Lock artifacts of an install in progress, or left behind by a killed one
+    // (see `acquireExtensionInstallLock`), are never extensions.
+    if (path.basename(extensionDir).endsWith(INSTALL_LOCK_SUFFIX)) {
+      return null;
+    }
     try {
       const stats = await fs.promises.stat(extensionDir);
       if (!stats.isDirectory()) {
@@ -693,25 +784,31 @@ Would you like to attempt to install via "git clone" instead?`,
 
     const installMetadata = loadInstallMetadata(extensionDir);
     let effectiveExtensionPath = extensionDir;
-    if (
-      this.settings.security?.allowedExtensions &&
-      this.settings.security?.allowedExtensions.length > 0
-    ) {
-      if (!installMetadata?.source) {
-        throw new Error(
+    if ((this.settings.security?.allowedExtensions?.length ?? 0) > 0) {
+      // The metadata is parsed JSON that is not validated, so a source that is
+      // not a string is as unusable as a missing one.
+      if (
+        !installMetadata?.source ||
+        typeof installMetadata.source !== 'string'
+      ) {
+        debugLogger.warn(
           `Failed to load extension ${extensionDir}. The ${INSTALL_METADATA_FILENAME} file is missing or misconfigured.`,
         );
+        return null;
       }
+      const source = getRealPath(installMetadata.source);
       const extensionAllowed = this.settings.security?.allowedExtensions.some(
         (pattern) => {
           try {
-            return new RegExp(pattern).test(
-              getRealPath(installMetadata?.source ?? ''),
-            );
+            return new RegExp(pattern).test(source);
           } catch (e) {
-            throw new Error(
-              `Invalid regex pattern in allowedExtensions setting: "${pattern}. Error: ${getErrorMessage(e)}`,
+            // An invalid pattern cannot match anything. Ignore it, so the
+            // patterns listed after it are still evaluated and one bad entry
+            // does not make every extension unavailable.
+            debugLogger.warn(
+              `Invalid regex pattern in allowedExtensions setting: "${pattern}". Error: ${getErrorMessage(e)}`,
             );
+            return false;
           }
         },
       );
@@ -803,11 +900,11 @@ Would you like to attempt to install via "git clone" instead?`,
       }
 
       if (config.mcpServers) {
-        if (this.settings.admin.mcp.enabled === false) {
+        if (this.settings.admin?.mcp?.enabled === false) {
           config.mcpServers = undefined;
         } else {
           // Apply admin allowlist if configured
-          const adminAllowlist = this.settings.admin.mcp.config;
+          const adminAllowlist = this.settings.admin?.mcp?.config;
           if (adminAllowlist && Object.keys(adminAllowlist).length > 0) {
             const result = applyAdminAllowlist(
               config.mcpServers,
@@ -836,20 +933,10 @@ Would you like to attempt to install via "git clone" instead?`,
         }
       }
 
-      const contextFiles = getContextFileNames(config)
-        .map((contextFileName) => {
-          const contextFilePath = path.join(
-            effectiveExtensionPath,
-            contextFileName,
-          );
-          if (!isSubpath(effectiveExtensionPath, contextFilePath)) {
-            throw new Error(
-              `Invalid context file path: "${contextFileName}". Context files must be within the extension directory.`,
-            );
-          }
-          return contextFilePath;
-        })
-        .filter((contextFilePath) => fs.existsSync(contextFilePath));
+      const contextFiles = resolveContextFilePaths(
+        config,
+        effectiveExtensionPath,
+      );
 
       const hydrationContext: VariableContext = {
         extensionPath: effectiveExtensionPath,
@@ -936,6 +1023,21 @@ Would you like to attempt to install via "git clone" instead?`,
         );
       }
 
+      let plan = config.plan;
+      if (plan?.directory) {
+        if (
+          typeof plan.directory !== 'string' ||
+          path.isAbsolute(plan.directory) ||
+          path.win32.isAbsolute(plan.directory) ||
+          plan.directory.includes('..')
+        ) {
+          debugLogger.warn(
+            `[ExtensionManager] Invalid plan.directory in extension "${config.name}": "${plan.directory}". Relative parent navigation and absolute paths are not allowed.`,
+          );
+          plan = undefined;
+        }
+      }
+
       return {
         name: config.name,
         version: config.version,
@@ -958,7 +1060,7 @@ Would you like to attempt to install via "git clone" instead?`,
         themes: config.themes,
         rules,
         checkers,
-        plan: config.plan,
+        plan,
       };
     } catch (e) {
       debugLogger.error(
@@ -1220,11 +1322,75 @@ function filterMcpConfig(original: MCPServerConfig): MCPServerConfig {
   return Object.freeze(rest);
 }
 
+/**
+ * Recursively ensures that the owner has write permissions for all files
+ * and directories within the target path.
+ */
+async function makeWritableRecursive(targetPath: string): Promise<void> {
+  const stats = await fs.promises.lstat(targetPath);
+
+  if (stats.isDirectory()) {
+    // Ensure directory is rwx for the owner (0o700)
+    await fs.promises.chmod(targetPath, stats.mode | 0o700);
+    const children = await fs.promises.readdir(targetPath);
+    for (const child of children) {
+      await makeWritableRecursive(path.join(targetPath, child));
+    }
+  } else if (stats.isFile()) {
+    // Ensure file is rw for the owner (0o600)
+    await fs.promises.chmod(targetPath, stats.mode | 0o600);
+  }
+}
+
 export async function copyExtension(
   source: string,
   destination: string,
 ): Promise<void> {
   await fs.promises.cp(source, destination, { recursive: true });
+  await makeWritableRecursive(destination);
+}
+
+/**
+ * Acquires the lock that serializes installs and updates writing to
+ * `destinationPath`, both within this process and across CLI processes.
+ *
+ * The lock is keyed on `destinationPath` itself rather than on the shared
+ * extensions directory: proper-lockfile tracks held locks per key, and locks on
+ * different extensions (e.g. from `extensions update --all`) must not release
+ * one another.
+ */
+async function acquireExtensionInstallLock(
+  destinationPath: string,
+  extensionName: string,
+): Promise<() => Promise<void>> {
+  // Only the parent (the extensions directory) has to exist, because the lock
+  // is the `<destinationPath>.lock` directory created next to it. Do not create
+  // `destinationPath` itself here: the existence re-check that runs once the
+  // lock is held would mistake it for a concurrent install.
+  await fs.promises.mkdir(path.dirname(destinationPath), { recursive: true });
+  try {
+    return await lock(destinationPath, {
+      // `destinationPath` usually does not exist yet. With `realpath: false`,
+      // proper-lockfile neither resolves nor stats it; it only creates and
+      // checks the `<destinationPath>.lock` directory.
+      realpath: false,
+      stale: INSTALL_LOCK_STALE_MS,
+      retries: INSTALL_LOCK_RETRIES,
+      // The default handler throws from a timer, which would crash the CLI.
+      onCompromised: (error) => {
+        debugLogger.warn(
+          `Lost the install lock for extension "${extensionName}": ${getErrorMessage(error)}`,
+        );
+      },
+    });
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ELOCKED') {
+      throw new Error(
+        `Cannot install extension "${extensionName}" because another installation or update of it is already in progress. Please try again later.`,
+      );
+    }
+    throw error;
+  }
 }
 
 function getContextFileNames(config: ExtensionConfig): string[] {
@@ -1234,6 +1400,120 @@ function getContextFileNames(config: ExtensionConfig): string[] {
     return [config.contextFileName];
   }
   return config.contextFileName;
+}
+
+/**
+ * Context file candidate path validation result.
+ */
+export interface ContextPathValidationResult {
+  isValid: boolean;
+  resolvedPath?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Validates a single context file candidate path against the extension root.
+ * Enforces directory boundary and path formatting by:
+ * - Requiring a non-empty string without null bytes.
+ * - Rejecting absolute paths (both POSIX and Windows formats).
+ * - Disallowing relative parent directory references (e.g. '..'), including URL-encoded variations.
+ * - Verifying that the resolved path stays strictly within the extension root directory.
+ */
+export function validateContextFilePath(
+  contextFileName: unknown,
+  effectiveExtensionPath: string,
+): ContextPathValidationResult {
+  if (typeof contextFileName !== 'string' || !contextFileName.trim()) {
+    return {
+      isValid: false,
+      errorMessage: 'expected a non-empty string.',
+    };
+  }
+
+  if (contextFileName.includes('\0')) {
+    return {
+      isValid: false,
+      errorMessage: 'null bytes are not allowed.',
+    };
+  }
+
+  // Reject absolute paths upfront (both POSIX and Windows formats)
+  if (
+    path.isAbsolute(contextFileName) ||
+    path.win32.isAbsolute(contextFileName)
+  ) {
+    return {
+      isValid: false,
+      errorMessage: 'Absolute paths are not allowed.',
+    };
+  }
+
+  // Disallow relative parent directory references (e.g. ..)
+  let decodedFileName = contextFileName;
+  try {
+    decodedFileName = decodeURIComponent(contextFileName);
+  } catch {
+    debugLogger.debug(
+      `[ExtensionManager] Could not decode URI component in contextFileName: "${contextFileName}". Proceeding with undecoded name.`,
+    );
+  }
+
+  if (contextFileName.includes('..') || decodedFileName.includes('..')) {
+    return {
+      isValid: false,
+      errorMessage:
+        'Relative parent directory references ("..") are not allowed.',
+    };
+  }
+
+  const resolvedExtensionRoot = path.resolve(effectiveExtensionPath);
+  const contextFilePath = path.resolve(resolvedExtensionRoot, contextFileName);
+
+  // Verify that contextFilePath is strictly within resolvedExtensionRoot
+  if (!isSubpath(resolvedExtensionRoot, contextFilePath)) {
+    return {
+      isValid: false,
+      errorMessage: `escapes the extension directory boundary ("${resolvedExtensionRoot}").`,
+    };
+  }
+
+  return {
+    isValid: true,
+    resolvedPath: contextFilePath,
+  };
+}
+
+/**
+ * Resolves and validates context file paths defined in an extension configuration.
+ * Hardens path resolution and enforces directory boundaries by:
+ * - Validating each candidate context file path using validateContextFilePath.
+ * - Logging a warning when an invalid path is detected and skipping loading that context file.
+ * - Returning only paths that exist on disk.
+ */
+export function resolveContextFilePaths(
+  config: ExtensionConfig,
+  effectiveExtensionPath: string,
+): string[] {
+  return getContextFileNames(config)
+    .map((contextFileName) => {
+      const validation = validateContextFilePath(
+        contextFileName,
+        effectiveExtensionPath,
+      );
+
+      if (!validation.isValid) {
+        debugLogger.warn(
+          `[ExtensionManager] Invalid contextFileName: "${contextFileName}" in extension "${config.name}". ${validation.errorMessage}`,
+        );
+        return null;
+      }
+
+      return validation.resolvedPath!;
+    })
+    .filter(
+      (contextFilePath): contextFilePath is string =>
+        contextFilePath !== null && fs.existsSync(contextFilePath),
+    );
 }
 
 function validateName(name: string) {
@@ -1256,7 +1536,10 @@ export async function inferInstallMetadata(
     source.startsWith('http://') ||
     source.startsWith('https://') ||
     source.startsWith('git@') ||
-    source.startsWith('sso://')
+    source.startsWith('sso://') ||
+    source.startsWith('github:') ||
+    source.startsWith('gitlab:') ||
+    source.startsWith('ssh://')
   ) {
     return {
       source,

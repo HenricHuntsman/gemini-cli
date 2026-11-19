@@ -209,9 +209,25 @@ ${formattedHistory}
 
       const reasoning = routerResponse.reasoning;
       const latencyMs = Date.now() - startTime;
+
+      const [useGemini3_1, useCustomToolModel, hasAccessToPreview] =
+        await Promise.all([
+          config.getGemini31Launched(),
+          config.getUseCustomToolModel(),
+          config.getHasAccessToPreviewModel(),
+        ]);
+      const useLatestFlash = config.hasLatestFlashGAAccess?.() ?? false;
+      const useLatestFlashLite = config.hasLatestFlashLiteGAAccess?.() ?? false;
+
       const selectedModel = resolveClassifierModel(
         context.requestedModel ?? config.getModel(),
         routerResponse.model_choice,
+        useGemini3_1,
+        useCustomToolModel,
+        hasAccessToPreview,
+        config,
+        useLatestFlash,
+        useLatestFlashLite,
       );
 
       return {
